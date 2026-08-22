@@ -23,7 +23,11 @@ HERDR_SOCK_PATH = os.path.expanduser(os.environ.get("HERDR_SOCKET_PATH", "~/.con
 OMP_SESSIONS_DIR = os.path.expanduser("~/.omp/agent/sessions")
 HERMES_STATE_DB = os.path.expanduser("~/.hermes/state.db")
 
-KNOWN_TERMINALS = ("foot", "ghostty", "alacritty", "kitty", "wezterm", "gnome-terminal", "xterm")
+KNOWN_TERMINALS = (
+    "foot", "ghostty", "alacritty", "kitty", "wezterm", "gnome-terminal",
+    "ptyxis", "konsole", "terminator", "xfce4-terminal", "xterm", "rio",
+    "contour", "blackbox", "tmux"
+)
 
 def redact_secrets(text: str) -> str:
     """Redact common API keys, tokens, and credentials from display text."""
@@ -913,8 +917,20 @@ def scan_standalone_agents(herdr_server_pids: List[int], seen_cwds: Set[str], cl
                             break
                     if term_name:
                         break
+
+                matched_client = match_hypr_client_for_terminal(ancestor_pids, cwd, agent_type)
+                if not term_name and matched_client:
+                    client_class = matched_client.get("class") or matched_client.get("initialClass") or ""
+                    if client_class:
+                        term_name = client_class.split(".")[-1].lower()
+
                 if not term_name:
-                    continue
+                    # Process has a valid terminal TTY or pts allocation
+                    has_pts = any("/dev/pts/" in str(os.readlink(fd)) for fd in glob.glob(f"/proc/{pid}/fd/*") if os.path.islink(fd))
+                    if has_pts or info.get("tty", 0) > 0:
+                        term_name = "terminal"
+                    else:
+                        continue
 
                 cwd = info["cwd"]
                 repo_name = os.path.basename(cwd.rstrip("/")) if cwd else ""
