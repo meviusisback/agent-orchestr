@@ -45,7 +45,7 @@ Panel {
   property var summary: rawData && rawData.summary ? rawData.summary : ({ total: 0, working: 0, idle: 0, waiting: 0, headline: "Offline" })
   property var agents: rawData && rawData.agents ? rawData.agents : []
   property bool loading: false
-  property string selectedFilter: "all" // "all" | "working" | "herdr" | "external"
+  property string selectedFilter: "all" // "all" | "working" | "idle"
   property string lastFocusedPane: ""
 
   readonly property var filteredAgents: {
@@ -53,17 +53,11 @@ Panel {
     if (root.selectedFilter === "working") {
       return list.filter(function(a) { return a.status === "working" || a.status === "waiting" })
     }
-    if (root.selectedFilter === "herdr") {
-      return list.filter(function(a) { return a.origin === "herdr" || a.origin === "herdr_desktop" })
-    }
-    if (root.selectedFilter === "external") {
-      return list.filter(function(a) { return a.origin === "terminal" || a.origin === "desktop" })
+    if (root.selectedFilter === "idle") {
+      return list.filter(function(a) { return a.status === "idle" || a.status === "error" })
     }
     return list
   }
-
-  readonly property int herdrCount: (root.agents || []).filter(function(a) { return a.origin === "herdr" || a.origin === "herdr_desktop" }).length
-  readonly property int externalCount: (root.agents || []).filter(function(a) { return a.origin === "terminal" || a.origin === "desktop" }).length
 
   function alpha(c, a) { return Qt.rgba(c.r, c.g, c.b, a) }
 
@@ -365,8 +359,7 @@ Panel {
           model: [
             { id: "all", label: "All (" + (root.summary.total || 0) + ")" },
             { id: "working", label: "Working (" + (root.summary.working || 0) + ")" },
-            { id: "herdr", label: "Herdr (" + root.herdrCount + ")" },
-            { id: "external", label: "Terminal / App (" + root.externalCount + ")" }
+            { id: "idle", label: "Idle (" + (root.summary.idle || 0) + ")" }
           ]
 
           Rectangle {
@@ -382,7 +375,7 @@ Panel {
               anchors.centerIn: parent
               text: modelData.label
               font.family: root.fontFamily
-              font.pixelSize: Style.space(10)
+              font.pixelSize: Style.space(11)
               font.weight: root.selectedFilter === modelData.id ? Font.DemiBold : Font.Normal
               color: root.selectedFilter === modelData.id ? root.accent : root.foreground
             }
