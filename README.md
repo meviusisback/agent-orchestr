@@ -58,6 +58,30 @@ omarchy plugin remove meviusisback.agent-orchestr
 ```
 
 Or manually remove the symlink/directory from `~/.config/omarchy/plugins/meviusisback.agent-orchestr` and remove `"meviusisback.agent-orchestr"` from `~/.config/omarchy/shell.json`.
+
+## Keybinding
+
+You can toggle the popup panel with a global Hyprland keyboard shortcut.
+
+Add the following to `~/.config/hypr/bindings.lua`:
+
+```lua
+o.bind("SUPER + A", "Agent Orchestrator", "omarchy shell meviusisback.agent-orchestr toggle")
+```
+
+### Shell IPC Commands
+
+```bash
+# Toggle popup panel
+omarchy shell meviusisback.agent-orchestr toggle
+
+# Explicit open / close
+omarchy shell meviusisback.agent-orchestr open
+omarchy shell meviusisback.agent-orchestr close
+
+# Force refresh live status
+omarchy shell meviusisback.agent-orchestr refresh
+```
 ## Settings
 
 | Key | Default | Description |

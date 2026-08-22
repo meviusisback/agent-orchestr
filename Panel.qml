@@ -169,6 +169,17 @@ Panel {
     function kill(paneId: string): void { root.killTarget(paneId) }
   }
 
+  IpcHandler {
+    enabled: true
+    target: "agent-orchestr"
+    function open(): void { root.open() }
+    function close(): void { root.close() }
+    function toggle(): void { root.toggle() }
+    function refresh(): void { root.fetchStatus() }
+    function focus(paneId: string): void { root.focusPane(paneId) }
+    function kill(paneId: string): void { root.killTarget(paneId) }
+  }
+
   // ------------------------------------------------------------- Bar Button (Icon Mode)
   BarIconButton {
     id: button
