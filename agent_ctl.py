@@ -203,8 +203,92 @@ def get_process_ancestors(pid: int, max_depth: int = 20) -> List[Dict[str, Any]]
     return ancestors
 
 
-def find_latest_session_for_cwd(agent_type: str, cwd: str) -> Optional[str]:
-    """Find the most recent session file matching a working directory."""
+def get_process_start_time(pid: int) -> float:
+    """Extract process start time in epoch seconds."""
+    try:
+        with open(f"/proc/{pid}/stat") as f:
+            stat = f.read().split()
+        starttime_ticks = int(stat[21])
+        with open("/proc/stat") as f:
+            for line in f:
+                if line.startswith("btime"):
+                    btime = int(line.split()[1])
+                    break
+        clock_ticks = os.sysconf(os.sysconf_names["SC_CLK_TCK"])
+        return btime + (starttime_ticks / clock_ticks)
+    except Exception:
+        return 0.0
+
+
+def get_process_open_session(pid: int) -> Optional[str]:
+    """Inspect open file descriptors of a process for active session files."""
+    try:
+        for fd in glob.glob(f"/proc/{pid}/fd/*"):
+            try:
+                target = os.readlink(fd)
+                if ".jsonl" in target and os.path.exists(target):
+                    return target
+            except Exception:
+                continue
+    except Exception:
+        pass
+    return None
+
+
+def find_session_for_process(agent_type: str, pid: int, cwd: str, claimed_sessions: Set[str]) -> Optional[str]:
+    """Find active or recent session file strictly belonging to this specific process."""
+    # 1. Direct open file descriptor
+    open_s = get_process_open_session(pid)
+    if open_s and open_s not in claimed_sessions:
+        return open_s
+
+    # 2. If no open session, check if there is an unclaimed session modified around/after process started
+    p_start = get_process_start_time(pid)
+    if agent_type == "omp" and os.path.exists(OMP_SESSIONS_DIR):
+        folder_part = os.path.basename(cwd.rstrip("/")) if cwd else ""
+        if folder_part and folder_part not in ("tmp", "~"):
+            matches = glob.glob(os.path.join(OMP_SESSIONS_DIR, f"*{folder_part}*", "*.jsonl"))
+        else:
+            matches = glob.glob(os.path.join(OMP_SESSIONS_DIR, "*-tmp*", "*.jsonl"))
+        if matches:
+            matches.sort(key=os.path.getmtime, reverse=True)
+            for m in matches:
+                if m not in claimed_sessions:
+                    mtime = os.path.getmtime(m)
+                    if p_start > 0 and mtime >= (p_start - 5.0):
+                        return m
+    return None
+
+
+def match_hypr_client_for_terminal(ancestor_pids: List[int], cwd: str, agent_type: str) -> Optional[Dict[str, Any]]:
+    """Find the exact Hyprland client window associated with a terminal process."""
+    clients = get_hypr_clients()
+    candidates = [c for c in clients if c.get("pid") in ancestor_pids]
+    if not candidates:
+        return None
+    if len(candidates) == 1:
+        return candidates[0]
+
+    folder_part = os.path.basename(cwd.rstrip("/")) if cwd else ""
+    for c in candidates:
+        t = c.get("title", "").lower()
+        if "omarchy:" in t or "herdr" in t:
+            continue
+        if folder_part and folder_part in t:
+            return c
+        if "π" in t or (agent_type and agent_type.lower() in t):
+            return c
+
+    for c in candidates:
+        t = c.get("title", "").lower()
+        if "omarchy:" not in t and "herdr" not in t:
+            return c
+    return candidates[0]
+
+
+def find_latest_session_for_cwd(agent_type: str, cwd: str, claimed_sessions: Optional[Set[str]] = None) -> Optional[str]:
+    """Find the most recent session file matching a working directory that is not already claimed."""
+    claimed = claimed_sessions or set()
     if agent_type == "omp" and os.path.exists(OMP_SESSIONS_DIR):
         try:
             folder_part = os.path.basename(cwd.rstrip("/")) if cwd else ""
@@ -216,23 +300,74 @@ def find_latest_session_for_cwd(agent_type: str, cwd: str) -> Optional[str]:
                 matches = glob.glob(os.path.join(OMP_SESSIONS_DIR, "*", "*.jsonl"))
             if matches:
                 matches.sort(key=os.path.getmtime, reverse=True)
-                return matches[0]
+                for m in matches:
+                    if m not in claimed:
+                        return m
         except Exception:
             pass
     return None
 
 
-def extract_omp_task_from_session(session_path: str) -> Tuple[Optional[str], Optional[str], Optional[str]]:
+def extract_first_line(text: str, max_len: int = 140) -> str:
+    """Extract the first meaningful non-empty line of the assistant response."""
+    if not text:
+        return ""
+    for line in text.split("\n"):
+        line = line.strip()
+        if not line or line.startswith("```"):
+            continue
+        # Strip leading markdown headers (#, ##, ###)
+        line = re.sub(r"^#+\s*", "", line).strip()
+        # Strip markdown bolding (**text**), italics (*text*), code (`code`)
+        line = re.sub(r"\*\*([^*]+)\*\*", r"\1", line)
+        line = re.sub(r"\*([^*]+)\*", r"\1", line)
+        line = re.sub(r"`([^`]+)`", r"\1", line)
+        line = " ".join(line.split())
+        if not line:
+            continue
+        if len(line) > max_len:
+            return line[:max_len - 1].rstrip() + "…"
+        return line
+    return ""
+
+
+def clean_user_prompt(text: str) -> str:
+    """Clean user prompt text by stripping system wrappers, XML tags, and extra whitespace."""
+    if not text:
+        return ""
+    cleaned = re.sub(r"<system-reminder>.*?</system-reminder>", "", text, flags=re.DOTALL).strip()
+    cleaned = re.sub(r"<system-directive>.*?</system-directive>", "", cleaned, flags=re.DOTALL).strip()
+    cleaned = re.sub(r"<[^>]+>", "", cleaned).strip()
+    cleaned = re.sub(r"^#+\s*", "", cleaned).strip()
+    return " ".join(cleaned.split())
+
+
+def is_system_wrapper(text: str) -> bool:
+    """Check if a prompt is an internal system directive or retry wrapper rather than a human prompt."""
+    if not text:
+        return True
+    t = text.strip()
+    if t.startswith("[System:") or t.startswith("[system:") or t.startswith("<system-directive>"):
+        return True
+    return False
+
+
+def extract_omp_task_from_session(
+    session_path: str,
+) -> Tuple[Optional[str], Optional[str], Optional[str], Optional[str], bool]:
     """
-    Extract user goal, latest activity/tool, and model from an OMP session .jsonl file.
-    Returns (user_goal, latest_activity, model_name).
+    Extract latest user prompt, latest activity/detail, model name, status override, and has_question flag from an OMP session .jsonl file.
+    Returns (latest_user_prompt, detail_text, model_name, status_override, has_question).
     """
     if not session_path or not os.path.exists(session_path):
-        return None, None, None
+        return None, None, None, None, False
     try:
-        user_goal = None
-        latest_activity = None
+        latest_user_prompt = None
         model_name = None
+        last_assistant_text = None
+        pending_tool = None
+        pending_ask_question = None
+        session_exited = False
 
         with open(session_path, "r", encoding="utf-8", errors="replace") as f:
             for line in f:
@@ -257,63 +392,153 @@ def extract_omp_task_from_session(session_path: str) -> Tuple[Optional[str], Opt
                         if "model" in msg and msg["model"]:
                             model_name = msg["model"]
 
-                        if role == "user" and not user_goal:
+                        if role == "user":
                             content = msg.get("content")
+                            raw_txt = ""
                             if isinstance(content, list):
                                 parts = [p.get("text", "") for p in content if isinstance(p, dict) and p.get("text")]
-                                user_goal = "".join(parts).strip()
+                                raw_txt = "".join(parts).strip()
                             elif isinstance(content, str):
-                                user_goal = content.strip()
+                                raw_txt = content.strip()
+
+                            cleaned = clean_user_prompt(raw_txt)
+                            if cleaned and not is_system_wrapper(cleaned):
+                                latest_user_prompt = cleaned
+
                         elif role == "assistant":
                             content = msg.get("content", [])
                             if isinstance(content, list):
-                                for item in reversed(content):
+                                for item in content:
                                     if isinstance(item, dict):
-                                        if item.get("type") == "toolCall":
-                                            intent = item.get("intent") or item.get("name")
-                                            if intent:
-                                                latest_activity = f"Tool: {intent}"
-                                                break
-                                        elif item.get("type") == "text" and item.get("text"):
-                                            txt = item["text"].strip().split("\n")[0]
-                                            if txt and not txt.startswith("```"):
-                                                latest_activity = txt[:80]
-                                                break
+                                        if item.get("type") == "text" and item.get("text"):
+                                            last_assistant_text = item["text"]
+                                            pending_tool = None
+                                            pending_ask_question = None
+                                        elif item.get("type") == "toolCall":
+                                            t_name = item.get("name") or "tool"
+                                            t_intent = item.get("intent") or (item.get("arguments") or item.get("args") or {}).get("i") or t_name
+                                            pending_tool = (t_name, t_intent)
+                                            if t_name == "ask":
+                                                args = item.get("arguments") or item.get("args") or {}
+                                                questions = args.get("questions") or []
+                                                if questions and isinstance(questions, list) and isinstance(questions[0], dict):
+                                                    pending_ask_question = questions[0].get("question") or questions[0].get("header")
+
+                        elif role == "toolResult":
+                            pending_tool = None
+                            pending_ask_question = None
+
                     elif msg_type == "custom":
                         c_type = entry.get("customType")
                         if c_type == "tool_execution_start":
                             data = entry.get("data", {})
-                            intent = data.get("intent") or data.get("toolName")
-                            if intent:
-                                latest_activity = f"Running: {intent}"
+                            t_name = data.get("toolName") or "tool"
+                            t_intent = data.get("intent") or t_name
+                            pending_tool = (t_name, t_intent)
+                            if t_name == "ask":
+                                q = data.get("question")
+                                if q:
+                                    pending_ask_question = q
+                        elif c_type == "session_exit":
+                            session_exited = True
+                            pending_tool = None
+                            pending_ask_question = None
                 except Exception:
                     continue
 
-        if user_goal:
-            user_goal = " ".join(user_goal.split())
-        return user_goal, latest_activity, clean_model_name(model_name)
+        status_override = None
+        detail = None
+        has_question = False
+
+        if pending_ask_question:
+            status_override = "waiting"
+            detail = f"❓ {pending_ask_question}"
+            has_question = True
+        elif pending_tool:
+            status_override = "working"
+            t_name, t_intent = pending_tool
+            detail = f"Running: {t_intent}" if t_intent else f"Running tool: {t_name}"
+        elif last_assistant_text:
+            status_override = "idle"
+            detail = extract_first_line(last_assistant_text)
+            has_question = "?" in (detail[-40:] if detail else "")
+        return latest_user_prompt, detail, clean_model_name(model_name), status_override, has_question
     except Exception:
-        return None, None, None
+        return None, None, None, None, False
 
 
-def extract_hermes_latest_session() -> Tuple[Optional[str], Optional[str], Optional[str], Optional[str], Optional[float]]:
-    """Extract latest session info from Hermes state.db."""
+def extract_hermes_latest_session() -> Tuple[Optional[str], Optional[str], Optional[str], Optional[str], Optional[str], Optional[str], bool]:
+    """Extract latest user prompt, model, provider, profile, and message detail from Hermes state.db."""
     if not os.path.exists(HERMES_STATE_DB):
-        return None, None, None, None, None
+        return None, None, None, None, None, None, False
     try:
         conn = sqlite3.connect(HERMES_STATE_DB, timeout=0.5)
         cur = conn.cursor()
         cur.execute(
-            "SELECT title, model, billing_provider, profile_name, last_activity_at FROM sessions ORDER BY last_activity_at DESC LIMIT 1;"
+            "SELECT id, title, model, billing_provider, profile_name, last_activity_at FROM sessions ORDER BY last_activity_at DESC LIMIT 1;"
         )
         row = cur.fetchone()
+        if not row:
+            conn.close()
+            return None, None, None, None, None, None, False
+
+        session_id, title, model, provider, profile, last_active = row
+        latest_user_prompt = None
+        detail = None
+        status_override = None
+        has_question = False
+
+        try:
+            # Find latest human prompt
+            cur.execute(
+                "SELECT content FROM messages WHERE session_id = ? AND role = 'user' ORDER BY id DESC;",
+                (session_id,)
+            )
+            user_rows = cur.fetchall()
+            for ur in user_rows:
+                if ur and ur[0]:
+                    cleaned_p = clean_user_prompt(ur[0])
+                    if cleaned_p and not is_system_wrapper(cleaned_p):
+                        latest_user_prompt = cleaned_p
+                        break
+            if not latest_user_prompt and user_rows and user_rows[0] and user_rows[0][0]:
+                latest_user_prompt = clean_user_prompt(user_rows[0][0])
+
+            # Find latest assistant response / tool status
+            cur.execute(
+                "SELECT role, content, tool_name, tool_calls FROM messages WHERE session_id = ? ORDER BY id DESC LIMIT 1;",
+                (session_id,)
+            )
+            msg_row = cur.fetchone()
+            if msg_row:
+                role, content, tool_name, tool_calls = msg_row
+                if role == "assistant":
+                    if tool_calls:
+                        try:
+                            tc = json.loads(tool_calls)
+                            if tc and isinstance(tc, list):
+                                fn = tc[0].get("function", {})
+                                fname = fn.get("name") or "tool"
+                                detail = f"Running: {fname}"
+                                status_override = "working"
+                        except Exception:
+                            detail = "Running tool"
+                            status_override = "working"
+                    elif content:
+                        detail = extract_first_line(content)
+                        status_override = "idle"
+                        has_question = "?" in (detail[-40:] if detail else "")
+                elif role == "tool":
+                    detail = f"Tool result: {tool_name or 'completed'}"
+                    status_override = "working"
+        except Exception:
+            pass
+
         conn.close()
-        if row:
-            title, model, provider, profile, last_active = row
-            return title or "", clean_model_name(model or "ox-alpha-free"), provider or "", profile or "", last_active
+        effective_prompt = latest_user_prompt or title or ""
+        return effective_prompt, clean_model_name(model or "ox-alpha-free"), provider or "", profile or "", detail, status_override, has_question
     except Exception:
-        pass
-    return None, None, None, None, None
+        return None, None, None, None, None, None, False
 
 
 def shorten_path(path: str) -> str:
@@ -328,7 +553,7 @@ def shorten_path(path: str) -> str:
     return path
 
 
-def scan_standalone_agents(herdr_server_pids: List[int], seen_cwds: Set[str]) -> List[Dict[str, Any]]:
+def scan_standalone_agents(herdr_server_pids: List[int], seen_cwds: Set[str], claimed_sessions: Set[str]) -> List[Dict[str, Any]]:
     """Discover AI agents running in normal terminal windows outside of Herdr."""
     standalone = []
     hermes_desktop_found = False
@@ -360,7 +585,7 @@ def scan_standalone_agents(herdr_server_pids: List[int], seen_cwds: Set[str]) ->
                 if "hermes_desktop" in seen_cwds or is_in_herdr:
                     continue
 
-                hermes_title, hermes_model, hermes_provider, hermes_profile, _ = extract_hermes_latest_session()
+                hermes_title, hermes_model, hermes_provider, hermes_profile, hermes_detail, hermes_status, hermes_has_q = extract_hermes_latest_session()
                 standalone.append({
                     "pane_id": f"desktop:hermes:{pid}",
                     "pid": pid,
@@ -368,9 +593,9 @@ def scan_standalone_agents(herdr_server_pids: List[int], seen_cwds: Set[str]) ->
                     "origin_label": "Hermes Desktop",
                     "agent": "hermes",
                     "agent_display": "Hermes Desktop",
-                    "status": "idle",
+                    "status": hermes_status or "idle",
                     "title": hermes_title or "Hermes Desktop Workspace",
-                    "detail": f"Profile: {hermes_profile or 'Default'}",
+                    "detail": hermes_detail or f"Profile: {hermes_profile or 'Default'}",
                     "cwd": "~/.hermes",
                     "repo": "Hermes Desktop",
                     "workspace": "Desktop App",
@@ -379,6 +604,7 @@ def scan_standalone_agents(herdr_server_pids: List[int], seen_cwds: Set[str]) ->
                     "focused": False,
                     "model": hermes_model or "ox-alpha-free",
                     "session_path": "",
+                    "has_question": hermes_has_q,
                 })
                 continue
 
@@ -388,13 +614,7 @@ def scan_standalone_agents(herdr_server_pids: List[int], seen_cwds: Set[str]) ->
             agent_type = None
             if first in ("omp", "pi"):
                 agent_type = "omp"
-            elif first == "claude":
-                agent_type = "claude"
-            elif first == "codex":
-                agent_type = "codex"
-            elif first == "opencode":
-                agent_type = "opencode"
-            elif first in ("cline", "cursor"):
+            elif first in ("claude", "codex", "opencode", "cline", "cursor"):
                 agent_type = first
             elif first == "python" and ("hermes_cli.main" in cmd or "hermes desktop" in cmd):
                 agent_type = "hermes"
@@ -417,39 +637,64 @@ def scan_standalone_agents(herdr_server_pids: List[int], seen_cwds: Set[str]) ->
                 repo_name = os.path.basename(cwd.rstrip("/")) if cwd else ""
                 clean_cwd = shorten_path(cwd)
 
-                session_path = find_latest_session_for_cwd(agent_type, cwd)
+                matched_client = match_hypr_client_for_terminal(ancestor_pids, cwd, agent_type)
+                if matched_client:
+                    ws_id = str(matched_client.get("workspace", {}).get("name", matched_client.get("workspace", {}).get("id", "1")))
+                    workspace_name = f"Desktop {ws_id}"
+                    tab_name = f"{term_name.capitalize()} (Desktop {ws_id})"
+                    window_addr = matched_client.get("address", "")
+                    pane_id = f"terminal:addr:{window_addr}" if window_addr else f"terminal:pid:{pid}"
+                else:
+                    workspace_name = "Terminal"
+                    tab_name = f"{term_name.capitalize()} (PID {pid})"
+                    pane_id = f"terminal:pid:{pid}"
+
+                session_path = find_session_for_process(agent_type, pid, cwd, claimed_sessions)
                 user_goal = None
-                latest_activity = None
+                detail_text = None
                 model_name = None
+                status_override = None
+                has_question = False
 
-                if agent_type == "omp" and session_path:
-                    user_goal, latest_activity, model_name = extract_omp_task_from_session(session_path)
-                elif agent_type == "hermes":
-                    hermes_title, hermes_model, _, hermes_profile, _ = extract_hermes_latest_session()
-                    user_goal = hermes_title
-                    model_name = hermes_model
+                if session_path:
+                    claimed_sessions.add(session_path)
+                    if agent_type == "omp":
+                        user_goal, detail_text, model_name, status_override, has_question = extract_omp_task_from_session(session_path)
+                    elif agent_type == "hermes":
+                        user_goal, model_name, _, _, detail_text, status_override, has_question = extract_hermes_latest_session()
+                else:
+                    detail_text = "Ready for prompt"
+                    status_override = "idle"
 
-                effective_title = user_goal or (f"Working in {repo_name}" if repo_name and repo_name not in ("tmp", "~") else f"{agent_type.upper()} standalone session")
-                detail_text = latest_activity or clean_cwd
+                if user_goal:
+                    effective_title = user_goal
+                elif repo_name and repo_name not in ("tmp", "~"):
+                    effective_title = f"{agent_type.upper()} session in {repo_name}"
+                else:
+                    effective_title = f"{agent_type.upper()} session ({repo_name or '~'})"
+
+                detail_display = detail_text or clean_cwd
+                effective_status = status_override or ("working" if info.get("state") in ("R", "D") else "idle")
 
                 standalone.append({
-                    "pane_id": f"terminal:pid:{pid}",
+                    "pane_id": pane_id,
                     "pid": pid,
                     "origin": "terminal",
                     "origin_label": f"Terminal ({term_name.capitalize()})",
                     "agent": agent_type,
                     "agent_display": agent_type.upper() if agent_type in ("omp", "pi") else agent_type.capitalize(),
-                    "status": "working" if info.get("state") in ("R", "D") else "idle",
+                    "status": effective_status,
                     "title": effective_title,
-                    "detail": detail_text,
+                    "detail": detail_display,
                     "cwd": clean_cwd,
                     "repo": repo_name,
-                    "workspace": "Terminal",
-                    "tab": f"{term_name.capitalize()} (PID {pid})",
+                    "workspace": workspace_name,
+                    "tab": tab_name,
                     "pane_label": f"PID {pid}",
                     "focused": False,
                     "model": model_name or "",
                     "session_path": session_path or "",
+                    "has_question": has_question,
                 })
         except Exception:
             continue
@@ -471,6 +716,7 @@ def fetch_all_agents() -> Dict[str, Any]:
     active_agent_types = set()
     top_working_task = ""
     seen_cwds: Set[str] = set()
+    claimed_sessions: Set[str] = set()
 
     herdr_connected = bool(resp and "result" in resp and "snapshot" in resp["result"])
 
@@ -493,20 +739,6 @@ def fetch_all_agents() -> Dict[str, Any]:
 
             agent_type = (a.get("agent") or "agent").lower()
             raw_status = (a.get("agent_status") or "idle").lower()
-
-            if raw_status in ("working", "busy", "running"):
-                status = "working"
-                working_count += 1
-                active_agent_types.add(agent_type)
-            elif raw_status in ("waiting", "prompt", "input"):
-                status = "waiting"
-                waiting_count += 1
-                active_agent_types.add(agent_type)
-            elif raw_status in ("error", "failed"):
-                status = "error"
-            else:
-                status = "idle"
-                idle_count += 1
 
             cwd = a.get("foreground_cwd") or a.get("cwd") or pane_info.get("foreground_cwd") or pane_info.get("cwd") or ""
             repo_name = os.path.basename(cwd.rstrip("/")) if cwd else ""
@@ -532,43 +764,67 @@ def fetch_all_agents() -> Dict[str, Any]:
             session_path = agent_session.get("value") if isinstance(agent_session, dict) else None
 
             if not session_path or not os.path.exists(session_path):
-                session_path = find_latest_session_for_cwd(agent_type, cwd)
+                session_path = find_latest_session_for_cwd(agent_type, cwd, claimed_sessions)
+
+            if session_path:
+                claimed_sessions.add(session_path)
 
             user_goal = None
-            latest_activity = None
+            detail_text = None
             model_name = None
+            status_override = None
+            has_question = False
 
             if agent_type == "omp" and session_path:
-                user_goal, latest_activity, model_name = extract_omp_task_from_session(session_path)
+                user_goal, detail_text, model_name, status_override, has_question = extract_omp_task_from_session(session_path)
             elif agent_type == "hermes":
-                hermes_title, hermes_model, _, hermes_profile, _ = extract_hermes_latest_session()
-                if hermes_title:
-                    user_goal = hermes_title
-                model_name = hermes_model
+                user_goal, model_name, _, _, detail_text, status_override, has_question = extract_hermes_latest_session()
 
             is_generic_title = cleaned_title in (repo_name, "~", "tmp", "/tmp", "") or cleaned_title.startswith("/tmp") or cleaned_title.startswith("alberto@")
 
-            if user_goal and (is_generic_title or len(cleaned_title) < 4):
+            if user_goal:
                 effective_title = user_goal
             elif cleaned_title and not is_generic_title:
                 effective_title = cleaned_title
-            elif user_goal:
-                effective_title = user_goal
             elif pane_label:
                 effective_title = pane_label
             elif repo_name and repo_name not in ("tmp", "~"):
                 effective_title = f"Working in {repo_name}"
             else:
                 effective_title = f"{agent_type.upper()} session"
-
-            if status == "working" and not top_working_task:
-                top_working_task = f"{agent_type.upper()}: {effective_title}"
-
-            detail_text = latest_activity or (user_goal if user_goal and user_goal != effective_title else "") or clean_cwd
+            # Determine effective status
+            if status_override == "waiting":
+                status = "waiting"
+            elif raw_status in ("waiting", "prompt", "input"):
+                status = "waiting"
+            elif status_override == "working":
+                status = "working"
+            elif raw_status in ("working", "busy", "running"):
+                if status_override == "idle" and not a.get("focused"):
+                    status = "idle"
+                else:
+                    status = "working"
+            elif raw_status in ("error", "failed"):
+                status = "error"
+            else:
+                status = "idle"
 
             origin = "herdr_desktop" if is_hermes_desktop else "herdr"
             origin_label = "Herdr (Desktop)" if is_hermes_desktop else "Herdr"
             display_name = "Hermes Desktop" if is_hermes_desktop else (agent_type.upper() if agent_type in ("omp", "pi") else agent_type.capitalize())
+
+            if status == "working":
+                working_count += 1
+                active_agent_types.add(agent_type)
+                if not top_working_task:
+                    top_working_task = f"{display_name}: {effective_title}"
+            elif status == "waiting":
+                waiting_count += 1
+                active_agent_types.add(agent_type)
+            else:
+                idle_count += 1
+
+            detail_display = detail_text or (user_goal if user_goal and user_goal != effective_title else "") or clean_cwd
 
             agents_list.append(
                 {
@@ -579,7 +835,7 @@ def fetch_all_agents() -> Dict[str, Any]:
                     "agent_display": display_name,
                     "status": status,
                     "title": effective_title,
-                    "detail": detail_text,
+                    "detail": detail_display,
                     "cwd": clean_cwd,
                     "repo": repo_name,
                     "workspace": workspace_name,
@@ -588,16 +844,20 @@ def fetch_all_agents() -> Dict[str, Any]:
                     "focused": bool(a.get("focused")),
                     "model": model_name or "",
                     "session_path": session_path or "",
+                    "has_question": has_question,
                 }
             )
 
-    standalone_agents = scan_standalone_agents(herdr_pids, seen_cwds)
+    standalone_agents = scan_standalone_agents(herdr_pids, seen_cwds, claimed_sessions)
     for sa in standalone_agents:
         if sa["status"] == "working":
             working_count += 1
             active_agent_types.add(sa["agent"])
             if not top_working_task:
                 top_working_task = f"{sa['agent_display']}: {sa['title']}"
+        elif sa["status"] == "waiting":
+            waiting_count += 1
+            active_agent_types.add(sa["agent"])
         else:
             idle_count += 1
         agents_list.append(sa)
@@ -609,12 +869,24 @@ def fetch_all_agents() -> Dict[str, Any]:
     agents_list.sort(key=agent_sort_key)
 
     total = len(agents_list)
-    if working_count > 0:
+    if waiting_count > 0:
+        waiting_agent = next((a for a in agents_list if a["status"] == "waiting"), None)
+        if waiting_agent and waiting_agent.get("detail"):
+            headline = f"{waiting_agent['agent_display']}: {waiting_agent['detail']}"
+        else:
+            headline = f"{waiting_count} agent{'s' if waiting_count > 1 else ''} awaiting input"
+    elif working_count > 0:
         headline = top_working_task or f"{working_count} agent{'s' if working_count > 1 else ''} busy"
     elif total > 0:
         headline = f"{total} agent{'s' if total > 1 else ''} idle"
     else:
         headline = "No active agents"
+
+    all_workspaces = list(workspaces_map.values())
+    for sa in standalone_agents:
+        ws = sa.get("workspace")
+        if ws and ws not in all_workspaces:
+            all_workspaces.append(ws)
 
     return {
         "ok": True,
@@ -628,7 +900,7 @@ def fetch_all_agents() -> Dict[str, Any]:
             "headline": headline,
         },
         "agents": agents_list,
-        "workspaces": list(workspaces_map.values()),
+        "workspaces": all_workspaces,
     }
 
 
@@ -656,17 +928,38 @@ def focus_pane(target_id: str) -> Dict[str, Any]:
         return {"ok": False, "error": "Hermes GUI window not found"}
 
     # 2. Standalone terminal window
+    if target_id.startswith("terminal:addr:"):
+        addr = target_id.split("terminal:addr:")[1]
+        target_win = next((c for c in clients if c.get("address") == addr), None)
+        if target_win:
+            focus_hypr_window(target_win)
+            return {
+                "ok": True,
+                "target": target_id,
+                "focused_window": target_win.get("title", ""),
+                "workspace": target_win.get("workspace", {}).get("id"),
+            }
+
     if target_id.startswith("terminal:pid:"):
-        standalone_win = next(
-            (
-                c
-                for c in clients
-                if c.get("class") in ("com.mitchellh.ghostty", "org.omarchy.terminal", "foot", "alacritty", "kitty")
-                and "MAIN" not in c.get("title", "")
-                and "herdr" not in c.get("title", "").lower()
-            ),
-            None,
-        )
+        pid_str = target_id.split("terminal:pid:")[1]
+        try:
+            target_pid = int(pid_str)
+            ancestors = get_process_ancestors(target_pid)
+            anc_pids = [target_pid] + [a["pid"] for a in ancestors]
+            standalone_win = match_hypr_client_for_terminal(anc_pids, "", "")
+        except Exception:
+            standalone_win = None
+        if not standalone_win:
+            standalone_win = next(
+                (
+                    c
+                    for c in clients
+                    if c.get("class") in ("com.mitchellh.ghostty", "org.omarchy.terminal", "foot", "alacritty", "kitty")
+                    and "MAIN" not in c.get("title", "")
+                    and "herdr" not in c.get("title", "").lower()
+                ),
+                None,
+            )
         if standalone_win:
             focus_hypr_window(standalone_win)
             return {
@@ -709,7 +1002,6 @@ def focus_pane(target_id: str) -> Dict[str, Any]:
         }
 
     return {"ok": True, "pane_id": target_id}
-
 
 def kill_target(target_id: str) -> Dict[str, Any]:
     """Gracefully terminate an agent process or close a Herdr pane."""

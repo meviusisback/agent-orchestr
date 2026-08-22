@@ -51,7 +51,10 @@ Panel {
   readonly property var filteredAgents: {
     var list = root.agents || []
     if (root.selectedFilter === "working") {
-      return list.filter(function(a) { return a.status === "working" || a.status === "waiting" })
+      return list.filter(function(a) { return a.status === "working" })
+    }
+    if (root.selectedFilter === "waiting") {
+      return list.filter(function(a) { return a.status === "waiting" })
     }
     if (root.selectedFilter === "idle") {
       return list.filter(function(a) { return a.status === "idle" || a.status === "error" })
@@ -101,10 +104,10 @@ Panel {
     onTriggered: root.fetchStatus()
   }
 
-  // Live pulsing animation for working agents
+  // Live pulsing animation for working and waiting agents
   property real pulseOpacity: 1.0
   SequentialAnimation on pulseOpacity {
-    running: root.summary.working > 0
+    running: (root.summary.working > 0 || root.summary.waiting > 0)
     loops: Animation.Infinite
     NumberAnimation { to: 0.35; duration: 750; easing.type: Easing.InOutQuad }
     NumberAnimation { to: 1.0; duration: 750; easing.type: Easing.InOutQuad }
@@ -168,9 +171,8 @@ Panel {
     bar: root.bar
     text: "󰚩" // Nerd font robot / orchestrator glyph
     tooltipText: Model.getTooltipText(root.summary)
-    active: root.summary.working > 0
-    activeColor: root.accent
-    onPressed: function(buttonCode) {
+    active: root.summary.working > 0 || root.summary.waiting > 0
+    activeColor: root.summary.waiting > 0 ? "#F59E0B" : root.accent
       if (buttonCode === Qt.RightButton) {
         root.fetchStatus()
       } else if (buttonCode === Qt.MiddleButton && root.agents.length > 0) {
@@ -183,7 +185,7 @@ Panel {
     // Active Badge on top of BarIconButton
     Rectangle {
       id: iconBadge
-      visible: root.summary.working > 0 || (root.showIdleInBar && root.summary.total > 0)
+      visible: root.summary.working > 0 || root.summary.waiting > 0 || (root.showIdleInBar && root.summary.total > 0)
       anchors.top: parent.top
       anchors.right: parent.right
       anchors.topMargin: Style.space(2)
@@ -191,7 +193,7 @@ Panel {
       implicitWidth: badgeInnerRow.implicitWidth + Style.space(6)
       implicitHeight: Style.space(13)
       radius: Style.space(7)
-      color: root.summary.working > 0 ? root.accent : root.alpha(root.foreground, 0.2)
+      color: root.summary.waiting > 0 ? "#F59E0B" : (root.summary.working > 0 ? root.accent : root.alpha(root.foreground, 0.2))
 
       RowLayout {
         id: badgeInnerRow
@@ -199,11 +201,11 @@ Panel {
         spacing: Style.space(2)
 
         Text {
-          text: String(root.summary.working > 0 ? root.summary.working : root.summary.total)
+          text: String(root.summary.waiting > 0 ? root.summary.waiting : (root.summary.working > 0 ? root.summary.working : root.summary.total))
           font.family: root.fontFamily
           font.pixelSize: Style.space(8)
           font.bold: true
-          color: root.summary.working > 0 ? Color.background : root.foreground
+          color: (root.summary.working > 0 || root.summary.waiting > 0) ? Color.background : root.foreground
         }
       }
     }
@@ -238,7 +240,7 @@ Panel {
         text: "󰚩"
         font.family: root.fontFamily
         font.pixelSize: Style.font.size.barIcon || Style.space(14)
-        color: root.summary.working > 0 ? root.accent : root.foreground
+        color: root.summary.waiting > 0 ? "#F59E0B" : (root.summary.working > 0 ? root.accent : root.foreground)
       }
 
       Text {
@@ -246,22 +248,21 @@ Panel {
         text: Model.formatBarHeadline(root.summary, root.barDisplay, root.maxTaskLength)
         font.family: root.fontFamily
         font.pixelSize: Style.font.caption || Style.space(11)
-        font.weight: root.summary.working > 0 ? Font.DemiBold : Font.Normal
-        color: root.summary.working > 0 ? root.foreground : root.dim
+        font.weight: (root.summary.working > 0 || root.summary.waiting > 0) ? Font.DemiBold : Font.Normal
+        color: root.summary.waiting > 0 ? "#F59E0B" : (root.summary.working > 0 ? root.foreground : root.dim)
         elide: Text.ElideRight
         Layout.maximumWidth: Style.space(220)
       }
 
       Rectangle {
         id: chipBadge
-        visible: root.summary.working > 0
+        visible: root.summary.working > 0 || root.summary.waiting > 0
         implicitWidth: Style.space(6)
         implicitHeight: Style.space(6)
         radius: Style.space(3)
-        color: root.accent
+        color: root.summary.waiting > 0 ? "#F59E0B" : root.accent
         opacity: root.pulseOpacity
       }
-    }
 
     MouseArea {
       id: dataMouse
@@ -301,7 +302,7 @@ Panel {
 
         Text {
           text: "󰚩"
-          color: root.summary.working > 0 ? root.accent : root.foreground
+          color: root.summary.waiting > 0 ? "#F59E0B" : (root.summary.working > 0 ? root.accent : root.foreground)
           font.family: root.fontFamily
           font.pixelSize: Style.space(32)
           Layout.alignment: Qt.AlignVCenter
@@ -366,20 +367,34 @@ Panel {
         spacing: Style.space(6)
 
         Repeater {
-          model: [
-            { id: "all", label: "All (" + (root.summary.total || 0) + ")" },
-            { id: "working", label: "Working (" + (root.summary.working || 0) + ")" },
-            { id: "idle", label: "Idle (" + (root.summary.idle || 0) + ")" }
-          ]
+          model: {
+            var tabs = [
+              { id: "all", label: "All (" + (root.summary.total || 0) + ")" },
+              { id: "working", label: "Active (" + (root.summary.working || 0) + ")" }
+            ]
+            if (root.summary.waiting > 0) {
+              tabs.push({ id: "waiting", label: "Prompt (" + (root.summary.waiting || 0) + ")" })
+            }
+            tabs.push({ id: "idle", label: "Idle (" + (root.summary.idle || 0) + ")" })
+            return tabs
+          }
 
           Rectangle {
             required property var modelData
             Layout.fillWidth: true
             implicitHeight: Style.space(26)
             radius: Style.space(13)
-            color: root.selectedFilter === modelData.id ? root.alpha(root.accent, 0.2) : root.alpha(root.foreground, 0.06)
+            color: {
+              if (root.selectedFilter !== modelData.id) return root.alpha(root.foreground, 0.06)
+              if (modelData.id === "waiting") return root.alpha("#F59E0B", 0.2)
+              return root.alpha(root.accent, 0.2)
+            }
             border.width: 1
-            border.color: root.selectedFilter === modelData.id ? root.accent : "transparent"
+            border.color: {
+              if (root.selectedFilter !== modelData.id) return "transparent"
+              if (modelData.id === "waiting") return "#F59E0B"
+              return root.accent
+            }
 
             Text {
               anchors.centerIn: parent
@@ -387,7 +402,11 @@ Panel {
               font.family: root.fontFamily
               font.pixelSize: Style.space(11)
               font.weight: root.selectedFilter === modelData.id ? Font.DemiBold : Font.Normal
-              color: root.selectedFilter === modelData.id ? root.accent : root.foreground
+              color: {
+                if (root.selectedFilter !== modelData.id) return root.foreground
+                if (modelData.id === "waiting") return "#F59E0B"
+                return root.accent
+              }
             }
 
             MouseArea {
@@ -425,15 +444,16 @@ Panel {
               if (cardMouseArea.containsPress) return root.track
               if (cardMouseArea.containsMouse) return root.alpha(root.foreground, 0.1)
               if (modelData.status === "working") return root.alpha(root.accent, 0.08)
+              if (modelData.status === "waiting") return root.alpha("#F59E0B", 0.1)
               return root.alpha(root.foreground, 0.04)
             }
-            border.width: modelData.status === "working" ? 1.5 : 1
+            border.width: (modelData.status === "working" || modelData.status === "waiting") ? 1.5 : 1
             border.color: {
               if (modelData.status === "working") return root.alpha(root.accent, root.pulseOpacity * 0.8)
+              if (modelData.status === "waiting") return root.alpha("#F59E0B", root.pulseOpacity * 0.8)
               if (modelData.focused) return root.alpha(root.foreground, 0.3)
               return root.alpha(root.foreground, 0.08)
             }
-
             Behavior on color { ColorAnimation { duration: 120 } }
 
             ColumnLayout {
@@ -592,15 +612,22 @@ Panel {
                 elide: Text.ElideRight
               }
 
-              // Activity Detail (if running tool or prompt)
+              // Activity Detail (if running tool, prompt question, or concluding tail)
               Text {
                 visible: Boolean(modelData.detail) && modelData.detail !== modelData.title
                 Layout.fillWidth: true
                 text: modelData.detail || ""
                 font.family: root.fontFamily
                 font.pixelSize: Style.space(10)
-                font.italic: true
-                color: root.summary.working > 0 && modelData.status === "working" ? root.accent : root.dim
+                font.italic: modelData.status === "idle"
+                color: {
+                  if (modelData.status === "waiting") return "#F59E0B"
+                  if (modelData.status === "working") return root.accent
+                  return root.dim
+                }
+                font.weight: (modelData.status === "waiting" || modelData.status === "working") ? Font.DemiBold : Font.Normal
+                wrapMode: Text.Wrap
+                maximumLineCount: 3
                 elide: Text.ElideRight
               }
 

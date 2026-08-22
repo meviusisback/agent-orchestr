@@ -110,15 +110,17 @@ function formatBarHeadline(summary, displayMode, maxLen) {
   if (!summary) return "Agents"
   var total = Number(summary.total) || 0
   var working = Number(summary.working) || 0
+  var waiting = Number(summary.waiting) || 0
   var mode = String(displayMode || "Icon").toLowerCase()
 
   if (mode === "compact") {
+    if (waiting > 0) return total + " ag · " + waiting + " prompt"
     if (working > 0) return total + " ag · " + working + " busy"
     return total + " agents"
   }
 
   if (mode === "status") {
-    if (summary.headline && working > 0) {
+    if (summary.headline && (working > 0 || waiting > 0)) {
       return truncateText(summary.headline, maxLen || 40)
     }
     if (total > 0) return total + " agents idle"
