@@ -25,6 +25,25 @@ HERMES_STATE_DB = os.path.expanduser("~/.hermes/state.db")
 
 KNOWN_TERMINALS = ("foot", "ghostty", "alacritty", "kitty", "wezterm", "gnome-terminal", "xterm")
 
+def redact_secrets(text: str) -> str:
+    """Redact common API keys, tokens, and credentials from display text."""
+    if not text:
+        return ""
+    t = text
+    # OpenAI / Anthropic / Groq / OpenRouter keys
+    t = re.sub(r"\b(sk-[a-zA-Z0-9_-]{8})[a-zA-Z0-9_-]{12,}\b", r"\1…[REDACTED]", t)
+    # GitHub tokens
+    t = re.sub(r"\b(ghp_[a-zA-Z0-9]{4})[a-zA-Z0-9]{16,}\b", r"\1…[REDACTED]", t)
+    t = re.sub(r"\b(github_pat_[a-zA-Z0-9_]{4})[a-zA-Z0-9_]{16,}\b", r"\1…[REDACTED]", t)
+    # AWS Access Key IDs
+    t = re.sub(r"\b(AKIA[0-9A-Z]{4})[0-9A-Z]{12}\b", r"\1…[REDACTED]", t)
+    # Bearer tokens
+    t = re.sub(r"(Bearer\s+)[a-zA-Z0-9._~+/-]{16,}", r"\1[REDACTED]", t, flags=re.IGNORECASE)
+    # Inline key-value tokens (e.g., api_key = "...", token: '...')
+    t = re.sub(r"((?:api[_-]?key|secret|token|password)\s*[:=]\s*['\"])[^'\"]{8,}(['\"])", r"\1[REDACTED]\2", t, flags=re.IGNORECASE)
+    return t
+
+
 
 def clean_ansi(text: str) -> str:
     """Strip ANSI escape sequences from text."""
@@ -120,7 +139,7 @@ def focus_hypr_window(client: Dict[str, Any]) -> bool:
     addr = client.get("address")
 
     # 1. Switch Hyprland workspace using Omarchy Lua dispatcher
-    if ws_id is not None:
+    if ws_id is not None and re.fullmatch(r"-?[0-9]+", str(ws_id)):
         try:
             lua_ws = f'hl.dsp.focus({{ workspace = "{ws_id}" }})'
             subprocess.run(
@@ -134,7 +153,7 @@ def focus_hypr_window(client: Dict[str, Any]) -> bool:
             pass
 
     # 2. Focus the exact window address using Omarchy Lua dispatcher
-    if addr:
+    if addr and re.fullmatch(r"(?:0x)?[0-9a-fA-F]+", str(addr)):
         try:
             lua_win = f'hl.dsp.focus({{ window = "address:{addr}" }})'
             subprocess.run(
@@ -147,6 +166,25 @@ def focus_hypr_window(client: Dict[str, Any]) -> bool:
         except Exception:
             pass
     return True
+
+
+def is_valid_agent_process(pid: int) -> bool:
+    """Validate that a PID actually corresponds to an active AI agent process before signaling."""
+    if pid <= 1:
+        return False
+    info = get_process_info(pid)
+    if not info or not info.get("cmd"):
+        return False
+    cmd = info["cmd"]
+    tokens = cmd.split()
+    first = os.path.basename(tokens[0]) if tokens else ""
+    if first in ("omp", "pi", "claude", "codex", "opencode", "cline", "cursor"):
+        return True
+    if first in ("python", "python3") and ("hermes_cli.main" in cmd or "hermes desktop" in cmd or "hermes" in cmd):
+        return True
+    if "/Hermes" in cmd or "Hermes" in cmd:
+        return True
+    return False
 
 
 def get_process_info(pid: int) -> Optional[Dict[str, Any]]:
@@ -325,6 +363,7 @@ def extract_first_line(text: str, max_len: int = 140) -> str:
         line = " ".join(line.split())
         if not line:
             continue
+        line = redact_secrets(line)
         if len(line) > max_len:
             return line[:max_len - 1].rstrip() + "…"
         return line
@@ -332,13 +371,14 @@ def extract_first_line(text: str, max_len: int = 140) -> str:
 
 
 def clean_user_prompt(text: str) -> str:
-    """Clean user prompt text by stripping system wrappers, XML tags, and extra whitespace."""
+    """Clean user prompt text by stripping system wrappers, XML tags, secrets, and extra whitespace."""
     if not text:
         return ""
     cleaned = re.sub(r"<system-reminder>.*?</system-reminder>", "", text, flags=re.DOTALL).strip()
     cleaned = re.sub(r"<system-directive>.*?</system-directive>", "", cleaned, flags=re.DOTALL).strip()
     cleaned = re.sub(r"<[^>]+>", "", cleaned).strip()
     cleaned = re.sub(r"^#+\s*", "", cleaned).strip()
+    cleaned = redact_secrets(cleaned)
     return " ".join(cleaned.split())
 
 
@@ -369,7 +409,13 @@ def extract_omp_task_from_session(
         pending_ask_question = None
         session_exited = False
 
+        file_size = os.path.getsize(session_path)
         with open(session_path, "r", encoding="utf-8", errors="replace") as f:
+            if file_size > 131072:
+                # Seek to last 128KB for fast O(1) tail read
+                f.seek(file_size - 131072)
+                f.readline()  # discard partial first line
+
             for line in f:
                 line = line.strip()
                 if not line:
@@ -446,11 +492,42 @@ def extract_omp_task_from_session(
                 except Exception:
                     continue
 
+        # If user prompt was earlier than the tail seek, quickly read from head
+        if not latest_user_prompt and file_size > 131072:
+            try:
+                with open(session_path, "r", encoding="utf-8", errors="replace") as f:
+                    for _ in range(50):
+                        line = f.readline()
+                        if not line:
+                            break
+                        try:
+                            entry = json.loads(line)
+                            if entry.get("type") == "message":
+                                msg = entry.get("message", {})
+                                if msg.get("role") == "user":
+                                    content = msg.get("content")
+                                    raw_txt = ""
+                                    if isinstance(content, list):
+                                        parts = [p.get("text", "") for p in content if isinstance(p, dict) and p.get("text")]
+                                        raw_txt = "".join(parts).strip()
+                                    elif isinstance(content, str):
+                                        raw_txt = content.strip()
+                                    cleaned = clean_user_prompt(raw_txt)
+                                    if cleaned and not is_system_wrapper(cleaned):
+                                        latest_user_prompt = cleaned
+                                        break
+                        except Exception:
+                            continue
+            except Exception:
+                pass
+
         status_override = None
         detail = None
         has_question = False
 
-        if pending_ask_question:
+        if session_exited:
+            status_override = "completed"
+        elif pending_ask_question:
             status_override = "waiting"
             detail = f"❓ {pending_ask_question}"
             has_question = True
@@ -459,9 +536,12 @@ def extract_omp_task_from_session(
             t_name, t_intent = pending_tool
             detail = f"Running: {t_intent}" if t_intent else f"Running tool: {t_name}"
         elif last_assistant_text:
-            status_override = "idle"
             detail = extract_first_line(last_assistant_text)
             has_question = "?" in (detail[-40:] if detail else "")
+            if has_question:
+                status_override = "waiting"
+            else:
+                status_override = "completed"
         return latest_user_prompt, detail, clean_model_name(model_name), status_override, has_question
     except Exception:
         return None, None, None, None, False
@@ -482,6 +562,7 @@ def get_all_hermes_dbs() -> List[Tuple[str, str]]:
 def extract_hermes_session_info(
     source_preference: Optional[str] = None,
     specific_session_id: Optional[str] = None,
+    min_start_time: Optional[float] = None,
 ) -> Tuple[Optional[str], Optional[str], Optional[str], Optional[str], Optional[str], Optional[str], bool]:
     """Extract prompt, model, provider, profile, message detail, and active status for Hermes.
 
@@ -497,7 +578,8 @@ def extract_hermes_session_info(
 
     for db_path, db_profile in all_dbs:
         try:
-            conn = sqlite3.connect(db_path, timeout=0.5)
+            db_uri = f"file:{os.path.abspath(db_path)}?mode=ro"
+            conn = sqlite3.connect(db_uri, uri=True, timeout=0.5)
             cur = conn.cursor()
 
             # Find active unexpired turn leases with alive holder PIDs
@@ -567,9 +649,29 @@ def extract_hermes_session_info(
     candidates.sort(key=sort_key, reverse=True)
     best = candidates[0]
 
+    # If the candidate session is older than the running process start time (or >4h old without an active lease),
+    # then this running Hermes instance is a fresh instance with no active prompt yet.
+    is_session_fresh = True
+    if not best["is_lease_active"]:
+        if min_start_time and best["last_active"] < (min_start_time - 30.0):
+            is_session_fresh = False
+        elif (now - best["last_active"]) > 14400.0:
+            is_session_fresh = False
+
+    if not is_session_fresh:
+        return (
+            None,
+            clean_model_name(best.get("model") or "ox-alpha-free"),
+            best.get("provider") or "",
+            best.get("profile") or "Default",
+            "Ready for prompt",
+            "idle",
+            False,
+        )
     # Open the winning DB and session to extract detailed messages
     try:
-        conn = sqlite3.connect(best["db_path"], timeout=0.5)
+        db_uri = f"file:{os.path.abspath(best['db_path'])}?mode=ro"
+        conn = sqlite3.connect(db_uri, uri=True, timeout=0.5)
         cur = conn.cursor()
         session_id = best["session_id"]
 
@@ -629,18 +731,18 @@ def extract_hermes_session_info(
                         status = "waiting"
                         detail = first_line
                     else:
-                        status = "idle"
+                        status = "completed"
                         detail = first_line
                 else:
                     if is_active:
                         status = "working"
                         detail = "Thinking…"
                     else:
-                        status = "idle"
-                        detail = "Ready for prompt"
+                        status = "completed"
+                        detail = "Task completed"
             elif role == "tool":
                 detail = f"Tool result: {tool_name or 'completed'}"
-                status = "working" if is_active else "idle"
+                status = "working" if is_active else "completed"
             elif role == "user":
                 if is_active:
                     detail = "Thinking…"
@@ -648,7 +750,6 @@ def extract_hermes_session_info(
                 else:
                     detail = "Ready for prompt"
                     status = "idle"
-
         # If detail is still not set or was generic, look for the last assistant response
         if not detail or detail == "Ready for prompt":
             cur.execute(
@@ -663,7 +764,7 @@ def extract_hermes_session_info(
 
         conn.close()
 
-        effective_prompt = latest_user_prompt or best["title"] or ""
+        effective_prompt = latest_user_prompt or redact_secrets(best["title"] or "")
         return (
             effective_prompt,
             clean_model_name(best["model"] or "ox-alpha-free"),
@@ -769,7 +870,6 @@ def scan_standalone_agents(herdr_server_pids: List[int], seen_cwds: Set[str], cl
                             break
                     if term_name:
                         break
-
                 if not term_name:
                     continue
 
@@ -801,7 +901,8 @@ def scan_standalone_agents(herdr_server_pids: List[int], seen_cwds: Set[str], cl
                     if agent_type == "omp":
                         user_goal, detail_text, model_name, status_override, has_question = extract_omp_task_from_session(session_path)
                     elif agent_type == "hermes":
-                        user_goal, model_name, _, _, detail_text, status_override, has_question = extract_hermes_session_info(source_preference="cli")
+                        p_st = get_process_start_time(pid)
+                        user_goal, model_name, _, _, detail_text, status_override, has_question = extract_hermes_session_info(source_preference="cli", min_start_time=p_st)
                 else:
                     detail_text = "Ready for prompt"
                     status_override = "idle"
@@ -851,10 +952,12 @@ def fetch_all_agents() -> Dict[str, Any]:
     panes_map = {}
     agents_list = []
     working_count = 0
+    completed_count = 0
     idle_count = 0
     waiting_count = 0
     active_agent_types = set()
     top_working_task = ""
+    top_completed_task = ""
     seen_cwds: Set[str] = set()
     claimed_sessions: Set[str] = set()
 
@@ -918,10 +1021,24 @@ def fetch_all_agents() -> Dict[str, Any]:
             if agent_type == "omp" and session_path:
                 user_goal, detail_text, model_name, status_override, has_question = extract_omp_task_from_session(session_path)
             elif agent_type == "hermes":
+                hermes_p_start = None
+                for hp in glob.glob("/proc/[0-9]*"):
+                    try:
+                        hpid = int(os.path.basename(hp))
+                        hinfo = get_process_info(hpid)
+                        if hinfo and "hermes" in hinfo["cmd"].lower() and "gateway" not in hinfo["cmd"] and "zygote" not in hinfo["cmd"]:
+                            if is_hermes_desktop and ("/Hermes" in hinfo["cmd"] or "hermes desktop" in hinfo["cmd"]):
+                                hermes_p_start = get_process_start_time(hpid)
+                                break
+                            elif not is_hermes_desktop and ("hermes_cli" in hinfo["cmd"] or hinfo["cmd"].endswith("hermes")):
+                                hermes_p_start = get_process_start_time(hpid)
+                                break
+                    except Exception:
+                        pass
                 if is_hermes_desktop:
-                    user_goal, model_name, _, _, detail_text, status_override, has_question = extract_hermes_session_info(source_preference="desktop")
+                    user_goal, model_name, _, _, detail_text, status_override, has_question = extract_hermes_session_info(source_preference="desktop", min_start_time=hermes_p_start)
                 else:
-                    user_goal, model_name, _, _, detail_text, status_override, has_question = extract_hermes_session_info(source_preference="cli")
+                    user_goal, model_name, _, _, detail_text, status_override, has_question = extract_hermes_session_info(source_preference="cli", min_start_time=hermes_p_start)
             is_generic_title = cleaned_title in (repo_name, "~", "tmp", "/tmp", "") or cleaned_title.startswith("/tmp") or cleaned_title.startswith("alberto@")
 
             if user_goal:
@@ -941,17 +1058,18 @@ def fetch_all_agents() -> Dict[str, Any]:
                 status = "waiting"
             elif status_override == "working":
                 status = "working"
-            elif agent_type == "hermes" and status_override:
-                status = status_override
             elif raw_status in ("working", "busy", "running"):
-                if status_override == "idle" and not a.get("focused"):
-                    status = "idle"
+                if status_override in ("completed", "done", "idle") and not a.get("focused"):
+                    status = status_override
                 else:
                     status = "working"
+            elif raw_status in ("completed", "done", "finished") or "✓" in title_raw or status_override in ("completed", "done"):
+                status = "completed"
             elif raw_status in ("error", "failed"):
                 status = "error"
             else:
-                status = "idle"
+                status = status_override or "idle"
+
             origin = "herdr_desktop" if is_hermes_desktop else "herdr"
             origin_label = "Herdr (Desktop)" if is_hermes_desktop else "Herdr"
             display_name = "Hermes Desktop" if is_hermes_desktop else (agent_type.upper() if agent_type in ("omp", "pi") else agent_type.capitalize())
@@ -964,9 +1082,12 @@ def fetch_all_agents() -> Dict[str, Any]:
             elif status == "waiting":
                 waiting_count += 1
                 active_agent_types.add(agent_type)
+            elif status == "completed":
+                completed_count += 1
+                if not top_completed_task:
+                    top_completed_task = f"{display_name}: ✓ {effective_title}"
             else:
                 idle_count += 1
-
             detail_display = detail_text or (user_goal if user_goal and user_goal != effective_title else "") or clean_cwd
 
             agents_list.append(
@@ -1001,13 +1122,17 @@ def fetch_all_agents() -> Dict[str, Any]:
         elif sa["status"] == "waiting":
             waiting_count += 1
             active_agent_types.add(sa["agent"])
+        elif sa["status"] == "completed":
+            completed_count += 1
+            if not top_completed_task:
+                top_completed_task = f"{sa['agent_display']}: ✓ {sa['title']}"
         else:
             idle_count += 1
         agents_list.append(sa)
 
     def agent_sort_key(item: Dict[str, Any]) -> Tuple[int, int, str]:
-        status_order = {"working": 0, "waiting": 1, "error": 2, "idle": 3}
-        return (status_order.get(item["status"], 4), 0 if item.get("focused") else 1, item["agent"])
+        status_order = {"working": 0, "waiting": 1, "completed": 2, "error": 3, "idle": 4}
+        return (status_order.get(item["status"], 5), 0 if item.get("focused") else 1, item["agent"])
 
     agents_list.sort(key=agent_sort_key)
 
@@ -1020,11 +1145,12 @@ def fetch_all_agents() -> Dict[str, Any]:
             headline = f"{waiting_count} agent{'s' if waiting_count > 1 else ''} awaiting input"
     elif working_count > 0:
         headline = top_working_task or f"{working_count} agent{'s' if working_count > 1 else ''} busy"
+    elif completed_count > 0:
+        headline = top_completed_task or f"{completed_count} agent{'s' if completed_count > 1 else ''} completed"
     elif total > 0:
         headline = f"{total} agent{'s' if total > 1 else ''} idle"
     else:
         headline = "No active agents"
-
     all_workspaces = list(workspaces_map.values())
     for sa in standalone_agents:
         ws = sa.get("workspace")
@@ -1037,6 +1163,7 @@ def fetch_all_agents() -> Dict[str, Any]:
         "summary": {
             "total": total,
             "working": working_count,
+            "completed": completed_count,
             "idle": idle_count,
             "waiting": waiting_count,
             "active_agents": sorted(list(active_agent_types)),
@@ -1073,6 +1200,8 @@ def focus_pane(target_id: str) -> Dict[str, Any]:
     # 2. Standalone terminal window
     if target_id.startswith("terminal:addr:"):
         addr = target_id.split("terminal:addr:")[1]
+        if not re.fullmatch(r"(?:0x)?[0-9a-fA-F]+", addr):
+            return {"ok": False, "error": "Invalid window address format"}
         target_win = next((c for c in clients if c.get("address") == addr), None)
         if target_win:
             focus_hypr_window(target_win)
@@ -1158,28 +1287,30 @@ def kill_target(target_id: str) -> Dict[str, Any]:
         pid_str = target_id.replace("terminal:pid:", "")
         try:
             pid = int(pid_str)
+            if not is_valid_agent_process(pid):
+                return {"ok": False, "error": f"PID {pid} is not a recognized agent process"}
             ancestors = get_process_ancestors(pid)
             clients = get_hypr_clients()
             ancestor_pids = [pid] + [a["pid"] for a in ancestors]
             matched_win = match_hypr_client_for_terminal(ancestor_pids, "", "")
             if matched_win and matched_win.get("address"):
-                try:
-                    win_addr = matched_win["address"]
-                    lua_close = f'hl.dsp.window.close({{ window = "address:{win_addr}" }})'
-                    subprocess.run(
-                        ["hyprctl", "dispatch", lua_close],
-                        env=env,
-                        stdout=subprocess.DEVNULL,
-                        stderr=subprocess.DEVNULL,
-                        timeout=0.5,
-                    )
-                except Exception:
-                    pass
-            for p in [pid] + [a["pid"] for a in ancestors[:3]]:
-                try:
-                    os.kill(p, signal.SIGTERM)
-                except ProcessLookupError:
-                    pass
+                win_addr = matched_win["address"]
+                if re.fullmatch(r"(?:0x)?[0-9a-fA-F]+", str(win_addr)):
+                    try:
+                        lua_close = f'hl.dsp.window.close({{ window = "address:{win_addr}" }})'
+                        subprocess.run(
+                            ["hyprctl", "dispatch", lua_close],
+                            env=env,
+                            stdout=subprocess.DEVNULL,
+                            stderr=subprocess.DEVNULL,
+                            timeout=0.5,
+                        )
+                    except Exception:
+                        pass
+            try:
+                os.kill(pid, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
             return {"ok": True, "killed_pid": pid}
         except Exception as e:
             return {"ok": False, "error": str(e)}
@@ -1189,6 +1320,8 @@ def kill_target(target_id: str) -> Dict[str, Any]:
         pid_str = target_id.replace("desktop:hermes:", "")
         try:
             pid = int(pid_str)
+            if not is_valid_agent_process(pid):
+                return {"ok": False, "error": f"PID {pid} is not a recognized Hermes process"}
             try:
                 subprocess.run(
                     ["hyprctl", "dispatch", 'hl.dsp.window.close({ window = "class:Hermes" })'],

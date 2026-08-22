@@ -2,8 +2,11 @@
 
 function statusColor(status, fg, accent, urgent) {
   var s = String(status || "").toLowerCase()
+  if (s === "completed" || s === "done") {
+    return "#10B981"
+  }
   if (s === "working" || s === "busy" || s === "running") {
-    return accent || "#10B981"
+    return accent || "#38BDF8"
   }
   if (s === "waiting" || s === "prompt" || s === "input") {
     return "#F59E0B"
@@ -16,6 +19,7 @@ function statusColor(status, fg, accent, urgent) {
 
 function statusBadgeText(status) {
   var s = String(status || "").toLowerCase()
+  if (s === "completed" || s === "done") return "DONE ✓"
   if (s === "working") return "ACTIVE"
   if (s === "waiting") return "PROMPT"
   if (s === "error") return "ERROR"
@@ -111,16 +115,18 @@ function formatBarHeadline(summary, displayMode, maxLen) {
   var total = Number(summary.total) || 0
   var working = Number(summary.working) || 0
   var waiting = Number(summary.waiting) || 0
+  var completed = Number(summary.completed) || 0
   var mode = String(displayMode || "Icon").toLowerCase()
 
   if (mode === "compact") {
     if (waiting > 0) return total + " ag · " + waiting + " prompt"
     if (working > 0) return total + " ag · " + working + " busy"
+    if (completed > 0) return total + " ag · " + completed + " done"
     return total + " agents"
   }
 
   if (mode === "status") {
-    if (summary.headline && (working > 0 || waiting > 0)) {
+    if (summary.headline && (working > 0 || waiting > 0 || completed > 0)) {
       return truncateText(summary.headline, maxLen || 40)
     }
     if (total > 0) return total + " agents idle"
@@ -134,6 +140,7 @@ function getTooltipText(summary) {
   if (!summary) return "Agent Orchestrator"
   var total = Number(summary.total) || 0
   var working = Number(summary.working) || 0
+  var completed = Number(summary.completed) || 0
   var idle = Number(summary.idle) || 0
   var waiting = Number(summary.waiting) || 0
 
@@ -141,6 +148,7 @@ function getTooltipText(summary) {
   var parts = []
   if (working > 0) parts.push(working + " working")
   if (waiting > 0) parts.push(waiting + " awaiting input")
+  if (completed > 0) parts.push(completed + " completed")
   if (idle > 0) parts.push(idle + " idle")
   return "Agent Orchestrator · " + parts.join(", ") + " (" + total + " total)"
 }

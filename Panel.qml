@@ -53,6 +53,9 @@ Panel {
     if (root.selectedFilter === "working") {
       return list.filter(function(a) { return a.status === "working" })
     }
+    if (root.selectedFilter === "completed") {
+      return list.filter(function(a) { return a.status === "completed" || a.status === "done" })
+    }
     if (root.selectedFilter === "waiting") {
       return list.filter(function(a) { return a.status === "waiting" })
     }
@@ -95,15 +98,18 @@ Panel {
     root.close()
   }
 
-  // Periodic status poll
+  // Periodic status poll with fast live updates when popup is open or agents are active
   Timer {
-    interval: root.refreshIntervalSec * 1000
+    interval: {
+      if (root.opened) return 1000
+      if (root.summary.working > 0 || root.summary.waiting > 0) return 1500
+      return root.refreshIntervalSec * 1000
+    }
     running: true
     repeat: true
     triggeredOnStart: true
     onTriggered: root.fetchStatus()
   }
-
   // Live pulsing animation for working and waiting agents
   property real pulseOpacity: 1.0
   SequentialAnimation on pulseOpacity {
@@ -173,6 +179,7 @@ Panel {
     tooltipText: Model.getTooltipText(root.summary)
     active: root.summary.working > 0 || root.summary.waiting > 0
     activeColor: root.summary.waiting > 0 ? "#F59E0B" : root.accent
+    onPressed: function(buttonCode) {
       if (buttonCode === Qt.RightButton) {
         root.fetchStatus()
       } else if (buttonCode === Qt.MiddleButton && root.agents.length > 0) {
@@ -246,6 +253,7 @@ Panel {
       Text {
         id: chipLabel
         text: Model.formatBarHeadline(root.summary, root.barDisplay, root.maxTaskLength)
+        textFormat: Text.PlainText
         font.family: root.fontFamily
         font.pixelSize: Style.font.caption || Style.space(11)
         font.weight: (root.summary.working > 0 || root.summary.waiting > 0) ? Font.DemiBold : Font.Normal
@@ -263,6 +271,7 @@ Panel {
         color: root.summary.waiting > 0 ? "#F59E0B" : root.accent
         opacity: root.pulseOpacity
       }
+    }
 
     MouseArea {
       id: dataMouse
@@ -372,6 +381,9 @@ Panel {
               { id: "all", label: "All (" + (root.summary.total || 0) + ")" },
               { id: "working", label: "Active (" + (root.summary.working || 0) + ")" }
             ]
+            if (root.summary.completed > 0) {
+              tabs.push({ id: "completed", label: "Done (" + (root.summary.completed || 0) + ")" })
+            }
             if (root.summary.waiting > 0) {
               tabs.push({ id: "waiting", label: "Prompt (" + (root.summary.waiting || 0) + ")" })
             }
@@ -386,12 +398,14 @@ Panel {
             radius: Style.space(13)
             color: {
               if (root.selectedFilter !== modelData.id) return root.alpha(root.foreground, 0.06)
+              if (modelData.id === "completed") return root.alpha("#10B981", 0.2)
               if (modelData.id === "waiting") return root.alpha("#F59E0B", 0.2)
               return root.alpha(root.accent, 0.2)
             }
             border.width: 1
             border.color: {
               if (root.selectedFilter !== modelData.id) return "transparent"
+              if (modelData.id === "completed") return "#10B981"
               if (modelData.id === "waiting") return "#F59E0B"
               return root.accent
             }
@@ -404,11 +418,11 @@ Panel {
               font.weight: root.selectedFilter === modelData.id ? Font.DemiBold : Font.Normal
               color: {
                 if (root.selectedFilter !== modelData.id) return root.foreground
+                if (modelData.id === "completed") return "#10B981"
                 if (modelData.id === "waiting") return "#F59E0B"
                 return root.accent
               }
             }
-
             MouseArea {
               anchors.fill: parent
               cursorShape: Qt.PointingHandCursor
@@ -444,12 +458,14 @@ Panel {
               if (cardMouseArea.containsPress) return root.track
               if (cardMouseArea.containsMouse) return root.alpha(root.foreground, 0.1)
               if (modelData.status === "working") return root.alpha(root.accent, 0.08)
+              if (modelData.status === "completed" || modelData.status === "done") return root.alpha("#10B981", 0.08)
               if (modelData.status === "waiting") return root.alpha("#F59E0B", 0.1)
               return root.alpha(root.foreground, 0.04)
             }
-            border.width: (modelData.status === "working" || modelData.status === "waiting") ? 1.5 : 1
+            border.width: (modelData.status === "working" || modelData.status === "waiting" || modelData.status === "completed" || modelData.status === "done") ? 1.5 : 1
             border.color: {
               if (modelData.status === "working") return root.alpha(root.accent, root.pulseOpacity * 0.8)
+              if (modelData.status === "completed" || modelData.status === "done") return root.alpha("#10B981", 0.6)
               if (modelData.status === "waiting") return root.alpha("#F59E0B", root.pulseOpacity * 0.8)
               if (modelData.focused) return root.alpha(root.foreground, 0.3)
               return root.alpha(root.foreground, 0.08)
@@ -480,6 +496,7 @@ Panel {
                 // Agent Name
                 Text {
                   text: modelData.agent_display || Model.agentDisplayName(modelData.agent)
+                  textFormat: Text.PlainText
                   font.family: root.fontFamily
                   font.pixelSize: Style.font.size.medium || Style.space(13)
                   font.bold: true
@@ -529,6 +546,7 @@ Panel {
                     id: modelText
                     anchors.centerIn: parent
                     text: modelData.model || ""
+                    textFormat: Text.PlainText
                     font.family: root.fontFamily
                     font.pixelSize: Style.space(9)
                     color: root.dim
@@ -554,6 +572,7 @@ Panel {
                     spacing: Style.space(4)
 
                     Rectangle {
+                      visible: modelData.status !== "completed" && modelData.status !== "done"
                       width: Style.space(5)
                       height: Style.space(5)
                       radius: Style.space(3)
@@ -603,6 +622,7 @@ Panel {
               Text {
                 Layout.fillWidth: true
                 text: modelData.title || "Active agent session"
+                textFormat: Text.PlainText
                 font.family: root.fontFamily
                 font.pixelSize: Style.font.size.small || Style.space(12)
                 font.weight: modelData.status === "working" ? Font.DemiBold : Font.Normal
@@ -617,6 +637,7 @@ Panel {
                 visible: Boolean(modelData.detail) && modelData.detail !== modelData.title
                 Layout.fillWidth: true
                 text: modelData.detail || ""
+                textFormat: Text.PlainText
                 font.family: root.fontFamily
                 font.pixelSize: Style.space(10)
                 font.italic: modelData.status === "idle"
@@ -653,6 +674,7 @@ Panel {
                     }
                     Text {
                       text: modelData.repo || modelData.cwd || "~"
+                      textFormat: Text.PlainText
                       font.family: root.fontFamily
                       font.pixelSize: Style.space(9)
                       color: root.foreground
@@ -672,6 +694,7 @@ Panel {
                     if (modelData.pane_label && modelData.pane_label !== modelData.tab) parts.push(modelData.pane_label)
                     return parts.join(" > ")
                   }
+                  textFormat: Text.PlainText
                   font.family: root.fontFamily
                   font.pixelSize: Style.space(9)
                   color: root.dim
