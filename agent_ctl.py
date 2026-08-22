@@ -11,6 +11,7 @@ import glob
 import json
 import os
 import re
+import signal
 import socket
 import sqlite3
 import subprocess
@@ -21,6 +22,8 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 HERDR_SOCK_PATH = os.path.expanduser(os.environ.get("HERDR_SOCKET_PATH", "~/.config/herdr/herdr.sock"))
 OMP_SESSIONS_DIR = os.path.expanduser("~/.omp/agent/sessions")
 HERMES_STATE_DB = os.path.expanduser("~/.hermes/state.db")
+
+KNOWN_TERMINALS = ("foot", "ghostty", "alacritty", "kitty", "wezterm", "gnome-terminal", "xterm")
 
 
 def clean_ansi(text: str) -> str:
@@ -86,18 +89,22 @@ def get_hypr_env() -> Dict[str, str]:
 
 
 def get_process_info(pid: int) -> Optional[Dict[str, Any]]:
-    """Read process cmdline, parent PID, and cwd from /proc."""
+    """Robustly parse /proc/<pid>/stat and cmdline."""
     try:
         proc_dir = f"/proc/{pid}"
         if not os.path.exists(proc_dir):
             return None
-        with open(f"{proc_dir}/cmdline", "rb") as f:
-            cmd = f.read().decode("utf-8", errors="replace").replace("\x00", " ").strip()
-        with open(f"{proc_dir}/stat", "r") as f:
-            stat_parts = f.read().split()
-            ppid = int(stat_parts[3])
-            tty_nr = int(stat_parts[6])
-            state = stat_parts[2]
+        with open(f"{proc_dir}/stat", "r") as sf:
+            content = sf.read()
+            last_paren = content.rfind(")")
+            if last_paren == -1:
+                return None
+            fields = content[last_paren + 1:].split()
+            state = fields[0]
+            ppid = int(fields[1])
+            tty_nr = int(fields[4])
+        with open(f"{proc_dir}/cmdline", "rb") as cf:
+            cmd = cf.read().decode("utf-8", errors="replace").replace("\x00", " ").strip()
         cwd = os.path.realpath(f"{proc_dir}/cwd")
         return {"pid": pid, "ppid": ppid, "tty": tty_nr, "state": state, "cmd": cmd, "cwd": cwd}
     except Exception:
@@ -105,22 +112,22 @@ def get_process_info(pid: int) -> Optional[Dict[str, Any]]:
 
 
 def get_herdr_server_pids() -> List[int]:
-    """Find PID(s) of running Herdr server instances."""
+    """Find PID(s) of running Herdr server and client instances."""
     pids = []
     for p in glob.glob("/proc/[0-9]*"):
         try:
             pid = int(os.path.basename(p))
             info = get_process_info(pid)
-            if info and "herdr server" in info["cmd"]:
+            if info and ("herdr server" in info["cmd"] or info["cmd"] == "herdr" or "herdr --session" in info["cmd"]):
                 pids.append(pid)
         except Exception:
             continue
     return pids
 
 
-def get_process_ancestors(pid: int, max_depth: int = 20) -> List[int]:
-    """Return ordered list of ancestor PIDs up to PID 1."""
-    ancestors = [pid]
+def get_process_ancestors(pid: int, max_depth: int = 20) -> List[Dict[str, Any]]:
+    """Return ordered list of ancestor process info dictionaries up to PID 1."""
+    ancestors = []
     curr = pid
     visited = set()
     depth = 0
@@ -130,7 +137,7 @@ def get_process_ancestors(pid: int, max_depth: int = 20) -> List[int]:
         info = get_process_info(curr)
         if not info or info["ppid"] <= 0:
             break
-        ancestors.append(info["ppid"])
+        ancestors.append(info)
         curr = info["ppid"]
     return ancestors
 
@@ -141,9 +148,9 @@ def resolve_hyprland_window_for_pid(target_pid: int) -> Optional[Dict[str, Any]]
     try:
         out = subprocess.check_output(["hyprctl", "-j", "clients"], env=env, timeout=0.5).decode()
         clients = json.loads(out)
-        ancestors = get_process_ancestors(target_pid)
+        ancestor_pids = [target_pid] + [a["pid"] for a in get_process_ancestors(target_pid)]
         for c in clients:
-            if c.get("pid") in ancestors:
+            if c.get("pid") in ancestor_pids:
                 return c
     except Exception:
         pass
@@ -279,7 +286,17 @@ def scan_standalone_agents(herdr_server_pids: List[int], seen_cwds: Set[str]) ->
             cmd = info["cmd"]
 
             ancestors = get_process_ancestors(pid)
-            is_in_herdr = any(hp in ancestors for hp in herdr_server_pids)
+            ancestor_pids = [a["pid"] for a in ancestors]
+
+            is_in_herdr = any(hp in ancestor_pids for hp in herdr_server_pids)
+            is_broker_child = any(
+                "daemon_broker" in a["cmd"] or "__omp_worker" in a["cmd"] or "runner-" in a["cmd"]
+                for a in ancestors
+            )
+
+            # Skip anything running inside Herdr, spawned as an internal background worker, or system usage script
+            if is_in_herdr or is_broker_child or "omarchy-agent-usage" in cmd or "__omp_worker" in cmd or "gateway run" in cmd or "serve --host" in cmd or "zygote" in cmd or "agent_ctl.py" in cmd:
+                continue
 
             # Check if this is a Hermes Desktop GUI process
             if "/Hermes" in cmd and "--type=" not in cmd and not hermes_desktop_found:
@@ -326,9 +343,19 @@ def scan_standalone_agents(herdr_server_pids: List[int], seen_cwds: Set[str]) ->
             elif first == "python" and ("hermes_cli.main" in cmd or "hermes desktop" in cmd):
                 agent_type = "hermes"
 
-            # Only include if truly outside Herdr
-            if agent_type and not is_in_herdr:
-                if "__omp_worker" in cmd or "gateway run" in cmd or "serve --host" in cmd or "zygote" in cmd or "agent_ctl.py" in cmd:
+            if agent_type:
+                # MUST have an interactive terminal emulator in its ancestor chain to be a standalone terminal session
+                term_name = None
+                for anc in ancestors:
+                    anc_cmd = anc["cmd"].lower()
+                    for t in KNOWN_TERMINALS:
+                        if t in anc_cmd:
+                            term_name = t
+                            break
+                    if term_name:
+                        break
+
+                if not term_name:
                     continue
 
                 cwd = info["cwd"]
@@ -349,18 +376,6 @@ def scan_standalone_agents(herdr_server_pids: List[int], seen_cwds: Set[str]) ->
 
                 effective_title = user_goal or (f"Working in {repo_name}" if repo_name and repo_name not in ("tmp", "~") else f"{agent_type.upper()} standalone session")
                 detail_text = latest_activity or clean_cwd
-
-                term_name = "terminal"
-                for anc_pid in ancestors:
-                    anc_info = get_process_info(anc_pid)
-                    if anc_info:
-                        anc_cmd = anc_info["cmd"].lower()
-                        for t in ("foot", "ghostty", "alacritty", "kitty", "wezterm", "gnome-terminal"):
-                            if t in anc_cmd:
-                                term_name = t
-                                break
-                        if term_name != "terminal":
-                            break
 
                 standalone.append({
                     "pane_id": f"terminal:pid:{pid}",
@@ -595,7 +610,6 @@ def focus_pane(target_id: str) -> Dict[str, Any]:
                 )
                 return {"ok": True, "target": target_id, "mode": "hypr_address", "address": win["address"]}
             else:
-                # Fallback to class / pid
                 subprocess.run(
                     ["hyprctl", "dispatch", "focuswindow", f"pid:{target_pid}"],
                     env=env,
@@ -610,7 +624,6 @@ def focus_pane(target_id: str) -> Dict[str, Any]:
     # 3. Herdr pane
     res = query_herdr_socket("pane.focus", {"pane_id": target_id})
     try:
-        # Focus the terminal emulator window running Herdr (e.g. Ghostty or Foot)
         subprocess.run(
             ["hyprctl", "dispatch", "focuswindow", "class:^(com.mitchellh.ghostty|ghostty|org.omarchy.terminal|foot|alacritty|kitty)$"],
             env=env,
@@ -621,6 +634,62 @@ def focus_pane(target_id: str) -> Dict[str, Any]:
     except Exception:
         pass
 
+    return {"ok": True, "pane_id": target_id, "socket_res": res}
+
+
+def kill_target(target_id: str) -> Dict[str, Any]:
+    """Gracefully terminate an agent process or close a Herdr pane."""
+    if not target_id:
+        return {"ok": False, "error": "No target_id provided"}
+
+    env = get_hypr_env()
+
+    # 1. Standalone terminal process
+    if target_id.startswith("terminal:pid:"):
+        pid_str = target_id.replace("terminal:pid:", "")
+        try:
+            pid = int(pid_str)
+            ancestors = get_process_ancestors(pid)
+            win = resolve_hyprland_window_for_pid(pid)
+            if win and win.get("address"):
+                subprocess.run(
+                    ["hyprctl", "dispatch", "closewindow", f"address:{win['address']}"],
+                    env=env,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    timeout=0.5,
+                )
+            for p in [pid] + [a["pid"] for a in ancestors[:3]]:
+                try:
+                    os.kill(p, signal.SIGTERM)
+                except ProcessLookupError:
+                    pass
+            return {"ok": True, "killed_pid": pid}
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
+
+    # 2. Hermes Desktop window
+    if target_id.startswith("desktop:hermes:"):
+        pid_str = target_id.replace("desktop:hermes:", "")
+        try:
+            pid = int(pid_str)
+            subprocess.run(
+                ["hyprctl", "dispatch", "closewindow", "class:^(Hermes|hermes)$"],
+                env=env,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=0.5,
+            )
+            try:
+                os.kill(pid, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+            return {"ok": True, "killed_pid": pid}
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
+
+    # 3. Herdr pane
+    res = query_herdr_socket("pane.close", {"pane_id": target_id})
     return {"ok": True, "pane_id": target_id, "socket_res": res}
 
 
@@ -647,6 +716,15 @@ def main() -> None:
             sys.exit(1)
         target_id = sys.argv[2]
         result = focus_pane(target_id)
+        print(json.dumps(result))
+        return
+
+    if cmd in ("kill", "--kill", "stop", "--stop", "-k"):
+        if len(sys.argv) < 3:
+            print(json.dumps({"ok": False, "error": "Missing pane_id/target_id"}))
+            sys.exit(1)
+        target_id = sys.argv[2]
+        result = kill_target(target_id)
         print(json.dumps(result))
         return
 

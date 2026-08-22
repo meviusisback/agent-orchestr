@@ -80,6 +80,12 @@ Panel {
     root.close()
   }
 
+  function killTarget(paneId) {
+    if (!paneId) return
+    killProc.command = ["python3", root.scriptPath(), "kill", paneId]
+    killProc.running = true
+  }
+
   function launchAgent(agentName) {
     launchProc.command = ["python3", root.scriptPath(), "launch", agentName || ""]
     launchProc.running = true
@@ -132,6 +138,14 @@ Panel {
   }
 
   Process {
+    id: killProc
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: root.fetchStatus()
+    }
+  }
+
+  Process {
     id: launchProc
   }
 
@@ -143,6 +157,7 @@ Panel {
     function toggle(): void { root.toggle() }
     function refresh(): void { root.fetchStatus() }
     function focus(paneId: string): void { root.focusPane(paneId) }
+    function kill(paneId: string): void { root.killTarget(paneId) }
   }
 
   // ------------------------------------------------------------- Bar Button (Icon Mode)
@@ -271,7 +286,7 @@ Panel {
     bar: root.bar
     owner: root
     open: root.opened
-    contentWidth: Style.space(450)
+    contentWidth: Style.space(460)
     contentHeight: Style.space(580)
 
     ColumnLayout {
@@ -369,7 +384,7 @@ Panel {
               anchors.centerIn: parent
               text: modelData.label
               font.family: root.fontFamily
-              font.pixelSize: Style.space(10)
+              font.pixelSize: Style.space(11)
               font.weight: root.selectedFilter === modelData.id ? Font.DemiBold : Font.Normal
               color: root.selectedFilter === modelData.id ? root.accent : root.foreground
             }
@@ -425,7 +440,7 @@ Panel {
               anchors.margins: Style.space(10)
               spacing: Style.space(6)
 
-              // Card Header: Brand Icon + Name + Origin Pill + Model + Status Badge + Focus Button
+              // Card Header: Brand Icon + Name + Origin Pill + Model + Status Badge + Actions
               RowLayout {
                 Layout.fillWidth: true
                 spacing: Style.space(8)
@@ -566,6 +581,33 @@ Panel {
                     onClicked: root.focusPane(modelData.pane_id)
                   }
                 }
+
+                // Terminate / Close Button
+                Rectangle {
+                  implicitWidth: Style.space(20)
+                  implicitHeight: Style.space(20)
+                  radius: Style.space(5)
+                  color: killMouse.containsMouse ? root.alpha(root.urgent, 0.35) : root.alpha(root.foreground, 0.08)
+                  border.width: 1
+                  border.color: killMouse.containsMouse ? root.urgent : "transparent"
+
+                  Text {
+                    anchors.centerIn: parent
+                    text: "✕"
+                    font.family: root.fontFamily
+                    font.pixelSize: Style.space(10)
+                    font.bold: true
+                    color: killMouse.containsMouse ? root.urgent : root.dim
+                  }
+
+                  MouseArea {
+                    id: killMouse
+                    anchors.fill: parent
+                    hoverEnabled: true
+                    cursorShape: Qt.PointingHandCursor
+                    onClicked: root.killTarget(modelData.pane_id)
+                  }
+                }
               }
 
               // Task Title
@@ -685,7 +727,7 @@ Panel {
 
           // Keyboard hint
           Text {
-            text: "Click card to focus · Right-click bar to refresh"
+            text: "Click card to focus · ✕ to terminate"
             font.family: root.fontFamily
             font.pixelSize: Style.space(9)
             color: root.dim
