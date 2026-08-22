@@ -20,7 +20,15 @@ Real-time status, active tasks, and one-click workspace switching for AI coding 
   - **Adaptive Fast Polling**: 1s live refresh while popup is open or agents are working; configurable interval when idle.
 ## Installation
 
-Symlink or clone this repository into your Omarchy plugins directory:
+### Via Omarchy Marketplace / Plugin Manager
+
+```bash
+omarchy plugin add https://github.com/meviusisback/agent-orchestr --enable
+```
+
+### Manual Installation
+
+Clone or symlink this repository into your Omarchy plugins directory:
 
 ```bash
 mkdir -p ~/.config/omarchy/plugins
@@ -43,6 +51,13 @@ And restart the shell:
 omarchy restart shell
 ```
 
+## Removal
+
+```bash
+omarchy plugin remove meviusisback.agent-orchestr
+```
+
+Or manually remove the symlink/directory from `~/.config/omarchy/plugins/meviusisback.agent-orchestr` and remove `"meviusisback.agent-orchestr"` from `~/.config/omarchy/shell.json`.
 ## Settings
 
 | Key | Default | Description |
