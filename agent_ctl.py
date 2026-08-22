@@ -72,6 +72,19 @@ def query_herdr_socket(method: str, params: Optional[Dict[str, Any]] = None, tim
         return None
 
 
+def get_hypr_env() -> Dict[str, str]:
+    """Ensure HYPRLAND_INSTANCE_SIGNATURE and XDG_RUNTIME_DIR are set for hyprctl."""
+    env = dict(os.environ)
+    runtime_dir = env.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}")
+    env["XDG_RUNTIME_DIR"] = runtime_dir
+    if "HYPRLAND_INSTANCE_SIGNATURE" not in env or not env["HYPRLAND_INSTANCE_SIGNATURE"]:
+        for s in glob.glob(f"{runtime_dir}/hypr/*"):
+            if os.path.isdir(s) and os.path.exists(f"{s}/.socket.sock"):
+                env["HYPRLAND_INSTANCE_SIGNATURE"] = os.path.basename(s)
+                break
+    return env
+
+
 def get_process_info(pid: int) -> Optional[Dict[str, Any]]:
     """Read process cmdline, parent PID, and cwd from /proc."""
     try:
@@ -107,7 +120,7 @@ def get_herdr_server_pids() -> List[int]:
 
 def get_process_ancestors(pid: int, max_depth: int = 20) -> List[int]:
     """Return ordered list of ancestor PIDs up to PID 1."""
-    ancestors = []
+    ancestors = [pid]
     curr = pid
     visited = set()
     depth = 0
@@ -120,6 +133,21 @@ def get_process_ancestors(pid: int, max_depth: int = 20) -> List[int]:
         ancestors.append(info["ppid"])
         curr = info["ppid"]
     return ancestors
+
+
+def resolve_hyprland_window_for_pid(target_pid: int) -> Optional[Dict[str, Any]]:
+    """Find the top-level Hyprland client window for a process PID."""
+    env = get_hypr_env()
+    try:
+        out = subprocess.check_output(["hyprctl", "-j", "clients"], env=env, timeout=0.5).decode()
+        clients = json.loads(out)
+        ancestors = get_process_ancestors(target_pid)
+        for c in clients:
+            if c.get("pid") in ancestors:
+                return c
+    except Exception:
+        pass
+    return None
 
 
 def find_latest_session_for_cwd(agent_type: str, cwd: str) -> Optional[str]:
@@ -535,11 +563,14 @@ def focus_pane(target_id: str) -> Dict[str, Any]:
     if not target_id:
         return {"ok": False, "error": "No target_id provided"}
 
+    env = get_hypr_env()
+
     # 1. Hermes Desktop standalone window
     if target_id.startswith("desktop:hermes:"):
         try:
             subprocess.run(
                 ["hyprctl", "dispatch", "focuswindow", "class:^(Hermes|hermes)$"],
+                env=env,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
                 timeout=0.5,
@@ -548,25 +579,41 @@ def focus_pane(target_id: str) -> Dict[str, Any]:
         except Exception as e:
             return {"ok": False, "error": str(e)}
 
-    # 2. Standalone terminal window by PID
+    # 2. Standalone terminal window by resolving its top-level Hyprland client window
     if target_id.startswith("terminal:pid:"):
-        pid = target_id.replace("terminal:pid:", "")
+        pid_str = target_id.replace("terminal:pid:", "")
         try:
-            subprocess.run(
-                ["hyprctl", "dispatch", "focuswindow", f"pid:{pid}"],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                timeout=0.5,
-            )
-            return {"ok": True, "target": target_id, "mode": "standalone_pid"}
+            target_pid = int(pid_str)
+            win = resolve_hyprland_window_for_pid(target_pid)
+            if win and win.get("address"):
+                subprocess.run(
+                    ["hyprctl", "dispatch", "focuswindow", f"address:{win['address']}"],
+                    env=env,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    timeout=0.5,
+                )
+                return {"ok": True, "target": target_id, "mode": "hypr_address", "address": win["address"]}
+            else:
+                # Fallback to class / pid
+                subprocess.run(
+                    ["hyprctl", "dispatch", "focuswindow", f"pid:{target_pid}"],
+                    env=env,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    timeout=0.5,
+                )
+                return {"ok": True, "target": target_id, "mode": "fallback_pid"}
         except Exception as e:
             return {"ok": False, "error": str(e)}
 
     # 3. Herdr pane
     res = query_herdr_socket("pane.focus", {"pane_id": target_id})
     try:
+        # Focus the terminal emulator window running Herdr (e.g. Ghostty or Foot)
         subprocess.run(
-            ["hyprctl", "dispatch", "focuswindow", "class:^(org.omarchy.terminal|foot|alacritty|kitty|ghostty)$"],
+            ["hyprctl", "dispatch", "focuswindow", "class:^(com.mitchellh.ghostty|ghostty|org.omarchy.terminal|foot|alacritty|kitty)$"],
+            env=env,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
             timeout=0.5,
