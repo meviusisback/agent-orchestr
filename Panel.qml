@@ -101,9 +101,9 @@ Panel {
   // Periodic status poll with fast live updates when popup is open or agents are active
   Timer {
     interval: {
-      if (root.opened) return 1000
-      if (root.summary.working > 0 || root.summary.waiting > 0) return 1500
-      return root.refreshIntervalSec * 1000
+      if (root.opened) return 2000
+      if (root.summary.working > 0 || root.summary.waiting > 0) return 3000
+      return Math.max(3000, root.refreshIntervalSec * 1000)
     }
     running: true
     repeat: true
@@ -128,6 +128,9 @@ Panel {
       onStreamFinished: {
         root.loading = false
         var output = text || ""
+        if (output.length > 262144) {
+          output = output.substring(0, 262144)
+        }
         try {
           var data = JSON.parse(output)
           root.rawData = data

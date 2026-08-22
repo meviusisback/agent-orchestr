@@ -106,15 +106,16 @@ def query_herdr_socket(method: str, params: Optional[Dict[str, Any]] = None, tim
         return None
     try:
         s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        s.settimeout(timeout)
+        s.settimeout(min(timeout, 0.5))
         s.connect(HERDR_SOCK_PATH)
         req_id = f"orchestr:{int(time.time() * 1000)}"
         payload = {"id": req_id, "method": method, "params": params or {}}
         s.sendall((json.dumps(payload) + "\n").encode("utf-8"))
 
+        max_bytes = 262144  # 256KB max response limit
         data = b""
-        while b"\n" not in data:
-            chunk = s.recv(65536)
+        while b"\n" not in data and len(data) < max_bytes:
+            chunk = s.recv(min(32768, max_bytes - len(data)))
             if not chunk:
                 break
             data += chunk
@@ -453,12 +454,17 @@ def extract_omp_task_from_session(
 
         file_size = os.path.getsize(session_path)
         with open(session_path, "r", encoding="utf-8", errors="replace") as f:
-            if file_size > 131072:
-                # Seek to last 128KB for fast O(1) tail read
-                f.seek(file_size - 131072)
-                f.readline()  # discard partial first line
+            tail_bytes = 65536  # Bounded 64KB tail read
+            if file_size > tail_bytes:
+                f.seek(file_size - tail_bytes)
+                f.readline(4096)  # discard partial first line
 
-            for line in f:
+            lines_read = 0
+            while lines_read < 100:
+                line = f.readline(8192)  # Bounded 8KB per line
+                if not line:
+                    break
+                lines_read += 1
                 line = line.strip()
                 if not line:
                     continue
@@ -493,7 +499,6 @@ def extract_omp_task_from_session(
                             cleaned = clean_user_prompt(raw_txt)
                             if cleaned and not is_system_wrapper(cleaned):
                                 latest_user_prompt = cleaned
-
                         elif role == "assistant":
                             content = msg.get("content", [])
                             if isinstance(content, list):
@@ -535,16 +540,16 @@ def extract_omp_task_from_session(
                 except Exception:
                     continue
 
-        # If user prompt or model was earlier than the tail seek, quickly read from head
-        if (not latest_user_prompt or not model_name) and file_size > 131072:
+        # If user prompt or model was earlier than the tail seek, quickly read from head with bounded lines
+        if (not latest_user_prompt or not model_name) and file_size > 65536:
             try:
                 with open(session_path, "r", encoding="utf-8", errors="replace") as f:
-                    for _ in range(50):
-                        line = f.readline()
+                    for _ in range(25):
+                        line = f.readline(4096)
                         if not line:
                             break
                         try:
-                            entry = json.loads(line)
+                            entry = json.loads(line.strip())
                             if not model_name:
                                 if entry.get("type") == "model_change" and entry.get("model"):
                                     model_name = entry["model"]
@@ -718,14 +723,14 @@ def extract_hermes_session_info(
     # Open the winning DB and session to extract detailed messages
     try:
         db_uri = f"file:{os.path.abspath(best['db_path'])}?mode=ro"
-        conn = sqlite3.connect(db_uri, uri=True, timeout=0.5)
+        conn = sqlite3.connect(db_uri, uri=True, timeout=0.3)
         cur = conn.cursor()
         session_id = best["session_id"]
 
-        # Latest human prompt
+        # Latest human prompt (bounded length & limited rows)
         latest_user_prompt = None
         cur.execute(
-            "SELECT content, display_kind FROM messages WHERE session_id = ? AND role = 'user' ORDER BY id DESC;",
+            "SELECT substr(content, 1, 2048), display_kind FROM messages WHERE session_id = ? AND role = 'user' ORDER BY id DESC LIMIT 5;",
             (session_id,)
         )
         for u_content, u_dk in cur.fetchall():
@@ -737,9 +742,9 @@ def extract_hermes_session_info(
                     latest_user_prompt = cleaned_p
                     break
 
-        # Latest assistant response / tool status
+        # Latest assistant response / tool status (bounded chunk)
         cur.execute(
-            "SELECT role, content, tool_name, tool_calls, finish_reason FROM messages WHERE session_id = ? ORDER BY id DESC LIMIT 1;",
+            "SELECT role, substr(content, 1, 2048), tool_name, substr(tool_calls, 1, 2048), finish_reason FROM messages WHERE session_id = ? ORDER BY id DESC LIMIT 1;",
             (session_id,)
         )
         msg_row = cur.fetchone()
