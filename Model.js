@@ -24,9 +24,9 @@ function statusBadgeText(status) {
 
 function originColor(origin) {
   var o = String(origin || "").toLowerCase()
-  if (o.indexOf("desktop") >= 0) return "#F59E0B" // Amber for Desktop
-  if (o === "terminal") return "#38BDF8" // Cyan/Blue for Standalone Terminal
-  return "#A855F7" // Purple for Herdr
+  if (o.indexOf("desktop") >= 0) return "#F59E0B"
+  if (o === "terminal") return "#38BDF8"
+  return "#A855F7"
 }
 
 function originBadgeText(origin) {
@@ -42,6 +42,40 @@ function originIcon(origin) {
   if (o.indexOf("desktop") >= 0) return "󰨇"
   if (o === "terminal") return ""
   return "󰘦"
+}
+
+function originSummaryText(agents) {
+  var list = agents || []
+  if (list.length === 0) return "No active agent instances"
+
+  var herdrCount = 0
+  var terminalCount = 0
+  var desktopCount = 0
+
+  for (var i = 0; i < list.length; i++) {
+    var a = list[i]
+    var o = String(a.origin || "").toLowerCase()
+    if (o === "desktop") {
+      desktopCount++
+    } else if (o === "terminal") {
+      terminalCount++
+    } else {
+      herdrCount++
+    }
+  }
+
+  var parts = []
+  if (herdrCount > 0) {
+    parts.push(herdrCount + " on Herdr")
+  }
+  if (terminalCount > 0) {
+    parts.push(terminalCount + (terminalCount === 1 ? " on terminal" : " on terminals"))
+  }
+  if (desktopCount > 0) {
+    parts.push(desktopCount + (desktopCount === 1 ? " desktop app" : " desktop apps"))
+  }
+
+  return parts.join(" · ")
 }
 
 function agentDisplayName(agent) {

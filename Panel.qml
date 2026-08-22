@@ -305,13 +305,7 @@ Panel {
           }
 
           Text {
-            text: {
-              if (!root.rawData.connected && root.summary.total === 0) return "No agents detected"
-              var w = root.summary.working || 0
-              var i = root.summary.idle || 0
-              var t = root.summary.total || 0
-              return w + " working · " + i + " idle across " + t + " active instance" + (t === 1 ? "" : "s")
-            }
+            text: Model.originSummaryText(root.agents)
             textFormat: Text.PlainText
             color: root.dim
             font.family: root.fontFamily
@@ -375,7 +369,7 @@ Panel {
               anchors.centerIn: parent
               text: modelData.label
               font.family: root.fontFamily
-              font.pixelSize: Style.space(11)
+              font.pixelSize: Style.space(10)
               font.weight: root.selectedFilter === modelData.id ? Font.DemiBold : Font.Normal
               color: root.selectedFilter === modelData.id ? root.accent : root.foreground
             }
