@@ -467,78 +467,218 @@ def extract_omp_task_from_session(
         return None, None, None, None, False
 
 
-def extract_hermes_latest_session() -> Tuple[Optional[str], Optional[str], Optional[str], Optional[str], Optional[str], Optional[str], bool]:
-    """Extract latest user prompt, model, provider, profile, and message detail from Hermes state.db."""
-    if not os.path.exists(HERMES_STATE_DB):
-        return None, None, None, None, None, None, False
-    try:
-        conn = sqlite3.connect(HERMES_STATE_DB, timeout=0.5)
-        cur = conn.cursor()
-        cur.execute(
-            "SELECT id, title, model, billing_provider, profile_name, last_activity_at FROM sessions ORDER BY last_activity_at DESC LIMIT 1;"
-        )
-        row = cur.fetchone()
-        if not row:
-            conn.close()
-            return None, None, None, None, None, None, False
+def get_all_hermes_dbs() -> List[Tuple[str, str]]:
+    """Discover default and profile-specific Hermes SQLite databases."""
+    dbs = []
+    base_db = os.path.expanduser("~/.hermes/state.db")
+    if os.path.exists(base_db):
+        dbs.append((base_db, "Default"))
+    for p in glob.glob(os.path.expanduser("~/.hermes/profiles/*/state.db")):
+        profile_name = os.path.basename(os.path.dirname(p))
+        dbs.append((p, profile_name))
+    return dbs
 
-        session_id, title, model, provider, profile, last_active = row
+
+def extract_hermes_session_info(
+    source_preference: Optional[str] = None,
+    specific_session_id: Optional[str] = None,
+) -> Tuple[Optional[str], Optional[str], Optional[str], Optional[str], Optional[str], Optional[str], bool]:
+    """Extract prompt, model, provider, profile, message detail, and active status for Hermes.
+
+    Scans default and profile state databases, inspects active turn leases, and evaluates
+    message stream state to accurately determine working, waiting, or idle status.
+    """
+    now = time.time()
+    all_dbs = get_all_hermes_dbs()
+    if not all_dbs:
+        return None, None, None, None, None, None, False
+
+    candidates = []
+
+    for db_path, db_profile in all_dbs:
+        try:
+            conn = sqlite3.connect(db_path, timeout=0.5)
+            cur = conn.cursor()
+
+            # Find active unexpired turn leases with alive holder PIDs
+            active_leases: Dict[str, Dict[str, Any]] = {}
+            try:
+                cur.execute("SELECT conversation_id, holder, acquired_at, expires_at FROM session_turn_leases;")
+                for cid, holder, acq, exp in cur.fetchall():
+                    if exp and float(exp) > now:
+                        m = re.search(r"pid=(\d+)", holder or "")
+                        pid = int(m.group(1)) if m else None
+                        pid_alive = os.path.exists(f"/proc/{pid}") if pid else True
+                        if pid_alive:
+                            active_leases[cid] = {"holder": holder, "pid": pid, "expires_at": float(exp)}
+            except Exception:
+                pass
+
+            # Query candidate sessions
+            if specific_session_id:
+                cur.execute(
+                    "SELECT id, source, title, model, billing_provider, profile_name, last_activity_at FROM sessions WHERE id = ? LIMIT 1;",
+                    (specific_session_id,)
+                )
+            elif source_preference:
+                cur.execute(
+                    "SELECT id, source, title, model, billing_provider, profile_name, last_activity_at FROM sessions WHERE source = ? ORDER BY last_activity_at DESC LIMIT 5;",
+                    (source_preference,)
+                )
+            else:
+                cur.execute(
+                    "SELECT id, source, title, model, billing_provider, profile_name, last_activity_at FROM sessions ORDER BY last_activity_at DESC LIMIT 5;"
+                )
+
+            session_rows = cur.fetchall()
+            for s_row in session_rows:
+                s_id, s_src, s_title, s_model, s_prov, s_prof, s_active = s_row
+                is_lease_active = bool(s_id in active_leases)
+                candidates.append({
+                    "db_path": db_path,
+                    "profile": s_prof or db_profile,
+                    "session_id": s_id,
+                    "source": s_src,
+                    "title": s_title,
+                    "model": s_model,
+                    "provider": s_prov,
+                    "last_active": float(s_active or 0),
+                    "is_lease_active": is_lease_active,
+                    "lease_info": active_leases.get(s_id),
+                })
+            conn.close()
+        except Exception:
+            continue
+
+    if not candidates:
+        return None, None, None, None, None, None, False
+
+    # If source_preference is given, strictly filter to matching source if any exist
+    if source_preference:
+        matching = [c for c in candidates if c.get("source") == source_preference]
+        if matching:
+            candidates = matching
+
+    # Sort candidates: active leases first among matching, then most recent last_active
+    def sort_key(c: Dict[str, Any]) -> Tuple[int, float]:
+        lease_score = 1 if c["is_lease_active"] else 0
+        return (lease_score, c["last_active"])
+
+    candidates.sort(key=sort_key, reverse=True)
+    best = candidates[0]
+
+    # Open the winning DB and session to extract detailed messages
+    try:
+        conn = sqlite3.connect(best["db_path"], timeout=0.5)
+        cur = conn.cursor()
+        session_id = best["session_id"]
+
+        # Latest human prompt
         latest_user_prompt = None
+        cur.execute(
+            "SELECT content, display_kind FROM messages WHERE session_id = ? AND role = 'user' ORDER BY id DESC;",
+            (session_id,)
+        )
+        for u_content, u_dk in cur.fetchall():
+            if u_dk in ("hidden", "auto_continue", "model_switch"):
+                continue
+            if u_content:
+                cleaned_p = clean_user_prompt(u_content)
+                if cleaned_p and not is_system_wrapper(cleaned_p):
+                    latest_user_prompt = cleaned_p
+                    break
+
+        # Latest assistant response / tool status
+        cur.execute(
+            "SELECT role, content, tool_name, tool_calls, finish_reason FROM messages WHERE session_id = ? ORDER BY id DESC LIMIT 1;",
+            (session_id,)
+        )
+        msg_row = cur.fetchone()
+
         detail = None
-        status_override = None
+        status = "idle"
         has_question = False
 
-        try:
-            # Find latest human prompt
-            cur.execute(
-                "SELECT content FROM messages WHERE session_id = ? AND role = 'user' ORDER BY id DESC;",
-                (session_id,)
-            )
-            user_rows = cur.fetchall()
-            for ur in user_rows:
-                if ur and ur[0]:
-                    cleaned_p = clean_user_prompt(ur[0])
-                    if cleaned_p and not is_system_wrapper(cleaned_p):
-                        latest_user_prompt = cleaned_p
-                        break
-            if not latest_user_prompt and user_rows and user_rows[0] and user_rows[0][0]:
-                latest_user_prompt = clean_user_prompt(user_rows[0][0])
+        is_active = best["is_lease_active"]
+        # Fallback: if last activity was within 10s and any hermes process is active
+        if not is_active and (now - best["last_active"] < 10.0):
+            is_active = True
 
-            # Find latest assistant response / tool status
+        if msg_row:
+            role, content, tool_name, tool_calls, finish_reason = msg_row
+            if role == "assistant":
+                if tool_calls:
+                    try:
+                        tc = json.loads(tool_calls)
+                        if tc and isinstance(tc, list):
+                            fn = tc[0].get("function", {})
+                            fname = fn.get("name") or "tool"
+                            detail = f"Running: {fname}"
+                        else:
+                            detail = "Running tool"
+                    except Exception:
+                        detail = "Running tool"
+                    status = "working"
+                elif content:
+                    first_line = extract_first_line(content)
+                    has_question = "?" in (first_line[-40:] if first_line else "")
+                    if is_active:
+                        status = "working"
+                        detail = first_line or "Generating response…"
+                    elif has_question:
+                        status = "waiting"
+                        detail = first_line
+                    else:
+                        status = "idle"
+                        detail = first_line
+                else:
+                    if is_active:
+                        status = "working"
+                        detail = "Thinking…"
+                    else:
+                        status = "idle"
+                        detail = "Ready for prompt"
+            elif role == "tool":
+                detail = f"Tool result: {tool_name or 'completed'}"
+                status = "working" if is_active else "idle"
+            elif role == "user":
+                if is_active:
+                    detail = "Thinking…"
+                    status = "working"
+                else:
+                    detail = "Ready for prompt"
+                    status = "idle"
+
+        # If detail is still not set or was generic, look for the last assistant response
+        if not detail or detail == "Ready for prompt":
             cur.execute(
-                "SELECT role, content, tool_name, tool_calls FROM messages WHERE session_id = ? ORDER BY id DESC LIMIT 1;",
+                "SELECT content FROM messages WHERE session_id = ? AND role = 'assistant' AND content IS NOT NULL ORDER BY id DESC LIMIT 1;",
                 (session_id,)
             )
-            msg_row = cur.fetchone()
-            if msg_row:
-                role, content, tool_name, tool_calls = msg_row
-                if role == "assistant":
-                    if tool_calls:
-                        try:
-                            tc = json.loads(tool_calls)
-                            if tc and isinstance(tc, list):
-                                fn = tc[0].get("function", {})
-                                fname = fn.get("name") or "tool"
-                                detail = f"Running: {fname}"
-                                status_override = "working"
-                        except Exception:
-                            detail = "Running tool"
-                            status_override = "working"
-                    elif content:
-                        detail = extract_first_line(content)
-                        status_override = "idle"
-                        has_question = "?" in (detail[-40:] if detail else "")
-                elif role == "tool":
-                    detail = f"Tool result: {tool_name or 'completed'}"
-                    status_override = "working"
-        except Exception:
-            pass
+            ast_row = cur.fetchone()
+            if ast_row and ast_row[0]:
+                first_line = extract_first_line(ast_row[0])
+                if first_line:
+                    detail = first_line
 
         conn.close()
-        effective_prompt = latest_user_prompt or title or ""
-        return effective_prompt, clean_model_name(model or "ox-alpha-free"), provider or "", profile or "", detail, status_override, has_question
+
+        effective_prompt = latest_user_prompt or best["title"] or ""
+        return (
+            effective_prompt,
+            clean_model_name(best["model"] or "ox-alpha-free"),
+            best["provider"] or "",
+            best["profile"] or "",
+            detail or f"Profile: {best['profile'] or 'Default'}",
+            status,
+            has_question,
+        )
     except Exception:
         return None, None, None, None, None, None, False
+
+def extract_hermes_latest_session() -> Tuple[Optional[str], Optional[str], Optional[str], Optional[str], Optional[str], Optional[str], bool]:
+    """Backward-compatible wrapper for extract_hermes_session_info."""
+    return extract_hermes_session_info()
 
 
 def shorten_path(path: str) -> str:
@@ -585,7 +725,7 @@ def scan_standalone_agents(herdr_server_pids: List[int], seen_cwds: Set[str], cl
                 if "hermes_desktop" in seen_cwds or is_in_herdr:
                     continue
 
-                hermes_title, hermes_model, hermes_provider, hermes_profile, hermes_detail, hermes_status, hermes_has_q = extract_hermes_latest_session()
+                hermes_title, hermes_model, hermes_provider, hermes_profile, hermes_detail, hermes_status, hermes_has_q = extract_hermes_session_info(source_preference="desktop")
                 standalone.append({
                     "pane_id": f"desktop:hermes:{pid}",
                     "pid": pid,
@@ -661,7 +801,7 @@ def scan_standalone_agents(herdr_server_pids: List[int], seen_cwds: Set[str], cl
                     if agent_type == "omp":
                         user_goal, detail_text, model_name, status_override, has_question = extract_omp_task_from_session(session_path)
                     elif agent_type == "hermes":
-                        user_goal, model_name, _, _, detail_text, status_override, has_question = extract_hermes_latest_session()
+                        user_goal, model_name, _, _, detail_text, status_override, has_question = extract_hermes_session_info(source_preference="cli")
                 else:
                     detail_text = "Ready for prompt"
                     status_override = "idle"
@@ -778,8 +918,10 @@ def fetch_all_agents() -> Dict[str, Any]:
             if agent_type == "omp" and session_path:
                 user_goal, detail_text, model_name, status_override, has_question = extract_omp_task_from_session(session_path)
             elif agent_type == "hermes":
-                user_goal, model_name, _, _, detail_text, status_override, has_question = extract_hermes_latest_session()
-
+                if is_hermes_desktop:
+                    user_goal, model_name, _, _, detail_text, status_override, has_question = extract_hermes_session_info(source_preference="desktop")
+                else:
+                    user_goal, model_name, _, _, detail_text, status_override, has_question = extract_hermes_session_info(source_preference="cli")
             is_generic_title = cleaned_title in (repo_name, "~", "tmp", "/tmp", "") or cleaned_title.startswith("/tmp") or cleaned_title.startswith("alberto@")
 
             if user_goal:
@@ -799,6 +941,8 @@ def fetch_all_agents() -> Dict[str, Any]:
                 status = "waiting"
             elif status_override == "working":
                 status = "working"
+            elif agent_type == "hermes" and status_override:
+                status = status_override
             elif raw_status in ("working", "busy", "running"):
                 if status_override == "idle" and not a.get("focused"):
                     status = "idle"
@@ -808,7 +952,6 @@ def fetch_all_agents() -> Dict[str, Any]:
                 status = "error"
             else:
                 status = "idle"
-
             origin = "herdr_desktop" if is_hermes_desktop else "herdr"
             origin_label = "Herdr (Desktop)" if is_hermes_desktop else "Herdr"
             display_name = "Hermes Desktop" if is_hermes_desktop else (agent_type.upper() if agent_type in ("omp", "pi") else agent_type.capitalize())
@@ -912,7 +1055,7 @@ def focus_pane(target_id: str) -> Dict[str, Any]:
     clients = get_hypr_clients()
 
     # 1. Hermes Desktop GUI window
-    if target_id.startswith("desktop:hermes:") or target_id == "w1:p4":
+    if target_id.startswith("desktop:hermes:") or target_id.startswith("desktop:") or target_id == "w1:p4":
         hermes_win = next(
             (c for c in clients if c.get("class") == "Hermes" or c.get("initialClass") == "Hermes"),
             None,
@@ -925,8 +1068,8 @@ def focus_pane(target_id: str) -> Dict[str, Any]:
                 "focused_window": "Hermes Desktop",
                 "workspace": hermes_win.get("workspace", {}).get("id"),
             }
-        return {"ok": False, "error": "Hermes GUI window not found"}
-
+        if target_id.startswith("desktop:"):
+            return {"ok": False, "error": "Hermes GUI window not found"}
     # 2. Standalone terminal window
     if target_id.startswith("terminal:addr:"):
         addr = target_id.split("terminal:addr:")[1]
@@ -1018,6 +1161,7 @@ def kill_target(target_id: str) -> Dict[str, Any]:
             ancestors = get_process_ancestors(pid)
             clients = get_hypr_clients()
             ancestor_pids = [pid] + [a["pid"] for a in ancestors]
+            matched_win = match_hypr_client_for_terminal(ancestor_pids, "", "")
             if matched_win and matched_win.get("address"):
                 try:
                     win_addr = matched_win["address"]
