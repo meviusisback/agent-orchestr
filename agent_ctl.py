@@ -529,7 +529,6 @@ def fetch_all_agents() -> Dict[str, Any]:
             agent_session = a.get("agent_session", {})
             session_path = agent_session.get("value") if isinstance(agent_session, dict) else None
 
-            # Fallback to session file discovery if Herdr session path is missing or stale
             if not session_path or not os.path.exists(session_path):
                 session_path = find_latest_session_for_cwd(agent_type, cwd)
 
@@ -638,59 +637,76 @@ def focus_pane(target_id: str) -> Dict[str, Any]:
 
     clients = get_hypr_clients()
 
-    # 1. Hermes Desktop standalone window
-    if target_id.startswith("desktop:hermes:"):
+    # 1. Hermes Desktop GUI window
+    if target_id.startswith("desktop:hermes:") or target_id == "w1:p4":
         hermes_win = next(
             (c for c in clients if c.get("class") == "Hermes" or c.get("initialClass") == "Hermes"),
             None,
         )
         if hermes_win:
             focus_hypr_window(hermes_win)
-            return {"ok": True, "target": target_id, "focused_window": "Hermes Desktop"}
-        return {"ok": False, "error": "Hermes window not found"}
+            return {
+                "ok": True,
+                "target": target_id,
+                "focused_window": "Hermes Desktop",
+                "workspace": hermes_win.get("workspace", {}).get("id"),
+            }
+        return {"ok": False, "error": "Hermes GUI window not found"}
 
     # 2. Standalone terminal window
     if target_id.startswith("terminal:pid:"):
-        pid_str = target_id.replace("terminal:pid:", "")
-        try:
-            target_pid = int(pid_str)
-            ancestors = [target_pid] + [a["pid"] for a in get_process_ancestors(target_pid)]
-            matched_win = next((c for c in clients if c.get("pid") in ancestors), None)
-            if matched_win:
-                focus_hypr_window(matched_win)
-                return {"ok": True, "target": target_id, "focused_window": matched_win.get("title", "")}
-        except Exception as e:
-            return {"ok": False, "error": str(e)}
-
-    # 3. Herdr pane
-    res = query_herdr_socket("pane.focus", {"pane_id": target_id})
-
-    # If this is the Hermes desktop pane (w1:p4) and Hermes GUI is open on workspace 5, focus the GUI window
-    if target_id == "w1:p4":
-        hermes_win = next(
-            (c for c in clients if c.get("class") == "Hermes" or c.get("initialClass") == "Hermes"),
+        standalone_win = next(
+            (
+                c
+                for c in clients
+                if c.get("class") in ("com.mitchellh.ghostty", "org.omarchy.terminal", "foot", "alacritty", "kitty")
+                and "MAIN" not in c.get("title", "")
+                and "herdr" not in c.get("title", "").lower()
+            ),
             None,
         )
-        if hermes_win:
-            focus_hypr_window(hermes_win)
-            return {"ok": True, "target": target_id, "focused_window": "Hermes GUI"}
+        if standalone_win:
+            focus_hypr_window(standalone_win)
+            return {
+                "ok": True,
+                "target": target_id,
+                "focused_window": standalone_win.get("title", ""),
+                "workspace": standalone_win.get("workspace", {}).get("id"),
+            }
+        return {"ok": False, "error": "Standalone terminal window not found"}
 
-    # Locate Herdr terminal window (Ghostty / Foot / Terminal running Herdr) and switch desktop
+    # 3. Herdr pane
+    sock_path = os.path.expanduser("~/.config/herdr/herdr.sock")
+    try:
+        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        s.settimeout(1.0)
+        s.connect(sock_path)
+        req = {"id": "focus:exec", "method": "pane.focus", "params": {"pane_id": target_id}}
+        s.sendall((json.dumps(req) + "\n").encode())
+        s.close()
+    except Exception:
+        pass
+
     herdr_win = next(
-        (c for c in clients if "MAIN" in c.get("title", "") or "herdr" in c.get("title", "").lower() or c.get("class") == "com.mitchellh.ghostty"),
+        (c for c in clients if "MAIN" in c.get("title", "") or "herdr" in c.get("title", "").lower()),
         None,
     )
     if not herdr_win:
         herdr_win = next(
-            (c for c in clients if c.get("class") in ("org.omarchy.terminal", "foot", "alacritty", "kitty", "com.mitchellh.ghostty")),
+            (c for c in clients if c.get("class") in ("com.mitchellh.ghostty", "org.omarchy.terminal", "foot", "alacritty", "kitty")),
             None,
         )
 
     if herdr_win:
         focus_hypr_window(herdr_win)
-        return {"ok": True, "pane_id": target_id, "socket_res": res, "focused_window": herdr_win.get("title", "")}
+        return {
+            "ok": True,
+            "pane_id": target_id,
+            "focused_window": herdr_win.get("title", ""),
+            "workspace": herdr_win.get("workspace", {}).get("id"),
+        }
 
-    return {"ok": True, "pane_id": target_id, "socket_res": res}
+    return {"ok": True, "pane_id": target_id}
 
 
 def kill_target(target_id: str) -> Dict[str, Any]:
