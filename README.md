@@ -6,17 +6,18 @@ Real-time status, active tasks, and one-click workspace switching for AI coding 
 
 ## Features
 
-- **Live Status & Active Tasks**: Connects directly to the Herdr daemon socket (`~/.config/herdr/herdr.sock`), OMP session transcripts (`~/.omp/agent/sessions/`), and Hermes SQLite state (`~/.hermes/state.db`) in under 5ms.
-- **One-Click Workspace Switching**: Click on any agent card to instantly focus its specific pane in Herdr and bring the terminal window to the front.
+- **Live Multi-Source Agent Tracking**: Seamlessly tracks AI coding agents across **Herdr** daemon panes (`~/.config/herdr/herdr.sock`), standalone terminal windows (Ghostty, Foot, Kitty, Alacritty, WezTerm), **OMP** sessions (`~/.omp/agent/sessions/`), and **Hermes** CLI & Desktop app databases (`~/.hermes/state.db`).
+- **One-Click Workspace & Window Switching**: Click any agent card to switch Hyprland workspaces and focus the exact terminal window, Herdr pane, or Hermes Desktop window.
 - **Visual Status Bar Display**:
-  - **`Icon` Mode**: Robot glyph with a live pulsing activity badge when agents are working.
-  - **`Status` Mode**: Real-time ticker showing the top active agent and task description.
-  - **`Compact` Mode**: Quick summary (e.g. `4 agents · 1 busy`).
+  - **`Icon` Mode**: Agent orchestrator glyph with dynamic activity badge and spinner animation when agents are actively working.
+  - **`Status` Mode**: Real-time ticker showing active task descriptions or prompt summaries.
+  - **`Compact` Mode**: Live count summary (e.g. `4 ag · 1 busy`, `3 done`).
 - **Interactive Popup Panel**:
-  - Hero header with live counts and quick action buttons (Refresh, New Agent).
-  - Quick filter tabs: `All`, `Working`, `Idle`.
-  - Rich cards displaying agent brand marks, model tags, user goals, live tool execution details, repositories, and workspace breadcrumbs.
-
+  - **Smart Filter Tabs**: Filter by `All`, `Working`, `Waiting` (user input needed), `Done` (completed tasks), and `Idle`.
+  - **Rich Agent Cards**: Model tags, latest human prompt, real-time tool execution details, repository / working directory breadcrumbs, and active session indicators.
+  - **Process Management**: Safely terminate agent processes or close Herdr panes directly from card action buttons.
+  - **Privacy First**: Automatic redaction of sensitive API keys and tokens from display prompts and status messages.
+  - **Adaptive Fast Polling**: 1s live refresh while popup is open or agents are working; configurable interval when idle.
 ## Installation
 
 Symlink or clone this repository into your Omarchy plugins directory:
