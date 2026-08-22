@@ -91,6 +91,14 @@ omarchy shell meviusisback.agent-orchestr refresh
 | `showIdleInBar` | `false` | Whether to display badge count when all agents are idle |
 | `maxTaskLength` | `45` | Maximum characters shown in the bar status ticker |
 
+
+## Security & Privacy
+
+- **Zero Network Transmission**: All agent tracking and process inspection runs 100% locally on your machine.
+- **Automatic Secret Redaction**: Prompts and status lines automatically redact API keys (OpenAI, Anthropic, OpenRouter, Groq), GitHub tokens, AWS keys, and Bearer tokens before UI rendering or IPC output.
+- **Read-Only SQLite & Session Parsing**: Hermes databases are queried strictly with `?mode=ro`, and OMP transcripts are parsed in read-only mode.
+- **Safe Process Signaling**: Process termination verifies the target PID against active AI agent process signatures before signaling.
+- **Shell & Injection Safety**: All subprocess and Hyprland dispatch operations use discrete argument vectors without shell evaluation, and QML Text components enforce plain-text formatting.
 ## License
 
 MIT
