@@ -111,7 +111,7 @@ def get_hypr_clients() -> List[Dict[str, Any]]:
 
 
 def focus_hypr_window(client: Dict[str, Any]) -> bool:
-    """Switch Hyprland to the client window's workspace and focus its address."""
+    """Switch Hyprland to the client window's workspace and focus its address using Omarchy Lua dispatchers."""
     if not client:
         return False
     env = get_hypr_env()
@@ -119,11 +119,12 @@ def focus_hypr_window(client: Dict[str, Any]) -> bool:
     ws_id = ws.get("id")
     addr = client.get("address")
 
-    # 1. Switch Hyprland to the desktop/workspace where the window lives
+    # 1. Switch Hyprland workspace using Omarchy Lua dispatcher
     if ws_id is not None:
         try:
+            lua_ws = f'hl.dsp.focus({{ workspace = "{ws_id}" }})'
             subprocess.run(
-                ["hyprctl", "dispatch", "workspace", str(ws_id)],
+                ["hyprctl", "dispatch", lua_ws],
                 env=env,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
@@ -132,11 +133,12 @@ def focus_hypr_window(client: Dict[str, Any]) -> bool:
         except Exception:
             pass
 
-    # 2. Focus the exact window address
+    # 2. Focus the exact window address using Omarchy Lua dispatcher
     if addr:
         try:
+            lua_win = f'hl.dsp.focus({{ window = "address:{addr}" }})'
             subprocess.run(
-                ["hyprctl", "dispatch", "focuswindow", f"address:{addr}"],
+                ["hyprctl", "dispatch", lua_win],
                 env=env,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
@@ -724,15 +726,19 @@ def kill_target(target_id: str) -> Dict[str, Any]:
             ancestors = get_process_ancestors(pid)
             clients = get_hypr_clients()
             ancestor_pids = [pid] + [a["pid"] for a in ancestors]
-            matched_win = next((c for c in clients if c.get("pid") in ancestor_pids), None)
             if matched_win and matched_win.get("address"):
-                subprocess.run(
-                    ["hyprctl", "dispatch", "closewindow", f"address:{matched_win['address']}"],
-                    env=env,
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
-                    timeout=0.5,
-                )
+                try:
+                    win_addr = matched_win["address"]
+                    lua_close = f'hl.dsp.window.close({{ window = "address:{win_addr}" }})'
+                    subprocess.run(
+                        ["hyprctl", "dispatch", lua_close],
+                        env=env,
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                        timeout=0.5,
+                    )
+                except Exception:
+                    pass
             for p in [pid] + [a["pid"] for a in ancestors[:3]]:
                 try:
                     os.kill(p, signal.SIGTERM)
@@ -747,13 +753,16 @@ def kill_target(target_id: str) -> Dict[str, Any]:
         pid_str = target_id.replace("desktop:hermes:", "")
         try:
             pid = int(pid_str)
-            subprocess.run(
-                ["hyprctl", "dispatch", "closewindow", "class:^(Hermes|hermes)$"],
-                env=env,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                timeout=0.5,
-            )
+            try:
+                subprocess.run(
+                    ["hyprctl", "dispatch", 'hl.dsp.window.close({ window = "class:Hermes" })'],
+                    env=env,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    timeout=0.5,
+                )
+            except Exception:
+                pass
             try:
                 os.kill(pid, signal.SIGTERM)
             except ProcessLookupError:
