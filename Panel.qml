@@ -287,7 +287,7 @@ Panel {
     owner: root
     open: root.opened
     contentWidth: Style.space(480)
-    contentHeight: Style.space(580)
+    contentHeight: Style.space(680)
 
     ColumnLayout {
       anchors.fill: parent

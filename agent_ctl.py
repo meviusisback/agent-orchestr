@@ -48,6 +48,18 @@ def clean_title(title: str) -> str:
     return t
 
 
+def clean_model_name(model_str: Optional[str]) -> str:
+    """Strip common provider prefixes for a clean model badge."""
+    if not model_str:
+        return ""
+    m = str(model_str).strip()
+    if "/" in m:
+        parts = m.split("/")
+        if parts[0] in ("google-antigravity", "openrouter", "anthropic", "openai", "deepseek", "groq", "together"):
+            m = "/".join(parts[1:])
+    return m
+
+
 def query_herdr_socket(method: str, params: Optional[Dict[str, Any]] = None, timeout: float = 1.0) -> Optional[Dict[str, Any]]:
     """Send JSON-RPC request to Herdr socket and return parsed response."""
     if not os.path.exists(HERDR_SOCK_PATH):
@@ -162,8 +174,10 @@ def find_latest_session_for_cwd(agent_type: str, cwd: str) -> Optional[str]:
     if agent_type == "omp" and os.path.exists(OMP_SESSIONS_DIR):
         try:
             folder_part = os.path.basename(cwd.rstrip("/")) if cwd else ""
-            pattern = os.path.join(OMP_SESSIONS_DIR, f"*{folder_part}*", "*.jsonl")
-            matches = glob.glob(pattern)
+            if folder_part and folder_part not in ("tmp", "~"):
+                matches = glob.glob(os.path.join(OMP_SESSIONS_DIR, f"*{folder_part}*", "*.jsonl"))
+            else:
+                matches = glob.glob(os.path.join(OMP_SESSIONS_DIR, "*-tmp*", "*.jsonl"))
             if not matches:
                 matches = glob.glob(os.path.join(OMP_SESSIONS_DIR, "*", "*.jsonl"))
             if matches:
@@ -194,9 +208,22 @@ def extract_omp_task_from_session(session_path: str) -> Tuple[Optional[str], Opt
                 try:
                     entry = json.loads(line)
                     msg_type = entry.get("type")
+
+                    # Look for model in top-level, data, or message fields
+                    if "model" in entry and entry["model"]:
+                        model_name = entry["model"]
+                    elif "data" in entry and isinstance(entry["data"], dict):
+                        if entry["data"].get("model"):
+                            model_name = entry["data"]["model"]
+                        elif entry["data"].get("modelId"):
+                            model_name = entry["data"]["modelId"]
+
                     if msg_type == "message":
                         msg = entry.get("message", {})
                         role = msg.get("role")
+                        if "model" in msg and msg["model"]:
+                            model_name = msg["model"]
+
                         if role == "user" and not user_goal:
                             content = msg.get("content")
                             if isinstance(content, list):
@@ -205,10 +232,6 @@ def extract_omp_task_from_session(session_path: str) -> Tuple[Optional[str], Opt
                             elif isinstance(content, str):
                                 user_goal = content.strip()
                         elif role == "assistant":
-                            if "model" in entry:
-                                model_name = entry["model"]
-                            elif "model" in msg:
-                                model_name = msg["model"]
                             content = msg.get("content", [])
                             if isinstance(content, list):
                                 for item in reversed(content):
@@ -235,7 +258,7 @@ def extract_omp_task_from_session(session_path: str) -> Tuple[Optional[str], Opt
 
         if user_goal:
             user_goal = " ".join(user_goal.split())
-        return user_goal, latest_activity, model_name
+        return user_goal, latest_activity, clean_model_name(model_name)
     except Exception:
         return None, None, None
 
@@ -254,7 +277,7 @@ def extract_hermes_latest_session() -> Tuple[Optional[str], Optional[str], Optio
         conn.close()
         if row:
             title, model, provider, profile, last_active = row
-            return title or "", model or "ox-alpha-free", provider or "", profile or "", last_active
+            return title or "", clean_model_name(model or "ox-alpha-free"), provider or "", profile or "", last_active
     except Exception:
         pass
     return None, None, None, None, None
@@ -344,7 +367,6 @@ def scan_standalone_agents(herdr_server_pids: List[int], seen_cwds: Set[str]) ->
                 agent_type = "hermes"
 
             if agent_type:
-                # MUST have an interactive terminal emulator in its ancestor chain to be a standalone terminal session
                 term_name = None
                 for anc in ancestors:
                     anc_cmd = anc["cmd"].lower()
@@ -475,6 +497,11 @@ def fetch_all_agents() -> Dict[str, Any]:
 
             agent_session = a.get("agent_session", {})
             session_path = agent_session.get("value") if isinstance(agent_session, dict) else None
+
+            # Fallback to session file discovery if Herdr session path is missing or stale
+            if not session_path or not os.path.exists(session_path):
+                session_path = find_latest_session_for_cwd(agent_type, cwd)
+
             user_goal = None
             latest_activity = None
             model_name = None
@@ -485,7 +512,7 @@ def fetch_all_agents() -> Dict[str, Any]:
                 hermes_title, hermes_model, _, hermes_profile, _ = extract_hermes_latest_session()
                 if hermes_title:
                     user_goal = hermes_title
-                    model_name = hermes_model
+                model_name = hermes_model
 
             is_generic_title = cleaned_title in (repo_name, "~", "tmp", "/tmp", "") or cleaned_title.startswith("/tmp") or cleaned_title.startswith("alberto@")
 
