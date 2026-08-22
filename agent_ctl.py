@@ -100,6 +100,53 @@ def get_hypr_env() -> Dict[str, str]:
     return env
 
 
+def get_hypr_clients() -> List[Dict[str, Any]]:
+    """Fetch all open client windows from Hyprland."""
+    env = get_hypr_env()
+    try:
+        out = subprocess.check_output(["hyprctl", "-j", "clients"], env=env, timeout=0.5).decode()
+        return json.loads(out)
+    except Exception:
+        return []
+
+
+def focus_hypr_window(client: Dict[str, Any]) -> bool:
+    """Switch Hyprland to the client window's workspace and focus its address."""
+    if not client:
+        return False
+    env = get_hypr_env()
+    ws = client.get("workspace", {})
+    ws_id = ws.get("id")
+    addr = client.get("address")
+
+    # 1. Switch Hyprland to the desktop/workspace where the window lives
+    if ws_id is not None:
+        try:
+            subprocess.run(
+                ["hyprctl", "dispatch", "workspace", str(ws_id)],
+                env=env,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=0.5,
+            )
+        except Exception:
+            pass
+
+    # 2. Focus the exact window address
+    if addr:
+        try:
+            subprocess.run(
+                ["hyprctl", "dispatch", "focuswindow", f"address:{addr}"],
+                env=env,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=0.5,
+            )
+        except Exception:
+            pass
+    return True
+
+
 def get_process_info(pid: int) -> Optional[Dict[str, Any]]:
     """Robustly parse /proc/<pid>/stat and cmdline."""
     try:
@@ -154,21 +201,6 @@ def get_process_ancestors(pid: int, max_depth: int = 20) -> List[Dict[str, Any]]
     return ancestors
 
 
-def resolve_hyprland_window_for_pid(target_pid: int) -> Optional[Dict[str, Any]]:
-    """Find the top-level Hyprland client window for a process PID."""
-    env = get_hypr_env()
-    try:
-        out = subprocess.check_output(["hyprctl", "-j", "clients"], env=env, timeout=0.5).decode()
-        clients = json.loads(out)
-        ancestor_pids = [target_pid] + [a["pid"] for a in get_process_ancestors(target_pid)]
-        for c in clients:
-            if c.get("pid") in ancestor_pids:
-                return c
-    except Exception:
-        pass
-    return None
-
-
 def find_latest_session_for_cwd(agent_type: str, cwd: str) -> Optional[str]:
     """Find the most recent session file matching a working directory."""
     if agent_type == "omp" and os.path.exists(OMP_SESSIONS_DIR):
@@ -209,7 +241,6 @@ def extract_omp_task_from_session(session_path: str) -> Tuple[Optional[str], Opt
                     entry = json.loads(line)
                     msg_type = entry.get("type")
 
-                    # Look for model in top-level, data, or message fields
                     if "model" in entry and entry["model"]:
                         model_name = entry["model"]
                     elif "data" in entry and isinstance(entry["data"], dict):
@@ -601,65 +632,63 @@ def fetch_all_agents() -> Dict[str, Any]:
 
 
 def focus_pane(target_id: str) -> Dict[str, Any]:
-    """Focus a specific pane in Herdr, Hermes Desktop window, or standalone terminal."""
+    """Focus a specific pane in Herdr, Hermes Desktop window, or standalone terminal and switch desktops."""
     if not target_id:
         return {"ok": False, "error": "No target_id provided"}
 
-    env = get_hypr_env()
+    clients = get_hypr_clients()
 
     # 1. Hermes Desktop standalone window
     if target_id.startswith("desktop:hermes:"):
-        try:
-            subprocess.run(
-                ["hyprctl", "dispatch", "focuswindow", "class:^(Hermes|hermes)$"],
-                env=env,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                timeout=0.5,
-            )
-            return {"ok": True, "target": target_id, "mode": "hermes_desktop"}
-        except Exception as e:
-            return {"ok": False, "error": str(e)}
+        hermes_win = next(
+            (c for c in clients if c.get("class") == "Hermes" or c.get("initialClass") == "Hermes"),
+            None,
+        )
+        if hermes_win:
+            focus_hypr_window(hermes_win)
+            return {"ok": True, "target": target_id, "focused_window": "Hermes Desktop"}
+        return {"ok": False, "error": "Hermes window not found"}
 
-    # 2. Standalone terminal window by resolving its top-level Hyprland client window
+    # 2. Standalone terminal window
     if target_id.startswith("terminal:pid:"):
         pid_str = target_id.replace("terminal:pid:", "")
         try:
             target_pid = int(pid_str)
-            win = resolve_hyprland_window_for_pid(target_pid)
-            if win and win.get("address"):
-                subprocess.run(
-                    ["hyprctl", "dispatch", "focuswindow", f"address:{win['address']}"],
-                    env=env,
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
-                    timeout=0.5,
-                )
-                return {"ok": True, "target": target_id, "mode": "hypr_address", "address": win["address"]}
-            else:
-                subprocess.run(
-                    ["hyprctl", "dispatch", "focuswindow", f"pid:{target_pid}"],
-                    env=env,
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
-                    timeout=0.5,
-                )
-                return {"ok": True, "target": target_id, "mode": "fallback_pid"}
+            ancestors = [target_pid] + [a["pid"] for a in get_process_ancestors(target_pid)]
+            matched_win = next((c for c in clients if c.get("pid") in ancestors), None)
+            if matched_win:
+                focus_hypr_window(matched_win)
+                return {"ok": True, "target": target_id, "focused_window": matched_win.get("title", "")}
         except Exception as e:
             return {"ok": False, "error": str(e)}
 
     # 3. Herdr pane
     res = query_herdr_socket("pane.focus", {"pane_id": target_id})
-    try:
-        subprocess.run(
-            ["hyprctl", "dispatch", "focuswindow", "class:^(com.mitchellh.ghostty|ghostty|org.omarchy.terminal|foot|alacritty|kitty)$"],
-            env=env,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            timeout=0.5,
+
+    # If this is the Hermes desktop pane (w1:p4) and Hermes GUI is open on workspace 5, focus the GUI window
+    if target_id == "w1:p4":
+        hermes_win = next(
+            (c for c in clients if c.get("class") == "Hermes" or c.get("initialClass") == "Hermes"),
+            None,
         )
-    except Exception:
-        pass
+        if hermes_win:
+            focus_hypr_window(hermes_win)
+            return {"ok": True, "target": target_id, "focused_window": "Hermes GUI"}
+
+    # Locate Herdr terminal window (Ghostty / Foot / Terminal running Herdr) and switch desktop
+    herdr_win = next(
+        (c for c in clients if "MAIN" in c.get("title", "") or "herdr" in c.get("title", "").lower() or c.get("class") == "com.mitchellh.ghostty"),
+        None,
+    )
+    if not herdr_win:
+        herdr_win = next(
+            (c for c in clients if c.get("class") in ("org.omarchy.terminal", "foot", "alacritty", "kitty", "com.mitchellh.ghostty")),
+            None,
+        )
+
+    if herdr_win:
+        focus_hypr_window(herdr_win)
+        return {"ok": True, "pane_id": target_id, "socket_res": res, "focused_window": herdr_win.get("title", "")}
 
     return {"ok": True, "pane_id": target_id, "socket_res": res}
 
@@ -677,10 +706,12 @@ def kill_target(target_id: str) -> Dict[str, Any]:
         try:
             pid = int(pid_str)
             ancestors = get_process_ancestors(pid)
-            win = resolve_hyprland_window_for_pid(pid)
-            if win and win.get("address"):
+            clients = get_hypr_clients()
+            ancestor_pids = [pid] + [a["pid"] for a in ancestors]
+            matched_win = next((c for c in clients if c.get("pid") in ancestor_pids), None)
+            if matched_win and matched_win.get("address"):
                 subprocess.run(
-                    ["hyprctl", "dispatch", "closewindow", f"address:{win['address']}"],
+                    ["hyprctl", "dispatch", "closewindow", f"address:{matched_win['address']}"],
                     env=env,
                     stdout=subprocess.DEVNULL,
                     stderr=subprocess.DEVNULL,
