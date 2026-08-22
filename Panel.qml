@@ -260,7 +260,7 @@ Panel {
         id: chipIcon
         text: "󰚩"
         font.family: root.fontFamily
-        font.pixelSize: Style.font.size.barIcon || Style.space(14)
+        font.pixelSize: Style.font.body
         color: root.summary.waiting > 0 ? "#F59E0B" : (root.summary.working > 0 ? root.accent : root.foreground)
       }
 
@@ -466,7 +466,7 @@ Panel {
 
             width: agentListView.width - Style.space(4)
             implicitHeight: cardContent.implicitHeight + Style.space(16)
-            radius: Style.radius.panelItem || Style.space(8)
+            radius: Style.cornerRadius
 
             color: {
               if (cardMouseArea.containsPress) return root.track
@@ -512,7 +512,7 @@ Panel {
                   text: modelData.agent_display || Model.agentDisplayName(modelData.agent)
                   textFormat: Text.PlainText
                   font.family: root.fontFamily
-                  font.pixelSize: Style.font.size.medium || Style.space(13)
+                  font.pixelSize: Style.font.body
                   font.bold: true
                   color: root.foreground
                   elide: Text.ElideRight
@@ -638,7 +638,7 @@ Panel {
                 text: modelData.title || "Active agent session"
                 textFormat: Text.PlainText
                 font.family: root.fontFamily
-                font.pixelSize: Style.font.size.small || Style.space(12)
+                font.pixelSize: Style.font.caption
                 font.weight: modelData.status === "working" ? Font.DemiBold : Font.Normal
                 color: root.foreground
                 wrapMode: Text.Wrap
@@ -733,7 +733,7 @@ Panel {
       Rectangle {
         Layout.fillWidth: true
         implicitHeight: Style.space(28)
-        radius: Style.radius.panelItem || Style.space(6)
+        radius: Style.cornerRadius
         color: root.alpha(root.foreground, 0.04)
 
         RowLayout {
