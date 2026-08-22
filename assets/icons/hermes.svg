@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none">
+  <rect width="24" height="24" rx="5" fill="#F59E0B" fill-opacity="0.15"/>
+  <!-- Winged helmet / Caduceus stylized motif -->
+  <path d="M12 3V21M12 3L9 6M12 3L15 6" stroke="#F59E0B" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+  <path d="M6 9C7.5 7.5 10 7.5 12 9C14 7.5 16.5 7.5 18 9" stroke="#F59E0B" stroke-width="2" stroke-linecap="round"/>
+  <path d="M5 14C7 12 10 12 12 14C14 12 17 12 19 14" stroke="#F59E0B" stroke-width="2" stroke-linecap="round"/>
+  <circle cx="12" cy="3" r="1.5" fill="#F59E0B"/>
+</svg>

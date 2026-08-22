@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none">
+  <rect width="24" height="24" rx="5" fill="#10B981" fill-opacity="0.15"/>
+  <!-- AI Agent robot/brain glyph -->
+  <rect x="5" y="7" width="14" height="12" rx="3" stroke="#10B981" stroke-width="1.8"/>
+  <circle cx="9" cy="12" r="1.2" fill="#10B981"/>
+  <circle cx="15" cy="12" r="1.2" fill="#10B981"/>
+  <path d="M12 3V7M8 16H16M3 12H5M19 12H21" stroke="#10B981" stroke-width="1.8" stroke-linecap="round"/>
+</svg>

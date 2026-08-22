@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none">
+  <rect width="24" height="24" rx="5" fill="#A855F7" fill-opacity="0.15"/>
+  <!-- Herdr terminal grid layout -->
+  <rect x="4" y="4" width="16" height="16" rx="2" stroke="#A855F7" stroke-width="1.8"/>
+  <path d="M4 9H20M11 9V20" stroke="#A855F7" stroke-width="1.8"/>
+  <circle cx="6.5" cy="6.5" r="0.75" fill="#A855F7"/>
+  <circle cx="9" cy="6.5" r="0.75" fill="#A855F7"/>
+</svg>

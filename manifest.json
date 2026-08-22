@@ -1,0 +1,73 @@
+{
+  "schemaVersion": 1,
+  "id": "meviusisback.agent-orchestr",
+  "name": "Agent Orchestrator",
+  "version": "1.0.0",
+  "author": "meviusisback",
+  "license": "MIT",
+  "description": "Live monitor and workspace orchestrator for AI coding agents (Herdr, OMP, Hermes, Claude, Codex) in the Omarchy bar.",
+  "kinds": [
+    "bar-widget"
+  ],
+  "activation": "on-demand",
+  "entryPoints": {
+    "barWidget": "Panel.qml"
+  },
+  "barWidget": {
+    "displayName": "Agent Orchestrator",
+    "description": "Real-time status, active tasks, and one-click workspace switching for AI coding agents.",
+    "category": "AI",
+    "aliases": [
+      "agent-orchestr",
+      "agent-monitor",
+      "herdr-agents"
+    ],
+    "defaults": {
+      "refreshIntervalSec": 3,
+      "barDisplay": "Icon",
+      "showIdleInBar": false,
+      "maxTaskLength": 45
+    },
+    "schema": [
+      {
+        "key": "refreshIntervalSec",
+        "type": "integer",
+        "label": "Refresh interval (seconds)",
+        "min": 1,
+        "max": 60,
+        "step": 1,
+        "defaultValue": 3,
+        "description": "How frequently the widget polls for agent status updates."
+      },
+      {
+        "key": "barDisplay",
+        "type": "enum",
+        "label": "Bar display mode",
+        "options": [
+          "Icon",
+          "Status",
+          "Compact"
+        ],
+        "defaultValue": "Icon",
+        "description": "Icon shows the orchestrator glyph + badge; Status shows the top active task; Compact shows total and busy count."
+      },
+      {
+        "key": "showIdleInBar",
+        "type": "boolean",
+        "label": "Show count when all idle",
+        "defaultValue": false,
+        "description": "Whether to display the badge number in the bar when all agents are idle."
+      },
+      {
+        "key": "maxTaskLength",
+        "type": "integer",
+        "label": "Max task description length",
+        "min": 20,
+        "max": 100,
+        "step": 5,
+        "defaultValue": 45,
+        "description": "Maximum characters shown in the bar ticker for active tasks."
+      }
+    ]
+  }
+}
