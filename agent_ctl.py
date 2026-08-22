@@ -923,29 +923,24 @@ def scan_standalone_agents(herdr_server_pids: List[int], seen_cwds: Set[str], cl
                         break
 
                 matched_client = match_hypr_client_for_terminal(ancestor_pids, cwd, agent_type)
-                if not term_name and matched_client:
+                if not matched_client:
+                    # Process is headless, orphaned, or terminal was closed -> skip it
+                    continue
+
+                window_addr = matched_client.get("address", "")
+                if not window_addr:
+                    continue
+
+                if not term_name:
                     client_class = matched_client.get("class") or matched_client.get("initialClass") or ""
                     if client_class:
                         term_name = client_class.split(".")[-1].lower()
+                term_name = term_name or "terminal"
 
-                if not term_name:
-                    # Process has a valid terminal TTY or pts allocation
-                    has_pts = any("/dev/pts/" in str(os.readlink(fd)) for fd in glob.glob(f"/proc/{pid}/fd/*") if os.path.islink(fd))
-                    if has_pts or info.get("tty", 0) > 0:
-                        term_name = "terminal"
-                    else:
-                        continue
-
-                if matched_client:
-                    ws_id = str(matched_client.get("workspace", {}).get("name", matched_client.get("workspace", {}).get("id", "1")))
-                    workspace_name = f"Desktop {ws_id}"
-                    tab_name = f"{term_name.capitalize()} (Desktop {ws_id})"
-                    window_addr = matched_client.get("address", "")
-                    pane_id = f"terminal:addr:{window_addr}" if window_addr else f"terminal:pid:{pid}"
-                else:
-                    workspace_name = "Terminal"
-                    tab_name = f"{term_name.capitalize()} (PID {pid})"
-                    pane_id = f"terminal:pid:{pid}"
+                ws_id = str(matched_client.get("workspace", {}).get("name", matched_client.get("workspace", {}).get("id", "1")))
+                workspace_name = f"Desktop {ws_id}"
+                tab_name = f"{term_name.capitalize()} (Desktop {ws_id})"
+                pane_id = f"terminal:addr:{window_addr}"
                 session_path = find_session_for_process(agent_type, pid, cwd, claimed_sessions)
                 user_goal = None
                 detail_text = None
@@ -1283,41 +1278,33 @@ def focus_pane(target_id: str) -> Dict[str, Any]:
             ancestors = get_process_ancestors(target_pid)
             anc_pids = [target_pid] + [a["pid"] for a in ancestors]
             standalone_win = match_hypr_client_for_terminal(anc_pids, "", "")
+            if standalone_win:
+                focus_hypr_window(standalone_win)
+                return {
+                    "ok": True,
+                    "target": target_id,
+                    "focused_window": standalone_win.get("title", ""),
+                    "workspace": standalone_win.get("workspace", {}).get("id"),
+                }
         except Exception:
-            standalone_win = None
-        if not standalone_win:
-            standalone_win = next(
-                (
-                    c
-                    for c in clients
-                    if c.get("class") in ("com.mitchellh.ghostty", "org.omarchy.terminal", "foot", "alacritty", "kitty")
-                    and "MAIN" not in c.get("title", "")
-                    and "herdr" not in c.get("title", "").lower()
-                ),
-                None,
-            )
-        if standalone_win:
-            focus_hypr_window(standalone_win)
-            return {
-                "ok": True,
-                "target": target_id,
-                "focused_window": standalone_win.get("title", ""),
-                "workspace": standalone_win.get("workspace", {}).get("id"),
-            }
+            pass
         return {"ok": False, "error": "Standalone terminal window not found"}
-
     # 3. Herdr pane
     sock_path = os.path.expanduser("~/.config/herdr/herdr.sock")
-    try:
-        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        s.settimeout(1.0)
-        s.connect(sock_path)
-        req = {"id": "focus:exec", "method": "pane.focus", "params": {"pane_id": target_id}}
-        s.sendall((json.dumps(req) + "\n").encode())
-        s.close()
-    except Exception:
-        pass
-
+    if os.path.exists(sock_path):
+        try:
+            s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            s.settimeout(1.0)
+            s.connect(sock_path)
+            req = {"jsonrpc": "2.0", "id": "focus:exec", "method": "pane.focus", "params": {"pane_id": target_id}}
+            s.sendall((json.dumps(req) + "\n").encode())
+            try:
+                s.recv(4096)
+            except Exception:
+                pass
+            s.close()
+        except Exception:
+            pass
     herdr_win = next(
         (c for c in clients if "MAIN" in c.get("title", "") or "herdr" in c.get("title", "").lower()),
         None,
