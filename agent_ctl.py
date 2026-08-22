@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 """
 agent_ctl.py - Backend collector and orchestrator controller for Omarchy Agent Orchestrator.
-Connects via UNIX domain socket to Herdr (~/.config/herdr/herdr.sock), and also scans
-standalone agent processes running in normal terminals (Foot, Alacritty, Kitty, Ghostty).
+Discovers and manages AI agents across:
+1. Herdr workspaces & panes (Herdr daemon socket)
+2. Standard terminal windows (Foot, Alacritty, Kitty, Ghostty)
+3. Hermes Desktop GUI instances (Electron app)
 """
 
 import glob
@@ -123,7 +125,6 @@ def find_latest_session_for_cwd(agent_type: str, cwd: str) -> Optional[str]:
     """Find the most recent session file matching a working directory."""
     if agent_type == "omp" and os.path.exists(OMP_SESSIONS_DIR):
         try:
-            # Match folder name
             folder_part = os.path.basename(cwd.rstrip("/")) if cwd else ""
             pattern = os.path.join(OMP_SESSIONS_DIR, f"*{folder_part}*", "*.jsonl")
             matches = glob.glob(pattern)
@@ -203,24 +204,24 @@ def extract_omp_task_from_session(session_path: str) -> Tuple[Optional[str], Opt
         return None, None, None
 
 
-def extract_hermes_latest_session() -> Tuple[Optional[str], Optional[str], Optional[str], Optional[float]]:
+def extract_hermes_latest_session() -> Tuple[Optional[str], Optional[str], Optional[str], Optional[str], Optional[float]]:
     """Extract latest session info from Hermes state.db."""
     if not os.path.exists(HERMES_STATE_DB):
-        return None, None, None, None
+        return None, None, None, None, None
     try:
         conn = sqlite3.connect(HERMES_STATE_DB, timeout=0.5)
         cur = conn.cursor()
         cur.execute(
-            "SELECT title, model, billing_provider, last_activity_at FROM sessions ORDER BY last_activity_at DESC LIMIT 1;"
+            "SELECT title, model, billing_provider, profile_name, last_activity_at FROM sessions ORDER BY last_activity_at DESC LIMIT 1;"
         )
         row = cur.fetchone()
         conn.close()
         if row:
-            title, model, provider, last_active = row
-            return title or "", model or "hermes", provider or "", last_active
+            title, model, provider, profile, last_active = row
+            return title or "", model or "ox-alpha-free", provider or "", profile or "", last_active
     except Exception:
         pass
-    return None, None, None, None
+    return None, None, None, None, None
 
 
 def shorten_path(path: str) -> str:
@@ -235,9 +236,11 @@ def shorten_path(path: str) -> str:
     return path
 
 
-def scan_standalone_agents(herdr_server_pids: List[int]) -> List[Dict[str, Any]]:
+def scan_standalone_agents(herdr_server_pids: List[int], seen_cwds: Set[str]) -> List[Dict[str, Any]]:
     """Discover AI agents running in normal terminal windows outside of Herdr."""
     standalone = []
+    hermes_desktop_found = False
+
     for p in glob.glob("/proc/[0-9]*"):
         try:
             pid = int(os.path.basename(p))
@@ -247,6 +250,36 @@ def scan_standalone_agents(herdr_server_pids: List[int]) -> List[Dict[str, Any]]
             cmd = info["cmd"]
             if not cmd:
                 continue
+
+            # Check if this is a Hermes Desktop GUI process
+            if "/Hermes" in cmd and "--type=" not in cmd and not hermes_desktop_found:
+                hermes_desktop_found = True
+                # If Hermes desktop is already represented in Herdr panes, don't duplicate
+                if "hermes_desktop" in seen_cwds:
+                    continue
+
+                hermes_title, hermes_model, hermes_provider, hermes_profile, _ = extract_hermes_latest_session()
+                standalone.append({
+                    "pane_id": f"desktop:hermes:{pid}",
+                    "pid": pid,
+                    "origin": "desktop",
+                    "origin_label": "Hermes Desktop",
+                    "agent": "hermes",
+                    "agent_display": "Hermes Desktop",
+                    "status": "idle",
+                    "title": hermes_title or "Hermes Desktop Workspace",
+                    "detail": f"Profile: {hermes_profile or 'Default'}",
+                    "cwd": "~/.hermes",
+                    "repo": "Hermes Desktop",
+                    "workspace": "Desktop App",
+                    "tab": f"Hermes GUI (PID {pid})",
+                    "pane_label": "Electron Window",
+                    "focused": False,
+                    "model": hermes_model or "ox-alpha-free",
+                    "session_path": "",
+                })
+                continue
+
             tokens = cmd.split()
             first = os.path.basename(tokens[0])
 
@@ -275,7 +308,7 @@ def scan_standalone_agents(herdr_server_pids: List[int]) -> List[Dict[str, Any]]
                 if agent_type == "omp" and session_path:
                     user_goal, latest_activity, model_name = extract_omp_task_from_session(session_path)
                 elif agent_type == "hermes":
-                    hermes_title, hermes_model, _, _ = extract_hermes_latest_session()
+                    hermes_title, hermes_model, _, hermes_profile, _ = extract_hermes_latest_session()
                     user_goal = hermes_title
                     model_name = hermes_model
 
@@ -293,9 +326,10 @@ def scan_standalone_agents(herdr_server_pids: List[int]) -> List[Dict[str, Any]]
                             break
 
                 standalone.append({
-                    "pane_id": f"standalone:pid:{pid}",
+                    "pane_id": f"terminal:pid:{pid}",
                     "pid": pid,
-                    "is_standalone": True,
+                    "origin": "terminal",
+                    "origin_label": f"Terminal ({term_name.capitalize()})",
                     "agent": agent_type,
                     "agent_display": agent_type.upper() if agent_type in ("omp", "pi") else agent_type.capitalize(),
                     "status": "working" if info.get("state") in ("R", "D") else "idle",
@@ -305,7 +339,7 @@ def scan_standalone_agents(herdr_server_pids: List[int]) -> List[Dict[str, Any]]
                     "repo": repo_name,
                     "workspace": "Terminal",
                     "tab": f"{term_name.capitalize()} (PID {pid})",
-                    "pane_label": f"Standalone {agent_type.upper()}",
+                    "pane_label": f"PID {pid}",
                     "focused": False,
                     "model": model_name or "",
                     "session_path": session_path or "",
@@ -329,6 +363,7 @@ def fetch_all_agents() -> Dict[str, Any]:
     waiting_count = 0
     active_agent_types = set()
     top_working_task = ""
+    seen_cwds: Set[str] = set()
 
     herdr_connected = bool(resp and "result" in resp and "snapshot" in resp["result"])
 
@@ -380,6 +415,13 @@ def fetch_all_agents() -> Dict[str, Any]:
             workspace_name = workspaces_map.get(workspace_id, "")
             pane_label = pane_info.get("label") or a.get("label") or ""
 
+            # Check if this pane runs Hermes Desktop
+            is_hermes_desktop = False
+            agent_launch = pane_info.get("agent_launch") or a.get("agent_launch") or {}
+            if agent_type == "hermes" and (agent_launch.get("args") == ["desktop"] or "desktop" in tab_name.lower()):
+                is_hermes_desktop = True
+                seen_cwds.add("hermes_desktop")
+
             agent_session = a.get("agent_session", {})
             session_path = agent_session.get("value") if isinstance(agent_session, dict) else None
             user_goal = None
@@ -389,7 +431,7 @@ def fetch_all_agents() -> Dict[str, Any]:
             if agent_type == "omp" and session_path:
                 user_goal, latest_activity, model_name = extract_omp_task_from_session(session_path)
             elif agent_type == "hermes":
-                hermes_title, hermes_model, _, _ = extract_hermes_latest_session()
+                hermes_title, hermes_model, _, hermes_profile, _ = extract_hermes_latest_session()
                 if hermes_title:
                     user_goal = hermes_title
                     model_name = hermes_model
@@ -414,12 +456,17 @@ def fetch_all_agents() -> Dict[str, Any]:
 
             detail_text = latest_activity or (user_goal if user_goal and user_goal != effective_title else "") or clean_cwd
 
+            origin = "herdr_desktop" if is_hermes_desktop else "herdr"
+            origin_label = "Herdr (Desktop)" if is_hermes_desktop else "Herdr"
+            display_name = "Hermes Desktop" if is_hermes_desktop else (agent_type.upper() if agent_type in ("omp", "pi") else agent_type.capitalize())
+
             agents_list.append(
                 {
                     "pane_id": pane_id,
-                    "is_standalone": False,
+                    "origin": origin,
+                    "origin_label": origin_label,
                     "agent": agent_type,
-                    "agent_display": agent_type.upper() if agent_type in ("omp", "pi") else agent_type.capitalize(),
+                    "agent_display": display_name,
                     "status": status,
                     "title": effective_title,
                     "detail": detail_text,
@@ -435,7 +482,7 @@ def fetch_all_agents() -> Dict[str, Any]:
             )
 
     # Scan and append standalone terminal agents
-    standalone_agents = scan_standalone_agents(herdr_pids)
+    standalone_agents = scan_standalone_agents(herdr_pids, seen_cwds)
     for sa in standalone_agents:
         if sa["status"] == "working":
             working_count += 1
@@ -477,12 +524,26 @@ def fetch_all_agents() -> Dict[str, Any]:
 
 
 def focus_pane(target_id: str) -> Dict[str, Any]:
-    """Focus a specific pane in Herdr or standalone terminal window."""
+    """Focus a specific pane in Herdr, Hermes Desktop window, or standalone terminal."""
     if not target_id:
         return {"ok": False, "error": "No target_id provided"}
 
-    if target_id.startswith("standalone:pid:"):
-        pid = target_id.replace("standalone:pid:", "")
+    # 1. Hermes Desktop standalone window
+    if target_id.startswith("desktop:hermes:"):
+        try:
+            subprocess.run(
+                ["hyprctl", "dispatch", "focuswindow", "class:^(Hermes|hermes)$"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=0.5,
+            )
+            return {"ok": True, "target": target_id, "mode": "hermes_desktop"}
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
+
+    # 2. Standalone terminal window by PID
+    if target_id.startswith("terminal:pid:"):
+        pid = target_id.replace("terminal:pid:", "")
         try:
             subprocess.run(
                 ["hyprctl", "dispatch", "focuswindow", f"pid:{pid}"],
@@ -494,7 +555,7 @@ def focus_pane(target_id: str) -> Dict[str, Any]:
         except Exception as e:
             return {"ok": False, "error": str(e)}
 
-    # Send pane.focus to Herdr socket
+    # 3. Herdr pane
     res = query_herdr_socket("pane.focus", {"pane_id": target_id})
     try:
         subprocess.run(

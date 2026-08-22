@@ -45,7 +45,7 @@ Panel {
   property var summary: rawData && rawData.summary ? rawData.summary : ({ total: 0, working: 0, idle: 0, waiting: 0, headline: "Offline" })
   property var agents: rawData && rawData.agents ? rawData.agents : []
   property bool loading: false
-  property string selectedFilter: "all" // "all" | "working" | "idle"
+  property string selectedFilter: "all" // "all" | "working" | "herdr" | "external"
   property string lastFocusedPane: ""
 
   readonly property var filteredAgents: {
@@ -53,11 +53,17 @@ Panel {
     if (root.selectedFilter === "working") {
       return list.filter(function(a) { return a.status === "working" || a.status === "waiting" })
     }
-    if (root.selectedFilter === "idle") {
-      return list.filter(function(a) { return a.status === "idle" || a.status === "error" })
+    if (root.selectedFilter === "herdr") {
+      return list.filter(function(a) { return a.origin === "herdr" || a.origin === "herdr_desktop" })
+    }
+    if (root.selectedFilter === "external") {
+      return list.filter(function(a) { return a.origin === "terminal" || a.origin === "desktop" })
     }
     return list
   }
+
+  readonly property int herdrCount: (root.agents || []).filter(function(a) { return a.origin === "herdr" || a.origin === "herdr_desktop" }).length
+  readonly property int externalCount: (root.agents || []).filter(function(a) { return a.origin === "terminal" || a.origin === "desktop" }).length
 
   function alpha(c, a) { return Qt.rgba(c.r, c.g, c.b, a) }
 
@@ -271,8 +277,8 @@ Panel {
     bar: root.bar
     owner: root
     open: root.opened
-    contentWidth: Style.space(430)
-    contentHeight: Style.space(560)
+    contentWidth: Style.space(450)
+    contentHeight: Style.space(580)
 
     ColumnLayout {
       anchors.fill: parent
@@ -306,11 +312,11 @@ Panel {
 
           Text {
             text: {
-              if (!root.rawData.connected) return "Herdr daemon not reachable"
+              if (!root.rawData.connected && root.summary.total === 0) return "No agents detected"
               var w = root.summary.working || 0
               var i = root.summary.idle || 0
               var t = root.summary.total || 0
-              return w + " working · " + i + " idle across " + t + " active pane" + (t === 1 ? "" : "s")
+              return w + " working · " + i + " idle across " + t + " active instance" + (t === 1 ? "" : "s")
             }
             textFormat: Text.PlainText
             color: root.dim
@@ -359,7 +365,8 @@ Panel {
           model: [
             { id: "all", label: "All (" + (root.summary.total || 0) + ")" },
             { id: "working", label: "Working (" + (root.summary.working || 0) + ")" },
-            { id: "idle", label: "Idle (" + (root.summary.idle || 0) + ")" }
+            { id: "herdr", label: "Herdr (" + root.herdrCount + ")" },
+            { id: "external", label: "Terminal / App (" + root.externalCount + ")" }
           ]
 
           Rectangle {
@@ -375,7 +382,7 @@ Panel {
               anchors.centerIn: parent
               text: modelData.label
               font.family: root.fontFamily
-              font.pixelSize: Style.space(11)
+              font.pixelSize: Style.space(10)
               font.weight: root.selectedFilter === modelData.id ? Font.DemiBold : Font.Normal
               color: root.selectedFilter === modelData.id ? root.accent : root.foreground
             }
@@ -431,7 +438,7 @@ Panel {
               anchors.margins: Style.space(10)
               spacing: Style.space(6)
 
-              // Card Header: Brand Icon + Name + Status Badge + Focus Button
+              // Card Header: Brand Icon + Name + Origin Pill + Model + Status Badge + Focus Button
               RowLayout {
                 Layout.fillWidth: true
                 spacing: Style.space(8)
@@ -446,33 +453,59 @@ Panel {
                   fillMode: Image.PreserveAspectFit
                 }
 
-                // Agent Name & Model Tag
-                RowLayout {
-                  spacing: Style.space(6)
-                  Text {
-                    text: modelData.agent_display || Model.agentDisplayName(modelData.agent)
-                    font.family: root.fontFamily
-                    font.pixelSize: Style.font.size.medium || Style.space(13)
-                    font.bold: true
-                    color: root.foreground
-                  }
+                // Agent Name
+                Text {
+                  text: modelData.agent_display || Model.agentDisplayName(modelData.agent)
+                  font.family: root.fontFamily
+                  font.pixelSize: Style.font.size.medium || Style.space(13)
+                  font.bold: true
+                  color: root.foreground
+                }
 
-                  // Model Chip (if present)
-                  Rectangle {
-                    visible: Boolean(modelData.model)
-                    implicitWidth: modelText.implicitWidth + Style.space(8)
-                    implicitHeight: Style.space(16)
-                    radius: Style.space(4)
-                    color: root.alpha(root.foreground, 0.1)
+                // Origin Pill (Herdr vs Terminal vs Desktop)
+                Rectangle {
+                  implicitWidth: originRow.implicitWidth + Style.space(8)
+                  implicitHeight: Style.space(16)
+                  radius: Style.space(4)
+                  color: root.alpha(Model.originColor(modelData.origin), 0.15)
+                  border.width: 1
+                  border.color: root.alpha(Model.originColor(modelData.origin), 0.4)
 
+                  RowLayout {
+                    id: originRow
+                    anchors.centerIn: parent
+                    spacing: Style.space(3)
                     Text {
-                      id: modelText
-                      anchors.centerIn: parent
-                      text: modelData.model || ""
+                      text: Model.originIcon(modelData.origin)
                       font.family: root.fontFamily
-                      font.pixelSize: Style.space(9)
-                      color: root.dim
+                      font.pixelSize: Style.space(8)
+                      color: Model.originColor(modelData.origin)
                     }
+                    Text {
+                      text: Model.originBadgeText(modelData.origin)
+                      font.family: root.fontFamily
+                      font.pixelSize: Style.space(8)
+                      font.bold: true
+                      color: Model.originColor(modelData.origin)
+                    }
+                  }
+                }
+
+                // Model Chip (if present)
+                Rectangle {
+                  visible: Boolean(modelData.model)
+                  implicitWidth: modelText.implicitWidth + Style.space(8)
+                  implicitHeight: Style.space(16)
+                  radius: Style.space(4)
+                  color: root.alpha(root.foreground, 0.1)
+
+                  Text {
+                    id: modelText
+                    anchors.centerIn: parent
+                    text: modelData.model || ""
+                    font.family: root.fontFamily
+                    font.pixelSize: Style.space(9)
+                    color: root.dim
                   }
                 }
 
@@ -609,7 +642,7 @@ Panel {
                     var parts = []
                     if (modelData.workspace) parts.push(modelData.workspace)
                     if (modelData.tab) parts.push(modelData.tab)
-                    if (modelData.pane_label) parts.push(modelData.pane_label)
+                    if (modelData.pane_label && modelData.pane_label !== modelData.tab) parts.push(modelData.pane_label)
                     return parts.join(" > ")
                   }
                   font.family: root.fontFamily
@@ -620,7 +653,7 @@ Panel {
               }
             }
 
-            // Click entire card to focus pane
+            // Click entire card to focus pane / window
             MouseArea {
               id: cardMouseArea
               anchors.fill: parent
@@ -644,17 +677,17 @@ Panel {
           anchors.leftMargin: Style.space(8)
           anchors.rightMargin: Style.space(8)
 
-          // Socket connection indicator
+          // Socket / Service connection indicator
           RowLayout {
             spacing: Style.space(5)
             Rectangle {
               width: Style.space(6)
               height: Style.space(6)
               radius: Style.space(3)
-              color: root.rawData.connected ? "#10B981" : root.urgent
+              color: root.rawData.connected ? "#10B981" : "#38BDF8"
             }
             Text {
-              text: root.rawData.connected ? "Herdr Socket Live" : "Herdr Disconnected"
+              text: root.rawData.connected ? "Herdr + Terminal Live" : "Standalone Scanner Active"
               font.family: root.fontFamily
               font.pixelSize: Style.space(9)
               color: root.dim

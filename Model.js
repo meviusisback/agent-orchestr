@@ -3,15 +3,15 @@
 function statusColor(status, fg, accent, urgent) {
   var s = String(status || "").toLowerCase()
   if (s === "working" || s === "busy" || s === "running") {
-    return accent || "#10B981" // Active Green / Accent
+    return accent || "#10B981"
   }
   if (s === "waiting" || s === "prompt" || s === "input") {
-    return "#F59E0B" // Amber warning
+    return "#F59E0B"
   }
   if (s === "error" || s === "failed") {
-    return urgent || "#EF4444" // Urgent Red
+    return urgent || "#EF4444"
   }
-  return Qt.darker(fg || "#FFFFFF", 1.8) // Neutral / Dim
+  return Qt.darker(fg || "#FFFFFF", 1.8)
 }
 
 function statusBadgeText(status) {
@@ -20,6 +20,28 @@ function statusBadgeText(status) {
   if (s === "waiting") return "PROMPT"
   if (s === "error") return "ERROR"
   return "IDLE"
+}
+
+function originColor(origin) {
+  var o = String(origin || "").toLowerCase()
+  if (o.indexOf("desktop") >= 0) return "#F59E0B" // Amber for Desktop
+  if (o === "terminal") return "#38BDF8" // Cyan/Blue for Standalone Terminal
+  return "#A855F7" // Purple for Herdr
+}
+
+function originBadgeText(origin) {
+  var o = String(origin || "").toLowerCase()
+  if (o === "herdr_desktop") return "HERDR · GUI"
+  if (o === "desktop") return "DESKTOP APP"
+  if (o === "terminal") return "TERMINAL"
+  return "HERDR"
+}
+
+function originIcon(origin) {
+  var o = String(origin || "").toLowerCase()
+  if (o.indexOf("desktop") >= 0) return "󰨇"
+  if (o === "terminal") return ""
+  return "󰘦"
 }
 
 function agentDisplayName(agent) {
