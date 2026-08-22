@@ -2,7 +2,7 @@
 """
 agent_ctl.py - Backend collector and orchestrator controller for Omarchy Agent Orchestrator.
 Discovers and manages AI agents across:
-1. Herdr workspaces & panes (Herdr daemon socket)
+1. Herdr workspaces & panes (Herdr daemon socket + process tree correlation)
 2. Standard terminal windows (Foot, Alacritty, Kitty, Ghostty)
 3. Hermes Desktop GUI instances (Electron app)
 """
@@ -83,9 +83,10 @@ def get_process_info(pid: int) -> Optional[Dict[str, Any]]:
         with open(f"{proc_dir}/stat", "r") as f:
             stat_parts = f.read().split()
             ppid = int(stat_parts[3])
+            tty_nr = int(stat_parts[6])
             state = stat_parts[2]
         cwd = os.path.realpath(f"{proc_dir}/cwd")
-        return {"pid": pid, "ppid": ppid, "state": state, "cmd": cmd, "cwd": cwd}
+        return {"pid": pid, "ppid": ppid, "tty": tty_nr, "state": state, "cmd": cmd, "cwd": cwd}
     except Exception:
         return None
 
@@ -104,8 +105,9 @@ def get_herdr_server_pids() -> List[int]:
     return pids
 
 
-def is_descendant_of(pid: int, target_pids: List[int], max_depth: int = 15) -> bool:
-    """Check if process is a child/descendant of any target PIDs."""
+def get_process_ancestors(pid: int, max_depth: int = 20) -> List[int]:
+    """Return ordered list of ancestor PIDs up to PID 1."""
+    ancestors = []
     curr = pid
     visited = set()
     depth = 0
@@ -113,12 +115,11 @@ def is_descendant_of(pid: int, target_pids: List[int], max_depth: int = 15) -> b
         visited.add(curr)
         depth += 1
         info = get_process_info(curr)
-        if not info:
+        if not info or info["ppid"] <= 0:
             break
-        if info["ppid"] in target_pids or curr in target_pids:
-            return True
+        ancestors.append(info["ppid"])
         curr = info["ppid"]
-    return False
+    return ancestors
 
 
 def find_latest_session_for_cwd(agent_type: str, cwd: str) -> Optional[str]:
@@ -245,17 +246,17 @@ def scan_standalone_agents(herdr_server_pids: List[int], seen_cwds: Set[str]) ->
         try:
             pid = int(os.path.basename(p))
             info = get_process_info(pid)
-            if not info:
+            if not info or not info["cmd"]:
                 continue
             cmd = info["cmd"]
-            if not cmd:
-                continue
+
+            ancestors = get_process_ancestors(pid)
+            is_in_herdr = any(hp in ancestors for hp in herdr_server_pids)
 
             # Check if this is a Hermes Desktop GUI process
             if "/Hermes" in cmd and "--type=" not in cmd and not hermes_desktop_found:
                 hermes_desktop_found = True
-                # If Hermes desktop is already represented in Herdr panes, don't duplicate
-                if "hermes_desktop" in seen_cwds:
+                if "hermes_desktop" in seen_cwds or is_in_herdr:
                     continue
 
                 hermes_title, hermes_model, hermes_provider, hermes_profile, _ = extract_hermes_latest_session()
@@ -284,15 +285,21 @@ def scan_standalone_agents(herdr_server_pids: List[int], seen_cwds: Set[str]) ->
             first = os.path.basename(tokens[0])
 
             agent_type = None
-            if first in ("omp", "hermes", "claude", "codex", "opencode", "cline", "cursor") or (first == "python" and "hermes" in cmd):
-                if first == "python":
-                    if "hermes_cli.main" in cmd or "hermes desktop" in cmd:
-                        agent_type = "hermes"
-                else:
-                    agent_type = first
+            if first in ("omp", "pi"):
+                agent_type = "omp"
+            elif first == "claude":
+                agent_type = "claude"
+            elif first == "codex":
+                agent_type = "codex"
+            elif first == "opencode":
+                agent_type = "opencode"
+            elif first in ("cline", "cursor"):
+                agent_type = first
+            elif first == "python" and ("hermes_cli.main" in cmd or "hermes desktop" in cmd):
+                agent_type = "hermes"
 
-            if agent_type and not is_descendant_of(pid, herdr_server_pids):
-                # Exclude internal daemon workers or subprocesses
+            # Only include if truly outside Herdr
+            if agent_type and not is_in_herdr:
                 if "__omp_worker" in cmd or "gateway run" in cmd or "serve --host" in cmd or "zygote" in cmd or "agent_ctl.py" in cmd:
                     continue
 
@@ -315,14 +322,16 @@ def scan_standalone_agents(herdr_server_pids: List[int], seen_cwds: Set[str]) ->
                 effective_title = user_goal or (f"Working in {repo_name}" if repo_name and repo_name not in ("tmp", "~") else f"{agent_type.upper()} standalone session")
                 detail_text = latest_activity or clean_cwd
 
-                # Determine terminal emulator name if possible
                 term_name = "terminal"
-                p_info = get_process_info(info["ppid"])
-                if p_info:
-                    p_cmd = p_info["cmd"].lower()
-                    for t in ("foot", "ghostty", "alacritty", "kitty", "wezterm", "gnome-terminal"):
-                        if t in p_cmd:
-                            term_name = t
+                for anc_pid in ancestors:
+                    anc_info = get_process_info(anc_pid)
+                    if anc_info:
+                        anc_cmd = anc_info["cmd"].lower()
+                        for t in ("foot", "ghostty", "alacritty", "kitty", "wezterm", "gnome-terminal"):
+                            if t in anc_cmd:
+                                term_name = t
+                                break
+                        if term_name != "terminal":
                             break
 
                 standalone.append({
@@ -415,7 +424,6 @@ def fetch_all_agents() -> Dict[str, Any]:
             workspace_name = workspaces_map.get(workspace_id, "")
             pane_label = pane_info.get("label") or a.get("label") or ""
 
-            # Check if this pane runs Hermes Desktop
             is_hermes_desktop = False
             agent_launch = pane_info.get("agent_launch") or a.get("agent_launch") or {}
             if agent_type == "hermes" and (agent_launch.get("args") == ["desktop"] or "desktop" in tab_name.lower()):
@@ -481,7 +489,6 @@ def fetch_all_agents() -> Dict[str, Any]:
                 }
             )
 
-    # Scan and append standalone terminal agents
     standalone_agents = scan_standalone_agents(herdr_pids, seen_cwds)
     for sa in standalone_agents:
         if sa["status"] == "working":
