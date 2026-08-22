@@ -908,6 +908,10 @@ def scan_standalone_agents(herdr_server_pids: List[int], seen_cwds: Set[str], cl
                 agent_type = "hermes"
 
             if agent_type:
+                cwd = info.get("cwd", "")
+                repo_name = os.path.basename(cwd.rstrip("/")) if cwd else ""
+                clean_cwd = shorten_path(cwd)
+
                 term_name = None
                 for anc in ancestors:
                     anc_cmd = anc["cmd"].lower()
@@ -932,11 +936,6 @@ def scan_standalone_agents(herdr_server_pids: List[int], seen_cwds: Set[str], cl
                     else:
                         continue
 
-                cwd = info["cwd"]
-                repo_name = os.path.basename(cwd.rstrip("/")) if cwd else ""
-                clean_cwd = shorten_path(cwd)
-
-                matched_client = match_hypr_client_for_terminal(ancestor_pids, cwd, agent_type)
                 if matched_client:
                     ws_id = str(matched_client.get("workspace", {}).get("name", matched_client.get("workspace", {}).get("id", "1")))
                     workspace_name = f"Desktop {ws_id}"
@@ -947,7 +946,6 @@ def scan_standalone_agents(herdr_server_pids: List[int], seen_cwds: Set[str], cl
                     workspace_name = "Terminal"
                     tab_name = f"{term_name.capitalize()} (PID {pid})"
                     pane_id = f"terminal:pid:{pid}"
-
                 session_path = find_session_for_process(agent_type, pid, cwd, claimed_sessions)
                 user_goal = None
                 detail_text = None
