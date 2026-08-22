@@ -286,11 +286,12 @@ Panel {
     bar: root.bar
     owner: root
     open: root.opened
-    contentWidth: Style.space(460)
+    contentWidth: Style.space(480)
     contentHeight: Style.space(580)
 
     ColumnLayout {
       anchors.fill: parent
+      anchors.margins: Style.space(4)
       spacing: Style.space(12)
 
       // --------------------------------------------------------- Header Row
@@ -407,6 +408,7 @@ Panel {
 
         ListView {
           id: agentListView
+          width: parent.width
           model: root.filteredAgents
           spacing: Style.space(8)
           boundsBehavior: Flickable.StopAtBounds
@@ -415,7 +417,7 @@ Panel {
             required property var modelData
             required property int index
 
-            width: agentListView.width
+            width: agentListView.width - Style.space(4)
             implicitHeight: cardContent.implicitHeight + Style.space(16)
             radius: Style.radius.panelItem || Style.space(8)
 
@@ -440,10 +442,10 @@ Panel {
               anchors.margins: Style.space(10)
               spacing: Style.space(6)
 
-              // Card Header: Brand Icon + Name + Origin Pill + Model + Status Badge + Actions
+              // Card Header: Brand Icon + Name + Origin Pill + Model + Status Badge + Terminate Button
               RowLayout {
                 Layout.fillWidth: true
-                spacing: Style.space(8)
+                spacing: Style.space(7)
 
                 // Agent Brand SVG Mark
                 Image {
@@ -462,6 +464,8 @@ Panel {
                   font.pixelSize: Style.font.size.medium || Style.space(13)
                   font.bold: true
                   color: root.foreground
+                  elide: Text.ElideRight
+                  Layout.maximumWidth: Style.space(140)
                 }
 
                 // Origin Pill (Herdr vs Terminal vs Desktop)
@@ -496,7 +500,7 @@ Panel {
                 // Model Chip (if present)
                 Rectangle {
                   visible: Boolean(modelData.model)
-                  implicitWidth: modelText.implicitWidth + Style.space(8)
+                  implicitWidth: Math.min(modelText.implicitWidth + Style.space(8), Style.space(120))
                   implicitHeight: Style.space(16)
                   radius: Style.space(4)
                   color: root.alpha(root.foreground, 0.1)
@@ -508,6 +512,8 @@ Panel {
                     font.family: root.fontFamily
                     font.pixelSize: Style.space(9)
                     color: root.dim
+                    elide: Text.ElideRight
+                    width: Math.min(implicitWidth, Style.space(110))
                   }
                 }
 
@@ -545,48 +551,11 @@ Panel {
                   }
                 }
 
-                // Interactive Focus Button
+                // Terminate / Close Button (Replaces Focus button)
                 Rectangle {
-                  implicitWidth: focusBtnText.implicitWidth + Style.space(10)
-                  implicitHeight: Style.space(20)
-                  radius: Style.space(5)
-                  color: focusMouse.containsMouse ? root.alpha(root.accent, 0.3) : root.alpha(root.foreground, 0.12)
-                  border.width: 1
-                  border.color: focusMouse.containsMouse ? root.accent : root.alpha(root.foreground, 0.2)
-
-                  RowLayout {
-                    id: focusBtnText
-                    anchors.centerIn: parent
-                    spacing: Style.space(3)
-                    Text {
-                      text: "Focus"
-                      font.family: root.fontFamily
-                      font.pixelSize: Style.space(10)
-                      font.weight: Font.Medium
-                      color: root.foreground
-                    }
-                    Text {
-                      text: "↗"
-                      font.family: root.fontFamily
-                      font.pixelSize: Style.space(10)
-                      color: root.accent
-                    }
-                  }
-
-                  MouseArea {
-                    id: focusMouse
-                    anchors.fill: parent
-                    hoverEnabled: true
-                    cursorShape: Qt.PointingHandCursor
-                    onClicked: root.focusPane(modelData.pane_id)
-                  }
-                }
-
-                // Terminate / Close Button
-                Rectangle {
-                  implicitWidth: Style.space(20)
-                  implicitHeight: Style.space(20)
-                  radius: Style.space(5)
+                  implicitWidth: Style.space(22)
+                  implicitHeight: Style.space(22)
+                  radius: Style.space(6)
                   color: killMouse.containsMouse ? root.alpha(root.urgent, 0.35) : root.alpha(root.foreground, 0.08)
                   border.width: 1
                   border.color: killMouse.containsMouse ? root.urgent : "transparent"
@@ -642,7 +611,7 @@ Panel {
 
                 // Repo / Directory Pill
                 Rectangle {
-                  implicitWidth: repoText.implicitWidth + Style.space(10)
+                  implicitWidth: Math.min(repoText.implicitWidth + Style.space(10), Style.space(140))
                   implicitHeight: Style.space(16)
                   radius: Style.space(4)
                   color: root.alpha(root.foreground, 0.08)
@@ -660,6 +629,8 @@ Panel {
                       font.family: root.fontFamily
                       font.pixelSize: Style.space(9)
                       color: root.foreground
+                      elide: Text.ElideRight
+                      Layout.maximumWidth: Style.space(110)
                     }
                   }
                 }
