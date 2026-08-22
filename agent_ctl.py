@@ -78,6 +78,23 @@ def clean_model_name(model_str: Optional[str]) -> str:
             m = "/".join(parts[1:])
     return m
 
+def get_omp_default_model() -> str:
+    """Extract default configured model for OMP from config.yml or fallback."""
+    cfg_path = os.path.expanduser("~/.omp/agent/config.yml")
+    if os.path.exists(cfg_path):
+        try:
+            with open(cfg_path, "r", encoding="utf-8") as f:
+                content = f.read()
+            m = re.search(r"default:\s*([^\s\n\r]+)", content)
+            if m:
+                return clean_model_name(m.group(1).strip("\"'"))
+            m = re.search(r"defaultModel:\s*([^\s\n\r]+)", content)
+            if m:
+                return clean_model_name(m.group(1).strip("\"'"))
+        except Exception:
+            pass
+    return "gemini-3.7-flash"
+
 
 def query_herdr_socket(method: str, params: Optional[Dict[str, Any]] = None, timeout: float = 1.0) -> Optional[Dict[str, Any]]:
     """Send JSON-RPC request to Herdr socket and return parsed response."""
@@ -275,12 +292,33 @@ def get_process_open_session(pid: int) -> Optional[str]:
 
 def find_session_for_process(agent_type: str, pid: int, cwd: str, claimed_sessions: Set[str]) -> Optional[str]:
     """Find active or recent session file strictly belonging to this specific process."""
-    # 1. Direct open file descriptor
+    if agent_type == "omp":
+        # 1. Check PTS terminal session mapping in ~/.omp/agent/terminal-sessions/pts-<N>
+        try:
+            for fd in glob.glob(f"/proc/{pid}/fd/*"):
+                try:
+                    target = os.readlink(fd)
+                    if target.startswith("/dev/pts/"):
+                        pts_num = target.split("/")[-1]
+                        pts_file = os.path.expanduser(f"~/.omp/agent/terminal-sessions/pts-{pts_num}")
+                        if os.path.exists(pts_file):
+                            with open(pts_file, "r", encoding="utf-8") as pf:
+                                lines = [line.strip() for line in pf if line.strip()]
+                                if len(lines) >= 2:
+                                    sess_cand = lines[1]
+                                    if sess_cand not in claimed_sessions:
+                                        return sess_cand
+                except Exception:
+                    continue
+        except Exception:
+            pass
+
+    # 2. Direct open file descriptor
     open_s = get_process_open_session(pid)
     if open_s and open_s not in claimed_sessions:
         return open_s
 
-    # 2. If no open session, check if there is an unclaimed session modified around/after process started
+    # 3. If no open session, check if there is an unclaimed session modified around/after process started
     p_start = get_process_start_time(pid)
     if agent_type == "omp" and os.path.exists(OMP_SESSIONS_DIR):
         folder_part = os.path.basename(cwd.rstrip("/")) if cwd else ""
@@ -424,14 +462,15 @@ def extract_omp_task_from_session(
                     entry = json.loads(line)
                     msg_type = entry.get("type")
 
-                    if "model" in entry and entry["model"]:
+                    if entry.get("type") == "model_change" and entry.get("model"):
+                        model_name = entry["model"]
+                    elif "model" in entry and entry["model"]:
                         model_name = entry["model"]
                     elif "data" in entry and isinstance(entry["data"], dict):
                         if entry["data"].get("model"):
                             model_name = entry["data"]["model"]
                         elif entry["data"].get("modelId"):
                             model_name = entry["data"]["modelId"]
-
                     if msg_type == "message":
                         msg = entry.get("message", {})
                         role = msg.get("role")
@@ -492,8 +531,8 @@ def extract_omp_task_from_session(
                 except Exception:
                     continue
 
-        # If user prompt was earlier than the tail seek, quickly read from head
-        if not latest_user_prompt and file_size > 131072:
+        # If user prompt or model was earlier than the tail seek, quickly read from head
+        if (not latest_user_prompt or not model_name) and file_size > 131072:
             try:
                 with open(session_path, "r", encoding="utf-8", errors="replace") as f:
                     for _ in range(50):
@@ -502,7 +541,12 @@ def extract_omp_task_from_session(
                             break
                         try:
                             entry = json.loads(line)
-                            if entry.get("type") == "message":
+                            if not model_name:
+                                if entry.get("type") == "model_change" and entry.get("model"):
+                                    model_name = entry["model"]
+                                elif "model" in entry and entry["model"]:
+                                    model_name = entry["model"]
+                            if not latest_user_prompt and entry.get("type") == "message":
                                 msg = entry.get("message", {})
                                 if msg.get("role") == "user":
                                     content = msg.get("content")
@@ -515,12 +559,10 @@ def extract_omp_task_from_session(
                                     cleaned = clean_user_prompt(raw_txt)
                                     if cleaned and not is_system_wrapper(cleaned):
                                         latest_user_prompt = cleaned
-                                        break
                         except Exception:
                             continue
             except Exception:
                 pass
-
         status_override = None
         detail = None
         has_question = False
@@ -542,7 +584,8 @@ def extract_omp_task_from_session(
                 status_override = "waiting"
             else:
                 status_override = "completed"
-        return latest_user_prompt, detail, clean_model_name(model_name), status_override, has_question
+        eff_model = clean_model_name(model_name) if model_name else get_omp_default_model()
+        return latest_user_prompt, detail, eff_model, status_override, has_question
     except Exception:
         return None, None, None, None, False
 
@@ -899,14 +942,21 @@ def scan_standalone_agents(herdr_server_pids: List[int], seen_cwds: Set[str], cl
                 if session_path:
                     claimed_sessions.add(session_path)
                     if agent_type == "omp":
-                        user_goal, detail_text, model_name, status_override, has_question = extract_omp_task_from_session(session_path)
+                        if os.path.exists(session_path):
+                            user_goal, detail_text, model_name, status_override, has_question = extract_omp_task_from_session(session_path)
+                        else:
+                            model_name = get_omp_default_model()
                     elif agent_type == "hermes":
                         p_st = get_process_start_time(pid)
                         user_goal, model_name, _, _, detail_text, status_override, has_question = extract_hermes_session_info(source_preference="cli", min_start_time=p_st)
                 else:
+                    if agent_type == "omp":
+                        model_name = get_omp_default_model()
                     detail_text = "Ready for prompt"
                     status_override = "idle"
 
+                if not model_name and agent_type == "omp":
+                    model_name = get_omp_default_model()
                 if user_goal:
                     effective_title = user_goal
                 elif repo_name and repo_name not in ("tmp", "~"):
@@ -1106,7 +1156,7 @@ def fetch_all_agents() -> Dict[str, Any]:
                     "tab": tab_name,
                     "pane_label": pane_label,
                     "focused": bool(a.get("focused")),
-                    "model": model_name or "",
+                    "model": model_name or (get_omp_default_model() if agent_type == "omp" else ""),
                     "session_path": session_path or "",
                     "has_question": has_question,
                 }
