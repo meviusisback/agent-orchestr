@@ -1115,23 +1115,25 @@ def fetch_all_agents() -> Dict[str, Any]:
                 effective_title = f"Working in {repo_name}"
             else:
                 effective_title = f"{agent_type.upper()} session"
-            # Determine effective status
+            # Determine effective status. Herdr's live agent_status is authoritative;
+            # session-file inference only fills gaps and must NEVER downgrade a
+            # live "working" report (a finished previous turn in the transcript tail
+            # does not mean the current turn is done).
             if status_override == "waiting":
                 status = "waiting"
             elif raw_status in ("waiting", "prompt", "input"):
                 status = "waiting"
+            elif raw_status in ("working", "busy", "running", "thinking", "generating"):
+                status = "working"
             elif status_override == "working":
                 status = "working"
-            elif raw_status in ("working", "busy", "running"):
-                if status_override in ("completed", "done", "idle") and not a.get("focused"):
-                    status = status_override
-                else:
-                    status = "working"
-            elif raw_status in ("completed", "done", "finished") or "✓" in title_raw or status_override in ("completed", "done"):
+            elif raw_status in ("completed", "done", "finished") or "✓" in title_raw:
                 status = "completed"
             elif raw_status in ("error", "failed"):
                 status = "error"
             else:
+                # Herdr has no strong opinion (idle/empty): fall back to the
+                # session tail, which distinguishes a finished task from a fresh prompt.
                 status = status_override or "idle"
 
             origin = "herdr_desktop" if is_hermes_desktop else "herdr"
