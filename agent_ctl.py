@@ -846,6 +846,195 @@ def shorten_path(path: str) -> str:
     return path
 
 
+# --- Orca-managed terminal agents -------------------------------------------
+#
+# Orca manages terminals inside its own GUI (worktrees, agent tabs). The
+# `orca terminal list --json` CLI is a single bounded subprocess call that
+# reports every live managed terminal with its worktree path, branch, tab
+# title, orphan/connected state, last-output timestamp and a raw preview
+# snippet. Agents running in those terminals never appear as standalone
+# Hyprland windows, so they are invisible to scan_standalone_agents() and must
+# be collected here.
+
+ORCA_CLI = os.environ.get("ORCA_CLI_PATH", "orca")
+_ORCA_CACHE: Dict[str, Any] = {"ts": 0.0, "terminals": []}
+_ORCA_CACHE_TTL = 5.0  # seconds; keeps repeated fetch cycles cheap
+
+# Map an Orca terminal to a known agent type from its cleaned title. Titles
+# like "Hermes", "OMP" or "Pi" are set by Orca's own tab-title detection.
+_ORCA_AGENT_ALIASES = {
+    "hermes": "hermes",
+    "omp": "omp",
+    "pi": "omp",
+    "claude": "claude",
+    "codex": "codex",
+    "opencode": "opencode",
+    "gemini": "gemini",
+    "agy": "agy",
+    "cursor": "cursor",
+    "cline": "cline",
+}
+
+# Bare shells / system programs that mean "no agent in this terminal".
+_ORCA_BARE_SHELLS = {
+    "zsh", "bash", "sh", "fish", "nushell", "nu", "dash", "ksh",
+    "alberto@omarchy", "omarchy", "shell", "sudo", "pacman", "vim", "nvim",
+}
+
+
+def query_orca_terminals(timeout: float = 2.0) -> List[Dict[str, Any]]:
+    """Return the live terminals known to the Orca runtime, cached briefly.
+
+    Single bounded subprocess invocation; returns [] silently when the Orca
+    app is closed or the CLI is missing/errors (stderr note only).
+    """
+    now = time.monotonic()
+    if now - _ORCA_CACHE["ts"] < _ORCA_CACHE_TTL:
+        return _ORCA_CACHE["terminals"]
+
+    terminals: List[Dict[str, Any]] = []
+    try:
+        proc = subprocess.run(
+            [ORCA_CLI, "terminal", "list", "--json"],
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+        if proc.returncode == 0 and proc.stdout.strip():
+            payload = json.loads(proc.stdout)
+            if isinstance(payload, dict) and payload.get("ok"):
+                result = payload.get("result") or {}
+                raw = result.get("terminals")
+                if isinstance(raw, list):
+                    terminals = [t for t in raw if isinstance(t, dict)]
+    except FileNotFoundError:
+        print("agent_ctl: orca CLI not found; skipping Orca terminal scan", file=sys.stderr)
+    except subprocess.TimeoutExpired:
+        print("agent_ctl: orca terminal list timed out; skipping Orca terminal scan", file=sys.stderr)
+    except Exception as e:
+        # Non-JSON output, transient runtime errors, etc. -> treat as no data.
+        print(f"agent_ctl: orca terminal list failed ({e}); skipping Orca terminal scan", file=sys.stderr)
+
+    _ORCA_CACHE["ts"] = now
+    _ORCA_CACHE["terminals"] = terminals
+    return terminals
+
+
+def classify_orca_terminal(term: Dict[str, Any]) -> Optional[str]:
+    """Map one Orca terminal to a known agent type from its cleaned tab title.
+
+    Returns None for bare shells and unknown titles so only real agents are
+    surfaced in the roster.
+    """
+    cleaned = clean_title(str(term.get("title") or "")).strip().lower()
+    if not cleaned:
+        return None
+    if cleaned in _ORCA_BARE_SHELLS or cleaned.startswith("alberto@"):
+        return None
+    first_word = cleaned.split()[0]
+    return _ORCA_AGENT_ALIASES.get(first_word)
+
+
+def scan_orca_agents(claimed_sessions: Set[str]) -> List[Dict[str, Any]]:
+    """Discover AI agents running inside Orca-managed terminals.
+
+    Excludes bare shells, disconnected and orphaned terminals; dedupes against
+    other sources via claimed_sessions when session enrichment applies.
+    """
+    orca_agents = []
+    for term in query_orca_terminals():
+        try:
+            # Skip orphaned (runtime lost the pty) and dead terminals; keep a
+            # little slack for connected=false flaps on freshly spawned tabs.
+            if term.get("orphaned"):
+                continue
+            if not term.get("connected", True) and not term.get("lastOutputAt"):
+                continue
+
+            agent_type = classify_orca_terminal(term)
+            if not agent_type:
+                continue
+
+            cwd = str(term.get("worktreePath") or "")
+            repo_name = os.path.basename(cwd.rstrip("/")) if cwd else ""
+            clean_cwd = shorten_path(cwd)
+
+            branch_raw = str(term.get("branch") or "")
+            branch_name = branch_raw.split("/")[-1] if branch_raw else ""
+
+            handle = str(term.get("handle") or "")
+            pane_id = f"orca:term:{handle}"
+
+            # Enrich from the same transcript sessions other sources use, so
+            # prompt/model/status match the rest of the roster. Claimed
+            # sessions are shared to avoid double-counting one transcript.
+            session_path = find_latest_session_for_cwd(agent_type, cwd, claimed_sessions)
+            user_goal = None
+            detail_text = None
+            model_name = None
+            status_override = None
+            has_question = False
+
+            if session_path:
+                claimed_sessions.add(session_path)
+                if agent_type == "omp" and os.path.exists(session_path):
+                    user_goal, detail_text, model_name, status_override, has_question = extract_omp_task_from_session(session_path)
+                elif agent_type == "hermes":
+                    _, model_name, _, _, detail_text, status_override, has_question = extract_hermes_session_info(source_preference="cli")
+            elif agent_type == "omp":
+                model_name = get_omp_default_model()
+
+            # Fall back to Orca's own preview snippet for the detail line:
+            # ANSI-stripped, secret-redacted, first meaningful line only.
+            preview_line = extract_first_line(clean_ansi(str(term.get("preview") or "")))
+            detail_display = detail_text or user_goal or preview_line or clean_cwd
+
+            title_candidates = [
+                user_goal,
+                clean_title(str(term.get("title") or "")),
+                f"{agent_type.capitalize()} in {repo_name}" if repo_name else "",
+            ]
+            effective_title = next((t for t in title_candidates if t), f"{agent_type.upper()} in Orca")
+
+            # Status: live session inference wins, then recency of output.
+            # A terminal that produced output within the last 30s while we
+            # could not prove otherwise is treated as working.
+            if status_override:
+                effective_status = status_override
+                if has_question and status_override != "waiting":
+                    effective_status = "waiting"
+            else:
+                last_out_ms = term.get("lastOutputAt")
+                recent = bool(last_out_ms) and (time.time() * 1000 - float(last_out_ms)) < 30000
+                effective_status = "working" if recent else "idle"
+
+            workspace_label = f"Orca · {repo_name}" if repo_name else "Orca"
+
+            orca_agents.append({
+                "pane_id": pane_id,
+                "pid": None,
+                "origin": "orca",
+                "origin_label": "Orca Terminal",
+                "agent": agent_type,
+                "agent_display": agent_type.upper() if agent_type in ("omp", "pi") else agent_type.capitalize(),
+                "status": effective_status,
+                "title": effective_title,
+                "detail": detail_display,
+                "cwd": clean_cwd,
+                "repo": repo_name,
+                "workspace": workspace_label,
+                "tab": str(term.get("title") or "").strip() or "Orca terminal",
+                "pane_label": branch_name or "Orca worktree",
+                "focused": False,
+                "model": clean_model_name(model_name) if model_name else "",
+                "session_path": session_path or "",
+                "has_question": has_question,
+            })
+        except Exception:
+            continue
+    return orca_agents
+
+
 def scan_standalone_agents(herdr_server_pids: List[int], seen_cwds: Set[str], claimed_sessions: Set[str]) -> List[Dict[str, Any]]:
     """Discover AI agents running in normal terminal windows outside of Herdr."""
     standalone = []
@@ -1181,6 +1370,11 @@ def fetch_all_agents() -> Dict[str, Any]:
                 }
             )
 
+    # Orca-managed terminals run before the standalone process scan so they
+    # can claim transcript sessions first; the standalone scan skips anything
+    # whose session was claimed here, which dedupes agents visible to both.
+    orca_agents = scan_orca_agents(claimed_sessions)
+
     standalone_agents = scan_standalone_agents(herdr_pids, seen_cwds, claimed_sessions)
     for sa in standalone_agents:
         if sa["status"] == "working":
@@ -1198,6 +1392,23 @@ def fetch_all_agents() -> Dict[str, Any]:
         else:
             idle_count += 1
         agents_list.append(sa)
+
+    for oa in orca_agents:
+        if oa["status"] == "working":
+            working_count += 1
+            active_agent_types.add(oa["agent"])
+            if not top_working_task:
+                top_working_task = f"{oa['agent_display']}: {oa['title']}"
+        elif oa["status"] == "waiting":
+            waiting_count += 1
+            active_agent_types.add(oa["agent"])
+        elif oa["status"] == "completed":
+            completed_count += 1
+            if not top_completed_task:
+                top_completed_task = f"{oa['agent_display']}: ✓ {oa['title']}"
+        else:
+            idle_count += 1
+        agents_list.append(oa)
 
     def agent_sort_key(item: Dict[str, Any]) -> Tuple[int, int, str]:
         status_order = {"working": 0, "waiting": 1, "completed": 2, "error": 3, "idle": 4}
@@ -1221,7 +1432,7 @@ def fetch_all_agents() -> Dict[str, Any]:
     else:
         headline = "No active agents"
     all_workspaces = list(workspaces_map.values())
-    for sa in standalone_agents:
+    for sa in standalone_agents + orca_agents:
         ws = sa.get("workspace")
         if ws and ws not in all_workspaces:
             all_workspaces.append(ws)
@@ -1229,6 +1440,7 @@ def fetch_all_agents() -> Dict[str, Any]:
     return {
         "ok": True,
         "connected": herdr_connected,
+        "orca_connected": bool(query_orca_terminals()),
         "summary": {
             "total": total,
             "working": working_count,
