@@ -200,7 +200,7 @@ def is_valid_agent_process(pid: int) -> bool:
     cmd = info["cmd"]
     tokens = cmd.split()
     first = os.path.basename(tokens[0]) if tokens else ""
-    if first in ("omp", "pi", "claude", "codex", "opencode", "cline", "cursor"):
+    if first in ("omp", "pi", "claude", "codex", "opencode", "cline", "cursor", "agy"):
         return True
     if first in ("python", "python3") and ("hermes_cli.main" in cmd or "hermes desktop" in cmd or "hermes" in cmd):
         return True
@@ -907,6 +907,9 @@ def scan_standalone_agents(herdr_server_pids: List[int], seen_cwds: Set[str], cl
             agent_type = None
             if first in ("omp", "pi"):
                 agent_type = "omp"
+            elif first == "agy":
+                # Google Antigravity CLI - no JSONL transcripts; generic enrichment
+                agent_type = "agy"
             elif first in ("claude", "codex", "opencode", "cline", "cursor"):
                 agent_type = first
             elif first == "python" and ("hermes_cli.main" in cmd or "hermes desktop" in cmd):

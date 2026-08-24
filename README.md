@@ -1,6 +1,6 @@
 # Agent Orchestrator for Omarchy
 
-Real-time status, active tasks, and one-click workspace switching for AI coding agents (**Herdr**, **OMP**, **Hermes**, **Claude**, **Codex**, **OpenCode**) in the Omarchy bar.
+Real-time status, active tasks, and one-click workspace switching for AI coding agents (**Herdr**, **OMP**, **Hermes**, **Claude**, **Codex**, **OpenCode**, **Agy** (Antigravity CLI)) in the Omarchy bar.
 
 ![Agent Orchestrator](preview.png)
 
