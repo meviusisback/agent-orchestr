@@ -881,6 +881,146 @@ _ORCA_BARE_SHELLS = {
     "alberto@omarchy", "omarchy", "shell", "sudo", "pacman", "vim", "nvim",
 }
 
+# While an agent works inside a tab, Orca renames the tab to a dynamic title
+# like "<status/spinner glyph> <task summary> · <model>[ · <extra>]", e.g.
+# "✓ Prevent new instance on she… · ox-alpha-free · ~". Titles truncate (the
+# "…" above), so match the STRUCTURE — arbitrary task text, then
+# " · "-separated segments starting with a model token — never the exact
+# string. The leading glyph is OPTIONAL because clean_title() already strips
+# Braille spinners before this pattern runs (check marks survive it).
+_ORCA_DYNAMIC_TITLE_RE = re.compile(
+    r"^[\u2800-\u28FF✓✗✳✻✷✸✹*·•]*\s*"
+    r"(?P<task>.+?)"
+    r"\s+·\s+(?P<model>\S+)"
+    r"(?:\s+·\s+.*)?$"
+)
+
+# Model tokens from dynamic titles mapped to the CLI that typically owns them
+# (Hermes titles carry "ox-alpha-free"; Claude carries "opus"/"sonnet"/...).
+# Most specific prefixes first.
+_ORCA_MODEL_AGENT_HINTS = (
+    ("ox", "hermes"),
+    ("opus", "claude"),
+    ("sonnet", "claude"),
+    ("haiku", "claude"),
+    ("codex", "codex"),
+    ("gpt", "codex"),
+    ("o3", "codex"),
+    ("o4", "codex"),
+    ("gemini", "gemini"),
+)
+
+# Unambiguous agent-TUI chrome strings (beyond the CLI's own name) that can
+# corroborate a dynamic title's model hint in the terminal preview.
+_ORCA_PREVIEW_CHROME_MARKERS = {
+    "hermes": ("hermes --tui", "voice off", "voice on"),
+    "omp": ("π",),
+    "claude": ("? for shortcuts", "⏵⏵", "✻"),
+    "gemini": ("gemini cli",),
+    "codex": (),
+    "opencode": (),
+    "agy": (),
+}
+
+# Agent names looked up literally (as words) in the preview when the title's
+# model token yields no hint. Ordered most-specific first.
+_ORCA_PREVIEW_AGENT_NAMES = ("hermes", "opencode", "gemini", "claude", "codex", "omp", "agy", "pi")
+
+
+def _contains_word(haystack: str, word: str) -> bool:
+    """True when `word` occurs in `haystack` not glued to other letters/digits."""
+    return re.search(rf"(?<![a-z0-9]){re.escape(word)}(?![a-z0-9])", haystack) is not None
+
+
+# Full-screen TUIs (agent CLIs included) paint their frames/rules with
+# box-drawing characters; interactive shell prompts use powerline glyphs
+# (private-use codepoints) instead. Enough box-drawing in a preview means a
+# full-screen app lives in the tab, not a bare shell.
+_ORCA_TUI_FRAME_RE = re.compile(r"[│┃┆┄─═╭╮╰╯┌┐└┘]")
+
+
+def _agent_from_model_token(token: str) -> Optional[str]:
+    """Map a model token from a dynamic tab title to a likely agent type."""
+    t = token.strip("…").strip().lower()
+    if not t:
+        return None
+    for prefix, agent in _ORCA_MODEL_AGENT_HINTS:
+        if t == prefix or t.startswith(prefix):
+            return agent
+    return None
+
+
+def _preview_confirms_agent(preview_lower: str, agent_type: str, model_token: str) -> bool:
+    """Decide whether a terminal's preview evidences the given agent TUI."""
+    # The TUI echoing its own model (raw, or separators rendered as spaces).
+    if model_token:
+        variants = {model_token, model_token.replace("-", " ").replace("_", " ")}
+        if any(v in preview_lower for v in variants):
+            return True
+    # Agent-specific TUI chrome (status bars, hints, key legends).
+    if any(m and m.lower() in preview_lower for m in _ORCA_PREVIEW_CHROME_MARKERS.get(agent_type, ())):
+        return True
+    # The CLI's own name spelled out in the visible output.
+    own_name = next((n for n, a in _ORCA_AGENT_ALIASES.items() if a == agent_type and n != "pi"), "")
+    if own_name and _contains_word(preview_lower, own_name):
+        return True
+    # Generic full-screen TUI frame: box-drawing structure a shell never draws.
+    if len(_ORCA_TUI_FRAME_RE.findall(preview_lower)) >= 3:
+        return True
+    return False
+
+
+def classify_orca_terminal(term: Dict[str, Any]) -> Optional[str]:
+    """Map one Orca terminal to a known agent type.
+
+    Two recognition paths:
+      1. Static titles set by Orca's own tab detection ("Hermes", "OMP", ...)
+         via a first-word alias lookup.
+      2. Dynamic titles ("<glyph> <task> · <model>") renamed by the running
+         agent, confirmed against the terminal's preview so bare shells and
+         unrelated output never classify as agents.
+
+    Returns None for bare shells and anything unrecognized so only real
+    agents surface in the roster.
+    """
+    cleaned = clean_title(str(term.get("title") or "")).strip()
+    lowered = cleaned.lower()
+    if not lowered:
+        return None
+    if lowered in _ORCA_BARE_SHELLS or lowered.startswith("alberto@"):
+        return None
+    first_word = lowered.split()[0]
+    static_type = _ORCA_AGENT_ALIASES.get(first_word)
+    if static_type:
+        return static_type
+
+    # Dynamic agent titles: require the structural title pattern AND positive
+    # evidence in the preview that an agent TUI really lives here.
+    match = _ORCA_DYNAMIC_TITLE_RE.match(lowered)
+    if not match:
+        return None
+
+    preview_lower = clean_ansi(str(term.get("preview") or "")).lower()
+    if not preview_lower:
+        return None
+
+    hinted = _agent_from_model_token(match.group("model"))
+
+    # 1) The title names a model: require the preview to corroborate that the
+    #    matching agent TUI really lives here.
+    if hinted:
+        model_token = match.group("model").strip("…").strip().lower()
+        if _preview_confirms_agent(preview_lower, hinted, model_token):
+            return hinted
+
+    # 2) No usable hint (or it failed corroboration): trust a literal agent
+    #    name in the preview over the title's guesswork.
+    for name in _ORCA_PREVIEW_AGENT_NAMES:
+        if _contains_word(preview_lower, name):
+            return _ORCA_AGENT_ALIASES.get(name)
+
+    return None
+
 
 def query_orca_terminals(timeout: float = 2.0) -> List[Dict[str, Any]]:
     """Return the live terminals known to the Orca runtime, cached briefly.
@@ -918,21 +1058,6 @@ def query_orca_terminals(timeout: float = 2.0) -> List[Dict[str, Any]]:
     _ORCA_CACHE["ts"] = now
     _ORCA_CACHE["terminals"] = terminals
     return terminals
-
-
-def classify_orca_terminal(term: Dict[str, Any]) -> Optional[str]:
-    """Map one Orca terminal to a known agent type from its cleaned tab title.
-
-    Returns None for bare shells and unknown titles so only real agents are
-    surfaced in the roster.
-    """
-    cleaned = clean_title(str(term.get("title") or "")).strip().lower()
-    if not cleaned:
-        return None
-    if cleaned in _ORCA_BARE_SHELLS or cleaned.startswith("alberto@"):
-        return None
-    first_word = cleaned.split()[0]
-    return _ORCA_AGENT_ALIASES.get(first_word)
 
 
 def scan_orca_agents(claimed_sessions: Set[str]) -> List[Dict[str, Any]]:
