@@ -28,6 +28,7 @@ function statusBadgeText(status) {
 
 function originColor(origin) {
   var o = String(origin || "").toLowerCase()
+  if (o === "orca") return "#22D3EE"
   if (o.indexOf("desktop") >= 0) return "#F59E0B"
   if (o === "terminal") return "#38BDF8"
   return "#A855F7"
@@ -35,6 +36,7 @@ function originColor(origin) {
 
 function originBadgeText(origin) {
   var o = String(origin || "").toLowerCase()
+  if (o === "orca") return "ORCA"
   if (o === "herdr_desktop") return "HERDR · GUI"
   if (o === "desktop") return "DESKTOP APP"
   if (o === "terminal") return "TERMINAL"
@@ -42,10 +44,19 @@ function originBadgeText(origin) {
 }
 
 function originIcon(origin) {
+  // Return "" so the panel falls back to the SVG brand mark (originIconPath)
+  // instead of a possibly-missing font glyph.
   var o = String(origin || "").toLowerCase()
+  if (o === "orca") return ""
   if (o.indexOf("desktop") >= 0) return "󰨇"
   if (o === "terminal") return ""
   return "󰘦"
+}
+
+function originIconPath(origin) {
+  var o = String(origin || "").toLowerCase()
+  if (o === "orca") return "assets/icons/orca.svg"
+  return ""
 }
 
 function originSummaryText(agents) {
@@ -55,11 +66,14 @@ function originSummaryText(agents) {
   var herdrCount = 0
   var terminalCount = 0
   var desktopCount = 0
+  var orcaCount = 0
 
   for (var i = 0; i < list.length; i++) {
     var a = list[i]
     var o = String(a.origin || "").toLowerCase()
-    if (o === "desktop") {
+    if (o === "orca") {
+      orcaCount++
+    } else if (o === "desktop") {
       desktopCount++
     } else if (o === "terminal") {
       terminalCount++
@@ -74,6 +88,9 @@ function originSummaryText(agents) {
   }
   if (terminalCount > 0) {
     parts.push(terminalCount + (terminalCount === 1 ? " on terminal" : " on terminals"))
+  }
+  if (orcaCount > 0) {
+    parts.push(orcaCount + (orcaCount === 1 ? " on Orca" : " on Orca"))
   }
   if (desktopCount > 0) {
     parts.push(desktopCount + (desktopCount === 1 ? " desktop app" : " desktop apps"))

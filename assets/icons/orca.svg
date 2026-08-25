@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none">
+  <rect width="24" height="24" rx="5" fill="#22D3EE" fill-opacity="0.15"/>
+  <!-- Orca terminal: nested rounded rect + prompt blip -->
+  <rect x="4" y="5" width="16" height="14" rx="2" stroke="#22D3EE" stroke-width="1.8"/>
+  <path d="M7 9l3 2.5L7 14" stroke="#22D3EE" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>
+  <line x1="11.5" y1="14" x2="16" y2="14" stroke="#22D3EE" stroke-width="1.8" stroke-linecap="round"/>
+</svg>

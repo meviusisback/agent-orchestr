@@ -15,8 +15,8 @@ Panel {
   manageIpc: false
 
   // Bar slot sizing driven by activeItem
-  implicitWidth: root.barShowsText ? Math.max(dataButton.implicitWidth, Style.space(130)) : button.implicitWidth
-  implicitHeight: button.implicitHeight
+  implicitWidth: root.barShowsText ? Math.max(dataButton.implicitWidth, Style.space(130)) : Style.bar.iconSlot
+  implicitHeight: Style.bar.iconSlot
 
   readonly property color foreground: bar ? bar.foreground : Color.foreground
   readonly property color dim: Qt.darker(foreground, 1.6)
@@ -192,7 +192,16 @@ Panel {
     anchors.fill: parent
     visible: !root.barShowsText
     bar: root.bar
-    text: "󰚩" // Nerd font robot / orchestrator glyph
+    text: "" // glyph disabled; using iconComponent SVG for reliable rendering
+    iconComponent: Component {
+      Image {
+        anchors.fill: parent
+        source: "file:///home/alberto/repo/agent-orchestr/assets/icons/agent.svg"
+        sourceSize.width: Style.bar.iconCanvas * 2
+        sourceSize.height: Style.bar.iconCanvas * 2
+        fillMode: Image.PreserveAspectFit
+      }
+    }
     tooltipText: Model.getTooltipText(root.summary)
     active: root.summary.working > 0 || root.summary.waiting > 0
     activeColor: root.summary.waiting > 0 ? "#F59E0B" : root.accent
@@ -261,7 +270,7 @@ Panel {
 
       Text {
         id: chipIcon
-        text: "󰚩"
+        text: ""
         font.family: root.fontFamily
         font.pixelSize: Style.font.body
         color: root.summary.waiting > 0 ? "#F59E0B" : (root.summary.working > 0 ? root.accent : root.foreground)
@@ -327,7 +336,7 @@ Panel {
         spacing: Style.space(14)
 
         Text {
-          text: "󰚩"
+          text: ""
           color: root.summary.waiting > 0 ? "#F59E0B" : (root.summary.working > 0 ? root.accent : root.foreground)
           font.family: root.fontFamily
           font.pixelSize: Style.space(32)
@@ -535,7 +544,15 @@ Panel {
                     id: originRow
                     anchors.centerIn: parent
                     spacing: Style.space(3)
+                    Image {
+                      visible: Boolean(Model.originIconPath(modelData.origin))
+                      source: Model.originIconPath(modelData.origin) ? Qt.resolvedUrl(Model.originIconPath(modelData.origin)) : ""
+                      sourceSize.width: Style.space(9)
+                      sourceSize.height: Style.space(9)
+                      fillMode: Image.PreserveAspectFit
+                    }
                     Text {
+                      visible: !Boolean(Model.originIconPath(modelData.origin)) && Boolean(Model.originIcon(modelData.origin))
                       text: Model.originIcon(modelData.origin)
                       font.family: root.fontFamily
                       font.pixelSize: Style.space(8)
@@ -754,7 +771,10 @@ Panel {
               color: root.rawData.connected ? "#10B981" : "#38BDF8"
             }
             Text {
-              text: root.rawData.connected ? "Herdr + Terminal Live" : "Standalone Scanner Active"
+              text: (root.rawData.connected && root.rawData.orca_connected) ? "Herdr · Terminal · Orca Live"
+                    : (root.rawData.connected) ? "Herdr + Terminal Live"
+                    : (root.rawData.orca_connected) ? "Orca Scanner Active"
+                    : "Standalone Scanner Active"
               font.family: root.fontFamily
               font.pixelSize: Style.space(9)
               color: root.dim
