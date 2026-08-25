@@ -1022,11 +1022,14 @@ def classify_orca_terminal(term: Dict[str, Any]) -> Optional[str]:
     return None
 
 
-def query_orca_terminals(timeout: float = 2.0) -> List[Dict[str, Any]]:
+def query_orca_terminals(timeout: float = 4.0) -> List[Dict[str, Any]]:
     """Return the live terminals known to the Orca runtime, cached briefly.
 
-    Single bounded subprocess invocation; returns [] silently when the Orca
-    app is closed or the CLI is missing/errors (stderr note only).
+    Single bounded subprocess invocation. On success the result is cached for
+    _ORCA_CACHE_TTL seconds. On failure (CLI missing, timeout, non-JSON) we do
+    NOT poison the cache with an empty list — instead we return the most recent
+    good result (or [] on the very first call) and leave the cache untouched, so
+    a transient Orca CLI hang can't blank out the roster for the whole TTL.
     """
     now = time.monotonic()
     if now - _ORCA_CACHE["ts"] < _ORCA_CACHE_TTL:
@@ -1047,17 +1050,22 @@ def query_orca_terminals(timeout: float = 2.0) -> List[Dict[str, Any]]:
                 raw = result.get("terminals")
                 if isinstance(raw, list):
                     terminals = [t for t in raw if isinstance(t, dict)]
+                # Only cache a successful parse; otherwise fall through to the
+                # last-known-good branch below.
+                _ORCA_CACHE["ts"] = now
+                _ORCA_CACHE["terminals"] = terminals
+                return terminals
     except FileNotFoundError:
         print("agent_ctl: orca CLI not found; skipping Orca terminal scan", file=sys.stderr)
     except subprocess.TimeoutExpired:
-        print("agent_ctl: orca terminal list timed out; skipping Orca terminal scan", file=sys.stderr)
+        print("agent_ctl: orca terminal list timed out; serving last-known-good", file=sys.stderr)
     except Exception as e:
         # Non-JSON output, transient runtime errors, etc. -> treat as no data.
-        print(f"agent_ctl: orca terminal list failed ({e}); skipping Orca terminal scan", file=sys.stderr)
+        print(f"agent_ctl: orca terminal list failed ({e}); serving last-known-good", file=sys.stderr)
 
-    _ORCA_CACHE["ts"] = now
-    _ORCA_CACHE["terminals"] = terminals
-    return terminals
+    # Failure path: return the last good cache (may be [] on first call) without
+    # refreshing the timestamp, so the next cycle retries the CLI promptly.
+    return _ORCA_CACHE["terminals"]
 
 
 def scan_orca_agents(claimed_sessions: Set[str]) -> List[Dict[str, Any]]:
