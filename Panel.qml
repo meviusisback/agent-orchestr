@@ -122,7 +122,10 @@ Panel {
   // Background processes
   Process {
     id: fetchProc
-    command: ["python3", root.scriptPath(), "status"]
+    // head -c bounds the stream structurally: after 256 KiB head exits and
+    // SIGPIPE stops the helper, so the collector below can never accumulate
+    // more than the cap regardless of helper output size.
+    command: ["sh", "-c", "python3 '" + root.scriptPath() + "' status | head -c 262144"]
     stdout: StdioCollector {
       waitForEnd: true
       onStreamFinished: {

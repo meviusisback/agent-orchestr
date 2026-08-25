@@ -637,7 +637,7 @@ def extract_hermes_session_info(
             # Find active unexpired turn leases with alive holder PIDs
             active_leases: Dict[str, Dict[str, Any]] = {}
             try:
-                cur.execute("SELECT conversation_id, holder, acquired_at, expires_at FROM session_turn_leases;")
+                cur.execute("SELECT conversation_id, holder, acquired_at, expires_at FROM session_turn_leases LIMIT 64;")
                 for cid, holder, acq, exp in cur.fetchall():
                     if exp and float(exp) > now:
                         m = re.search(r"pid=(\d+)", holder or "")
@@ -805,7 +805,7 @@ def extract_hermes_session_info(
         # If detail is still not set or was generic, look for the last assistant response
         if not detail or detail == "Ready for prompt":
             cur.execute(
-                "SELECT content FROM messages WHERE session_id = ? AND role = 'assistant' AND content IS NOT NULL ORDER BY id DESC LIMIT 1;",
+                "SELECT substr(content, 1, 2048) FROM messages WHERE session_id = ? AND role = 'assistant' AND content IS NOT NULL ORDER BY id DESC LIMIT 1;",
                 (session_id,)
             )
             ast_row = cur.fetchone()
