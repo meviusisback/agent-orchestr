@@ -190,6 +190,21 @@ def focus_hypr_window(client: Dict[str, Any]) -> bool:
     return True
 
 
+def is_hermes_cli_process(cmd: str) -> bool:
+    """Detect Hermes CLI processes across all invocation forms.
+
+    Covers:
+      - python -m hermes_cli.main (direct module invocation)
+      - hermes desktop wrapper (Electron app launcher)
+      - /path/hermes-agent/hermes script (standalone CLI via bash wrapper)
+    """
+    return (
+        "hermes_cli.main" in cmd
+        or "hermes desktop" in cmd
+        or "/hermes" in cmd
+    )
+
+
 def is_valid_agent_process(pid: int) -> bool:
     """Validate that a PID actually corresponds to an active AI agent process before signaling."""
     if pid <= 1:
@@ -202,7 +217,7 @@ def is_valid_agent_process(pid: int) -> bool:
     first = os.path.basename(tokens[0]) if tokens else ""
     if first in ("omp", "pi", "claude", "codex", "opencode", "cline", "cursor", "agy"):
         return True
-    if first in ("python", "python3") and ("hermes_cli.main" in cmd or "hermes desktop" in cmd or "hermes" in cmd):
+    if first in ("python", "python3") and is_hermes_cli_process(cmd):
         return True
     if "/Hermes" in cmd or "Hermes" in cmd:
         return True
@@ -1234,7 +1249,7 @@ def scan_standalone_agents(herdr_server_pids: List[int], seen_cwds: Set[str], cl
                 agent_type = "agy"
             elif first in ("claude", "codex", "opencode", "cline", "cursor"):
                 agent_type = first
-            elif first == "python" and ("hermes_cli.main" in cmd or "hermes desktop" in cmd):
+            elif first in ("python", "python3") and is_hermes_cli_process(cmd):
                 agent_type = "hermes"
 
             if agent_type:
@@ -1419,7 +1434,7 @@ def fetch_all_agents() -> Dict[str, Any]:
                             if is_hermes_desktop and ("/Hermes" in hinfo["cmd"] or "hermes desktop" in hinfo["cmd"]):
                                 hermes_p_start = get_process_start_time(hpid)
                                 break
-                            elif not is_hermes_desktop and ("hermes_cli" in hinfo["cmd"] or hinfo["cmd"].endswith("hermes")):
+                            elif not is_hermes_desktop and is_hermes_cli_process(hinfo["cmd"]):
                                 hermes_p_start = get_process_start_time(hpid)
                                 break
                     except Exception:
