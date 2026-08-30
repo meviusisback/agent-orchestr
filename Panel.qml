@@ -196,7 +196,7 @@ Panel {
     iconComponent: Component {
       Image {
         anchors.fill: parent
-        source: "file:///home/alberto/repo/agent-orchestr/assets/icons/agent.svg"
+        source: Qt.resolvedUrl("assets/icons/agent.svg")
         sourceSize.width: Style.bar.iconCanvas * 2
         sourceSize.height: Style.bar.iconCanvas * 2
         fillMode: Image.PreserveAspectFit
