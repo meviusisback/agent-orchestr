@@ -1037,14 +1037,33 @@ def classify_orca_terminal(term: Dict[str, Any]) -> Optional[str]:
     return None
 
 
+_ORCA_MAX_BYTES = 256 * 1024  # 256 KiB hard cap on raw CLI output
+_ORCA_MAX_TERMINALS = 64      # maximum terminals to retain from one fetch
+_ORCA_MAX_FIELD = 4096        # per-field string cap (preview, title, etc.)
+
+
+def _cap_fields(term: Dict[str, Any]) -> Dict[str, Any]:
+    """Truncate large string fields to prevent memory amplification."""
+    for key in ("preview", "title", "worktreePath", "branch", "handle"):
+        val = term.get(key)
+        if isinstance(val, str) and len(val) > _ORCA_MAX_FIELD:
+            term[key] = val[:_ORCA_MAX_FIELD]
+    return term
+
+
 def query_orca_terminals(timeout: float = 4.0) -> List[Dict[str, Any]]:
     """Return the live terminals known to the Orca runtime, cached briefly.
 
-    Single bounded subprocess invocation. On success the result is cached for
-    _ORCA_CACHE_TTL seconds. On failure (CLI missing, timeout, non-JSON) we do
-    NOT poison the cache with an empty list — instead we return the most recent
-    good result (or [] on the very first call) and leave the cache untouched, so
-    a transient Orca CLI hang can't blank out the roster for the whole TTL.
+    Single bounded subprocess invocation with structural output capping:
+    the raw stdout is read through a 256 KiB ceiling so a runaway Orca
+    endpoint cannot exhaust memory before JSON parsing.  Terminal count
+    and per-field sizes are also capped.
+
+    On success the result is cached for _ORCA_CACHE_TTL seconds.  On
+    failure (CLI missing, timeout, non-JSON) we do NOT poison the cache
+    with an empty list — instead we return the most recent good result
+    (or [] on the very first call) and leave the cache untouched, so a
+    transient Orca CLI hang can't blank out the roster for the whole TTL.
     """
     now = time.monotonic()
     if now - _ORCA_CACHE["ts"] < _ORCA_CACHE_TTL:
@@ -1052,19 +1071,42 @@ def query_orca_terminals(timeout: float = 4.0) -> List[Dict[str, Any]]:
 
     terminals: List[Dict[str, Any]] = []
     try:
-        proc = subprocess.run(
+        proc = subprocess.Popen(
             [ORCA_CLI, "terminal", "list", "--json"],
-            capture_output=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
             text=True,
-            timeout=timeout,
         )
-        if proc.returncode == 0 and proc.stdout.strip():
-            payload = json.loads(proc.stdout)
+        # Read at most _ORCA_MAX_BYTES from stdout so the producer cannot
+        # exhaust memory regardless of how much it writes.
+        chunks: List[str] = []
+        total = 0
+        while total < _ORCA_MAX_BYTES:
+            remaining = _ORCA_MAX_BYTES - total
+            chunk = proc.stdout.read(min(8192, remaining))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            total += len(chunk)
+        try:
+            proc.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
+            raise subprocess.TimeoutExpired(proc.args, timeout)
+        stdout = "".join(chunks)
+
+        if proc.returncode == 0 and stdout.strip():
+            payload = json.loads(stdout)
             if isinstance(payload, dict) and payload.get("ok"):
                 result = payload.get("result") or {}
                 raw = result.get("terminals")
                 if isinstance(raw, list):
-                    terminals = [t for t in raw if isinstance(t, dict)]
+                    terminals = [
+                        _cap_fields(t)
+                        for t in raw
+                        if isinstance(t, dict)
+                    ][:_ORCA_MAX_TERMINALS]
                 # Only cache a successful parse; otherwise fall through to the
                 # last-known-good branch below.
                 _ORCA_CACHE["ts"] = now
