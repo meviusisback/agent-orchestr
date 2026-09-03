@@ -154,6 +154,10 @@ function formatBarHeadline(summary, displayMode, maxLen) {
 }
 
 function getTooltipText(summary) {
+  // SECURITY CONTRACT: tooltip strings are rendered by the host bar (textFormat
+  // outside this plugin's control), so this must stay numeric-coerced fields and
+  // fixed literals only — never route raw agent-controlled JSON strings (e.g.
+  // summary.headline, labels) into the returned text.
   if (!summary) return "Agent Orchestrator"
   var total = Number(summary.total) || 0
   var working = Number(summary.working) || 0
