@@ -235,6 +235,7 @@ Panel {
 
         Text {
           text: String(root.summary.waiting > 0 ? root.summary.waiting : (root.summary.working > 0 ? root.summary.working : root.summary.total))
+          textFormat: Text.PlainText
           font.family: root.fontFamily
           font.pixelSize: Style.space(8)
           font.bold: true
@@ -271,6 +272,7 @@ Panel {
       Text {
         id: chipIcon
         text: ""
+        textFormat: Text.PlainText
         font.family: root.fontFamily
         font.pixelSize: Style.font.body
         color: root.summary.waiting > 0 ? "#F59E0B" : (root.summary.working > 0 ? root.accent : root.foreground)
@@ -338,6 +340,7 @@ Panel {
         Text {
           text: ""
           color: root.summary.waiting > 0 ? "#F59E0B" : (root.summary.working > 0 ? root.accent : root.foreground)
+          textFormat: Text.PlainText
           font.family: root.fontFamily
           font.pixelSize: Style.space(32)
           Layout.alignment: Qt.AlignVCenter
@@ -351,6 +354,7 @@ Panel {
           Text {
             text: "Agent Orchestrator"
             color: root.foreground
+            textFormat: Text.PlainText
             font.family: root.fontFamily
             font.pixelSize: Style.font.title
             font.bold: true
@@ -380,6 +384,7 @@ Panel {
             anchors.centerIn: parent
             text: "󰑐"
             color: root.foreground
+            textFormat: Text.PlainText
             font.family: root.fontFamily
             font.pixelSize: Style.space(14)
             rotation: root.loading ? 360 : 0
@@ -439,6 +444,7 @@ Panel {
             Text {
               anchors.centerIn: parent
               text: modelData.label
+              textFormat: Text.PlainText
               font.family: root.fontFamily
               font.pixelSize: Style.space(11)
               font.weight: root.selectedFilter === modelData.id ? Font.DemiBold : Font.Normal
@@ -554,12 +560,14 @@ Panel {
                     Text {
                       visible: !Boolean(Model.originIconPath(modelData.origin)) && Boolean(Model.originIcon(modelData.origin))
                       text: Model.originIcon(modelData.origin)
+                      textFormat: Text.PlainText
                       font.family: root.fontFamily
                       font.pixelSize: Style.space(8)
                       color: Model.originColor(modelData.origin)
                     }
                     Text {
                       text: Model.originBadgeText(modelData.origin)
+                      textFormat: Text.PlainText
                       font.family: root.fontFamily
                       font.pixelSize: Style.space(8)
                       font.bold: true
@@ -616,6 +624,7 @@ Panel {
 
                     Text {
                       text: Model.statusBadgeText(modelData.status)
+                      textFormat: Text.PlainText
                       font.family: root.fontFamily
                       font.pixelSize: Style.space(9)
                       font.bold: true
@@ -636,6 +645,7 @@ Panel {
                   Text {
                     anchors.centerIn: parent
                     text: "✕"
+                    textFormat: Text.PlainText
                     font.family: root.fontFamily
                     font.pixelSize: Style.space(10)
                     font.bold: true
@@ -704,6 +714,7 @@ Panel {
                     spacing: Style.space(3)
                     Text {
                       text: "📁"
+                      textFormat: Text.PlainText
                       font.pixelSize: Style.space(9)
                     }
                     Text {
@@ -775,6 +786,7 @@ Panel {
                     : (root.rawData.connected) ? "Herdr + Terminal Live"
                     : (root.rawData.orca_connected) ? "Orca Scanner Active"
                     : "Standalone Scanner Active"
+              textFormat: Text.PlainText
               font.family: root.fontFamily
               font.pixelSize: Style.space(9)
               color: root.dim
@@ -786,6 +798,7 @@ Panel {
           // Keyboard hint
           Text {
             text: "Click card to focus · ✕ to terminate"
+            textFormat: Text.PlainText
             font.family: root.fontFamily
             font.pixelSize: Style.space(9)
             color: root.dim
