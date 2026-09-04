@@ -893,7 +893,7 @@ _ORCA_AGENT_ALIASES = {
 # Bare shells / system programs that mean "no agent in this terminal".
 _ORCA_BARE_SHELLS = {
     "zsh", "bash", "sh", "fish", "nushell", "nu", "dash", "ksh",
-    "alberto@omarchy", "omarchy", "shell", "sudo", "pacman", "vim", "nvim",
+    "alberto@omarchy", "omarchy", "shell", "pacman", "vim", "nvim",
 }
 
 # While an agent works inside a tab, Orca renames the tab to a dynamic title
