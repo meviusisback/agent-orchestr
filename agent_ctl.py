@@ -100,14 +100,39 @@ def get_omp_default_model() -> str:
     return "gemini-3.7-flash"
 
 
-def query_herdr_socket(method: str, params: Optional[Dict[str, Any]] = None, timeout: float = 1.0) -> Optional[Dict[str, Any]]:
-    """Send JSON-RPC request to Herdr socket and return parsed response."""
-    if not os.path.exists(HERDR_SOCK_PATH):
+def herdr_session_sockets() -> List[Tuple[str, str]]:
+    """Return (session_name, socket_path) for every running Herdr server.
+
+    The default session listens on ~/.config/herdr/herdr.sock; each named
+    session gets its own server and socket under
+    ~/.config/herdr/sessions/<name>/herdr.sock. Sockets only exist while the
+    server for that session is running.
+    """
+    sessions: List[Tuple[str, str]] = []
+    if os.path.exists(HERDR_SOCK_PATH):
+        sessions.append(("default", HERDR_SOCK_PATH))
+    for sock in sorted(glob.glob(os.path.expanduser("~/.config/herdr/sessions/*/herdr.sock"))):
+        sessions.append((os.path.basename(os.path.dirname(sock)), sock))
+    return sessions
+
+
+def herdr_socket_for_session(session_name: str) -> str:
+    """Resolve the Herdr socket path for a session name (fallback: default)."""
+    for name, sock in herdr_session_sockets():
+        if name == session_name:
+            return sock
+    return HERDR_SOCK_PATH
+
+
+def query_herdr_socket(method: str, params: Optional[Dict[str, Any]] = None, timeout: float = 1.0, sock_path: Optional[str] = None) -> Optional[Dict[str, Any]]:
+    """Send JSON-RPC request to a Herdr socket and return parsed response."""
+    sock = sock_path or HERDR_SOCK_PATH
+    if not os.path.exists(sock):
         return None
     try:
         s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         s.settimeout(min(timeout, 0.5))
-        s.connect(HERDR_SOCK_PATH)
+        s.connect(sock)
         req_id = f"orchestr:{int(time.time() * 1000)}"
         payload = {"id": req_id, "method": method, "params": params or {}}
         s.sendall((json.dumps(payload) + "\n").encode("utf-8"))
@@ -1391,11 +1416,7 @@ def scan_standalone_agents(herdr_server_pids: List[int], seen_cwds: Set[str], cl
 def fetch_all_agents() -> Dict[str, Any]:
     """Fetch all agent data, combining Herdr snapshot, session enrichment, and standalone processes."""
     herdr_pids = get_herdr_server_pids()
-    resp = query_herdr_socket("session.snapshot")
 
-    workspaces_map = {}
-    tabs_map = {}
-    panes_map = {}
     agents_list = []
     working_count = 0
     completed_count = 0
@@ -1406,14 +1427,28 @@ def fetch_all_agents() -> Dict[str, Any]:
     top_completed_task = ""
     seen_cwds: Set[str] = set()
     claimed_sessions: Set[str] = set()
+    herdr_connected = False
+    all_workspaces: List[str] = []
 
-    herdr_connected = bool(resp and "result" in resp and "snapshot" in resp["result"])
+    def consume_herdr_snapshot(snap: Dict[str, Any], sess_name: str, sess_sock: str) -> None:
+        """Parse one Herdr session snapshot and merge its agents into the results.
 
-    if herdr_connected:
-        snap = resp["result"]["snapshot"]
+        Each Herdr session is an independent server with its own socket and
+        ID namespace, so pane/tab/workspace maps are per-snapshot and every
+        agent records the session it came from.
+        """
+        nonlocal working_count, completed_count, idle_count, waiting_count, top_working_task, top_completed_task
+
+        workspaces_map = {}
+        tabs_map = {}
+        panes_map = {}
 
         for ws in snap.get("workspaces", []):
             workspaces_map[ws.get("workspace_id")] = ws.get("label") or f"Workspace {ws.get('number', 1)}"
+        for ws_label in workspaces_map.values():
+            display = ws_label if sess_name == "default" else f"{sess_name}: {ws_label}"
+            if display not in all_workspaces:
+                all_workspaces.append(display)
 
         for tab in snap.get("tabs", []):
             tabs_map[tab.get("tab_id")] = tab.get("label") or f"Tab {tab.get('number', 1)}"
@@ -1441,6 +1476,8 @@ def fetch_all_agents() -> Dict[str, Any]:
 
             tab_name = tabs_map.get(tab_id, "")
             workspace_name = workspaces_map.get(workspace_id, "")
+            if workspace_name and sess_name != "default":
+                workspace_name = f"{sess_name}: {workspace_name}"
             pane_label = pane_info.get("label") or a.get("label") or ""
 
             is_hermes_desktop = False
@@ -1540,7 +1577,9 @@ def fetch_all_agents() -> Dict[str, Any]:
 
             agents_list.append(
                 {
-                    "pane_id": pane_id,
+                    "pane_id": f"herdr:{sess_name}|{pane_id}",
+                    "raw_pane_id": pane_id,
+                    "herdr_session": sess_name,
                     "origin": origin,
                     "origin_label": origin_label,
                     "agent": agent_type,
@@ -1559,6 +1598,12 @@ def fetch_all_agents() -> Dict[str, Any]:
                     "has_question": has_question,
                 }
             )
+
+    for sess_name, sess_sock in herdr_session_sockets():
+        resp = query_herdr_socket("session.snapshot", sock_path=sess_sock)
+        if resp and "result" in resp and "snapshot" in resp["result"]:
+            herdr_connected = True
+            consume_herdr_snapshot(resp["result"]["snapshot"], sess_name, sess_sock)
 
     # Orca-managed terminals run before the standalone process scan so they
     # can claim transcript sessions first; the standalone scan skips anything
@@ -1621,15 +1666,19 @@ def fetch_all_agents() -> Dict[str, Any]:
         headline = f"{total} agent{'s' if total > 1 else ''} idle"
     else:
         headline = "No active agents"
-    all_workspaces = list(workspaces_map.values())
+    all_workspaces_dedup: List[str] = []
+    for ws in all_workspaces:
+        if ws and ws not in all_workspaces_dedup:
+            all_workspaces_dedup.append(ws)
     for sa in standalone_agents + orca_agents:
         ws = sa.get("workspace")
-        if ws and ws not in all_workspaces:
-            all_workspaces.append(ws)
+        if ws and ws not in all_workspaces_dedup:
+            all_workspaces_dedup.append(ws)
 
     return {
         "ok": True,
         "connected": herdr_connected,
+        "herdr_sessions": [{"name": n, "socket": s} for n, s in herdr_session_sockets()],
         "orca_connected": bool(query_orca_terminals()),
         "summary": {
             "total": total,
@@ -1641,8 +1690,34 @@ def fetch_all_agents() -> Dict[str, Any]:
             "headline": headline,
         },
         "agents": agents_list,
-        "workspaces": all_workspaces,
+        "workspaces": all_workspaces_dedup,
     }
+
+
+def find_herdr_window_for_session(clients: List[Dict[str, Any]], session_name: str) -> Optional[Dict[str, Any]]:
+    """Find the Hyprland window whose terminal client is attached to a Herdr session.
+
+    Terminal clients run `herdr` (default session) or `herdr --session <name>`
+    as a direct child process, so pair a window to a session by reading that
+    child process's command line.
+    """
+    for c in clients:
+        client_pid = c.get("pid")
+        if not client_pid:
+            continue
+        for p in glob.glob("/proc/[0-9]*"):
+            try:
+                child = get_process_info(int(os.path.basename(p)))
+                if not child or child["ppid"] != client_pid:
+                    continue
+                cmd = child["cmd"]
+                if f"herdr --session {session_name}" in cmd:
+                    return c
+                if session_name == "default" and (cmd == "herdr" or cmd.endswith("/herdr")):
+                    return c
+            except Exception:
+                continue
+    return None
 
 
 def focus_pane(target_id: str) -> Dict[str, Any]:
@@ -1701,14 +1776,20 @@ def focus_pane(target_id: str) -> Dict[str, Any]:
         except Exception:
             pass
         return {"ok": False, "error": "Standalone terminal window not found"}
-    # 3. Herdr pane
-    sock_path = os.path.expanduser("~/.config/herdr/herdr.sock")
+    # 3. Herdr pane (session-qualified targets look like herdr:<session>|<pane_id>)
+    sess_name = "default"
+    pane_target = target_id
+    if target_id.startswith("herdr:"):
+        parts = target_id.split("|", 1)
+        sess_name = parts[0][len("herdr:"):]
+        pane_target = parts[1] if len(parts) > 1 else target_id
+    sock_path = herdr_socket_for_session(sess_name)
     if os.path.exists(sock_path):
         try:
             s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
             s.settimeout(1.0)
             s.connect(sock_path)
-            req = {"jsonrpc": "2.0", "id": "focus:exec", "method": "pane.focus", "params": {"pane_id": target_id}}
+            req = {"jsonrpc": "2.0", "id": "focus:exec", "method": "pane.focus", "params": {"pane_id": pane_target}}
             s.sendall((json.dumps(req) + "\n").encode())
             try:
                 s.recv(4096)
@@ -1717,10 +1798,12 @@ def focus_pane(target_id: str) -> Dict[str, Any]:
             s.close()
         except Exception:
             pass
-    herdr_win = next(
-        (c for c in clients if "MAIN" in c.get("title", "") or "herdr" in c.get("title", "").lower()),
-        None,
-    )
+    herdr_win = find_herdr_window_for_session(clients, sess_name)
+    if not herdr_win:
+        herdr_win = next(
+            (c for c in clients if "MAIN" in c.get("title", "") or "herdr" in c.get("title", "").lower()),
+            None,
+        )
     if not herdr_win:
         herdr_win = next(
             (c for c in clients if c.get("class") in ("com.mitchellh.ghostty", "org.omarchy.terminal", "foot", "alacritty", "kitty")),
@@ -1731,12 +1814,13 @@ def focus_pane(target_id: str) -> Dict[str, Any]:
         focus_hypr_window(herdr_win)
         return {
             "ok": True,
-            "pane_id": target_id,
+            "pane_id": pane_target,
+            "herdr_session": sess_name,
             "focused_window": herdr_win.get("title", ""),
             "workspace": herdr_win.get("workspace", {}).get("id"),
         }
 
-    return {"ok": True, "pane_id": target_id}
+    return {"ok": True, "pane_id": pane_target, "herdr_session": sess_name}
 
 def kill_target(target_id: str) -> Dict[str, Any]:
     """Gracefully terminate an agent process or close a Herdr pane."""
@@ -1803,7 +1887,13 @@ def kill_target(target_id: str) -> Dict[str, Any]:
         except Exception as e:
             return {"ok": False, "error": str(e)}
 
-    # 3. Herdr pane
+    # 3. Herdr pane (session-qualified targets look like herdr:<session>|<pane_id>)
+    if target_id.startswith("herdr:"):
+        parts = target_id.split("|", 1)
+        sess_name = parts[0][len("herdr:"):]
+        pane_target = parts[1] if len(parts) > 1 else target_id
+        res = query_herdr_socket("pane.close", {"pane_id": pane_target}, sock_path=herdr_socket_for_session(sess_name))
+        return {"ok": True, "pane_id": pane_target, "herdr_session": sess_name, "socket_res": res}
     res = query_herdr_socket("pane.close", {"pane_id": target_id})
     return {"ok": True, "pane_id": target_id, "socket_res": res}
 
