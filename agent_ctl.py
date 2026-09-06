@@ -230,6 +230,29 @@ def is_hermes_cli_process(cmd: str) -> bool:
     )
 
 
+# Claude Code runs internal helpers under the same `claude` binary (argv[0]).
+# They are identifiable by a literal subcommand verb in argv[1]; real sessions
+# are invoked as `claude --session-id …`, `claude --resume …` or bare `claude`,
+# where that slot holds a flag, a prompt, or nothing. (Ref: issue #10)
+CLAUDE_HELPER_SUBCOMMANDS = ("daemon", "bg-pty-host", "bg-spare")
+
+
+def is_claude_helper_process(cmd: str, argv: Optional[List[str]] = None) -> bool:
+    """Heuristic: True for Claude Code internal helpers (daemon, bg-pty-host, bg-spare).
+
+    Helpers share argv[0] == "claude" with real sessions but carry a literal
+    subcommand verb in argv[1]; real sessions have a flag, a prompt, or nothing
+    there. Pass the exact /proc argv list (get_process_info()["argv"]) so a
+    prompt whose first word is e.g. "daemon" — a single argv element — is not
+    mistaken for the verb; without argv, cmd.split() is used as a best-effort
+    approximation (exact token match, no substring/prefix matching).
+    """
+    tokens = list(argv) if argv is not None else cmd.split()
+    if len(tokens) < 2 or os.path.basename(tokens[0]) != "claude":
+        return False
+    return tokens[1] in CLAUDE_HELPER_SUBCOMMANDS
+
+
 def is_valid_agent_process(pid: int) -> bool:
     """Validate that a PID actually corresponds to an active AI agent process before signaling."""
     if pid <= 1:
@@ -240,7 +263,7 @@ def is_valid_agent_process(pid: int) -> bool:
     cmd = info["cmd"]
     tokens = cmd.split()
     first = os.path.basename(tokens[0]) if tokens else ""
-    if first in ("omp", "pi", "claude", "codex", "opencode", "cline", "cursor", "agy"):
+    if first in ("omp", "pi", "claude", "codex", "opencode", "cline", "cursor", "agy") and not is_claude_helper_process(cmd, info.get("argv")):
         return True
     if first in ("python", "python3") and is_hermes_cli_process(cmd):
         return True
@@ -265,9 +288,14 @@ def get_process_info(pid: int) -> Optional[Dict[str, Any]]:
             ppid = int(fields[1])
             tty_nr = int(fields[4])
         with open(f"{proc_dir}/cmdline", "rb") as cf:
-            cmd = cf.read().decode("utf-8", errors="replace").replace("\x00", " ").strip()
+            raw_cmdline = cf.read().decode("utf-8", errors="replace")
+        # Exact argv elements (cmdline is NUL-separated). Empty string = zombie.
+        # `argv` preserves boundaries; `cmd` keeps the legacy space-joined form
+        # for substring checks (argv elements may themselves contain spaces).
+        argv = [a for a in raw_cmdline.split("\x00") if a != ""]
+        cmd = " ".join(argv).strip()
         cwd = os.path.realpath(f"{proc_dir}/cwd")
-        return {"pid": pid, "ppid": ppid, "tty": tty_nr, "state": state, "cmd": cmd, "cwd": cwd}
+        return {"pid": pid, "ppid": ppid, "tty": tty_nr, "state": state, "cmd": cmd, "cwd": cwd, "argv": argv}
     except Exception:
         return None
 
@@ -1273,7 +1301,7 @@ def scan_standalone_agents(herdr_server_pids: List[int], seen_cwds: Set[str], cl
             )
 
             # Skip anything running inside Herdr, spawned as an internal background worker, or system usage script
-            if is_in_herdr or is_broker_child or "omarchy-agent-usage" in cmd or "__omp_worker" in cmd or "gateway run" in cmd or "serve --host" in cmd or "zygote" in cmd or "agent_ctl.py" in cmd:
+            if is_in_herdr or is_broker_child or is_claude_helper_process(cmd, info.get("argv")) or "omarchy-agent-usage" in cmd or "__omp_worker" in cmd or "gateway run" in cmd or "serve --host" in cmd or "zygote" in cmd or "agent_ctl.py" in cmd:
                 continue
 
             # Check if this is a Hermes Desktop GUI process
