@@ -23,6 +23,16 @@ HERDR_SOCK_PATH = os.path.expanduser(os.environ.get("HERDR_SOCKET_PATH", "~/.con
 OMP_SESSIONS_DIR = os.path.expanduser("~/.omp/agent/sessions")
 HERMES_STATE_DB = os.path.expanduser("~/.hermes/state.db")
 
+# Claude Code keeps no session .jsonl file descriptor open the way OMP does and
+# exposes no local session API the way Hermes does, so find_session_for_process()
+# never resolves a session for it and every claude process falls back to the
+# generic idle default regardless of its real state. Claude Code hooks (see
+# hooks/claude-code-status.sh) write real status here instead, one file per
+# session, keyed by the claude process's own PID.
+CLAUDE_HOOK_STATUS_DIR = os.path.expanduser("~/.local/state/omarchy/agents/claude-status")
+CLAUDE_HOOK_STATUS_MAX_AGE = 24 * 3600
+CLAUDE_HOOK_STATUSES = ("working", "waiting", "completed", "idle")
+
 KNOWN_TERMINALS = (
     "foot", "ghostty", "alacritty", "kitty", "wezterm", "gnome-terminal",
     "ptyxis", "konsole", "terminator", "xfce4-terminal", "xterm", "rio",
@@ -361,6 +371,35 @@ def get_process_open_session(pid: int) -> Optional[str]:
     except Exception:
         pass
     return None
+
+
+# Only a status from the known vocabulary carrying a fresh timestamp is trusted,
+# so a malformed, foreign or stale file can never reach the UI. Freshness matters
+# because a session killed with SIGKILL never fires SessionEnd, and its last
+# "working" would otherwise stick around forever. The detail line is
+# hook-supplied free text (a tool name, a permission prompt), so it runs through
+# the same first-line and secret-redaction pass as every other agent detail.
+def read_claude_hook_status(pid: int) -> Optional[Dict[str, str]]:
+    """Read the live status Claude Code's own hooks wrote for this PID."""
+    path = os.path.join(CLAUDE_HOOK_STATUS_DIR, f"{pid}.json")
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception:
+        return None
+    if not isinstance(data, dict):
+        return None
+    status = data.get("status")
+    if status not in CLAUDE_HOOK_STATUSES:
+        return None
+    updated = data.get("updated")
+    if not isinstance(updated, (int, float)) or (time.time() - updated) > CLAUDE_HOOK_STATUS_MAX_AGE:
+        return None
+    detail = data.get("detail")
+    return {
+        "status": status,
+        "detail": extract_first_line(clean_ansi(detail)) if isinstance(detail, str) else "",
+    }
 
 
 def find_session_for_process(agent_type: str, pid: int, cwd: str, claimed_sessions: Set[str]) -> Optional[str]:
@@ -1381,14 +1420,22 @@ def scan_standalone_agents(herdr_server_pids: List[int], seen_cwds: Set[str], cl
                 workspace_name = f"Desktop {ws_id}"
                 tab_name = f"{term_name.capitalize()} (Desktop {ws_id})"
                 pane_id = f"terminal:addr:{window_addr}"
-                session_path = find_session_for_process(agent_type, pid, cwd, claimed_sessions)
+                # A hook-reported Claude status is authoritative: it comes from
+                # the session itself, so it wins over transcript inference and
+                # over the process-state guess further down.
+                claude_hook_status = read_claude_hook_status(pid) if agent_type == "claude" else None
+                session_path = None if claude_hook_status else find_session_for_process(agent_type, pid, cwd, claimed_sessions)
                 user_goal = None
                 detail_text = None
                 model_name = None
                 status_override = None
                 has_question = False
 
-                if session_path:
+                if claude_hook_status:
+                    status_override = claude_hook_status["status"]
+                    detail_text = claude_hook_status["detail"] or "Ready for prompt"
+                    has_question = status_override == "waiting"
+                elif session_path:
                     claimed_sessions.add(session_path)
                     if agent_type == "omp":
                         if os.path.exists(session_path):
