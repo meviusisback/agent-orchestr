@@ -5,6 +5,7 @@ Discovers and manages AI agents across:
 1. Herdr workspaces & panes (Herdr daemon socket + process tree correlation)
 2. Standard terminal windows (Foot, Alacritty, Kitty, Ghostty)
 3. Hermes Desktop GUI instances (Electron app)
+4. Grok Build TUI sessions ($GROK_HOME/active_sessions.json + events.jsonl)
 """
 
 import glob
@@ -18,6 +19,7 @@ import subprocess
 import sys
 import time
 from typing import Any, Dict, List, Optional, Set, Tuple
+from urllib.parse import quote
 
 HERDR_SOCK_PATH = os.path.expanduser(os.environ.get("HERDR_SOCKET_PATH", "~/.config/herdr/herdr.sock"))
 OMP_SESSIONS_DIR = os.path.expanduser("~/.omp/agent/sessions")
@@ -263,6 +265,271 @@ def is_claude_helper_process(cmd: str, argv: Optional[List[str]] = None) -> bool
     return tokens[1] in CLAUDE_HELPER_SUBCOMMANDS
 
 
+# Grok Build's interactive TUI is argv[0] == "grok" with a flag, a prompt, or
+# nothing in argv[1]. The same binary also hosts one-shot CLI verbs (login,
+# mcp, doctor, agent, …). Discriminate on the exact argv[1] token the same way
+# Claude helpers are (issue #10 / PR #11): a prompt whose first word is
+# "agent" as a single argv element must not be mistaken for `grok agent`.
+GROK_HELPER_SUBCOMMANDS = (
+    "agent", "clone", "completions", "dashboard", "doctor", "du", "disk-usage",
+    "export", "help", "inspect", "leader", "login", "logout", "mcp", "memory",
+    "models", "plugin", "sessions", "setup", "trace", "update", "usage",
+    "version", "v", "worktree", "wrap",
+)
+GROK_WAITING_TOOLS = ("ask_user_question",)
+GROK_WORKING_PHASES = (
+    "waiting_for_model", "streaming_reasoning", "streaming_text", "tool_execution",
+)
+GROK_WAITING_PHASES = ("permission_prompt",)
+
+
+def grok_home() -> str:
+    """Grok's data dir; GROK_HOME overrides, default ~/.grok."""
+    return os.path.expanduser(os.environ.get("GROK_HOME", "~/.grok"))
+
+
+def is_grok_helper_process(cmd: str, argv: Optional[List[str]] = None) -> bool:
+    """True for Grok CLI verbs that are not an interactive coding session."""
+    tokens = list(argv) if argv is not None else cmd.split()
+    if len(tokens) < 2 or os.path.basename(tokens[0]) != "grok":
+        return False
+    return tokens[1] in GROK_HELPER_SUBCOMMANDS
+
+
+def grok_session_is_subagent(session_dir: str) -> bool:
+    """Skip forked subagent sessions so the parent card is not counted twice."""
+    summary_path = os.path.join(session_dir, "summary.json")
+    try:
+        with open(summary_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception:
+        return False
+    if not isinstance(data, dict):
+        return False
+    # session_kind is the reliable flag (agent_name is the role, e.g. general-purpose).
+    for key in ("session_kind", "agent_name", "session_relationship"):
+        val = str(data.get(key) or "")
+        if val.startswith("subagent"):
+            return True
+    return False
+
+
+def grok_session_dir(cwd: str, session_id: str) -> Optional[str]:
+    """Resolve ~/.grok/sessions/<urlencoded-cwd>/<id>/ for a live session."""
+    if not cwd or not session_id:
+        return None
+    root = os.path.join(grok_home(), "sessions", quote(cwd, safe=""), session_id)
+    if os.path.isdir(root):
+        return root
+    try:
+        alt = os.path.join(grok_home(), "sessions", quote(os.path.realpath(cwd), safe=""), session_id)
+    except Exception:
+        return None
+    return alt if os.path.isdir(alt) else None
+
+
+def grok_active_session_for_pid(pid: int) -> Optional[str]:
+    """Map a live grok PID to its session directory via active_sessions.json."""
+    path = os.path.join(grok_home(), "active_sessions.json")
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            rows = json.load(f)
+    except Exception:
+        return None
+    if not isinstance(rows, list):
+        return None
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        try:
+            row_pid = int(row.get("pid"))
+        except (TypeError, ValueError):
+            continue
+        if row_pid != pid:
+            continue
+        session_id = str(row.get("session_id") or "")
+        cwd = str(row.get("cwd") or "")
+        session_dir = grok_session_dir(cwd, session_id)
+        if session_dir and not grok_session_is_subagent(session_dir):
+            return session_dir
+    return None
+
+
+def grok_sessions_for_cwd(cwd: str) -> List[str]:
+    """Session directories under the urlencoded cwd folder, newest first."""
+    if not cwd:
+        return []
+    sessions_root = os.path.join(grok_home(), "sessions")
+    candidates = [quote(cwd, safe="")]
+    try:
+        real = os.path.realpath(cwd)
+        encoded_real = quote(real, safe="")
+        if encoded_real not in candidates:
+            candidates.append(encoded_real)
+    except Exception:
+        pass
+    found: List[str] = []
+    for encoded in candidates:
+        folder = os.path.join(sessions_root, encoded)
+        if not os.path.isdir(folder):
+            continue
+        for name in os.listdir(folder):
+            path = os.path.join(folder, name)
+            if os.path.isdir(path) and os.path.exists(os.path.join(path, "summary.json")):
+                found.append(path)
+    found.sort(key=lambda p: os.path.getmtime(os.path.join(p, "summary.json")), reverse=True)
+    return found
+
+
+def _iter_jsonl_tail(path: str, tail_bytes: int = 65536, max_lines: int = 200, max_line: int = 8192) -> List[Dict[str, Any]]:
+    """Bounded JSONL tail read; skips malformed lines."""
+    entries: List[Dict[str, Any]] = []
+    try:
+        file_size = os.path.getsize(path)
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            if file_size > tail_bytes:
+                f.seek(file_size - tail_bytes)
+                f.readline(max_line)
+            while len(entries) < max_lines:
+                line = f.readline(max_line)
+                if not line:
+                    break
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    obj = json.loads(line)
+                except Exception:
+                    continue
+                if isinstance(obj, dict):
+                    entries.append(obj)
+    except Exception:
+        return []
+    return entries
+
+
+def extract_grok_task_from_session(
+    session_dir: str,
+) -> Tuple[Optional[str], Optional[str], Optional[str], Optional[str], bool]:
+    """Read a Grok session directory.
+
+    Returns (latest_user_prompt, detail_text, model_name, status_override, has_question).
+    Status comes from a bounded tail of events.jsonl; the title/model from summary.json
+    plus the last real user line in chat_history.jsonl.
+    """
+    if not session_dir or not os.path.isdir(session_dir):
+        return None, None, None, None, False
+
+    model_name = None
+    latest_user_prompt = None
+    last_turn_summary = None
+    summary_path = os.path.join(session_dir, "summary.json")
+    try:
+        with open(summary_path, "r", encoding="utf-8") as f:
+            summary = json.load(f)
+        if isinstance(summary, dict):
+            model_name = clean_model_name(summary.get("current_model_id") or "")
+            title = summary.get("generated_title") or summary.get("session_summary") or ""
+            if isinstance(title, str) and title.strip():
+                latest_user_prompt = clean_user_prompt(title)
+            turn = summary.get("last_turn_summary")
+            if isinstance(turn, str) and turn.strip():
+                last_turn_summary = extract_first_line(turn)
+    except Exception:
+        pass
+
+    history_path = os.path.join(session_dir, "chat_history.jsonl")
+    if os.path.exists(history_path):
+        for entry in reversed(_iter_jsonl_tail(history_path)):
+            if entry.get("type") != "user":
+                continue
+            if entry.get("synthetic_reason"):
+                continue
+            content = entry.get("content")
+            raw = content if isinstance(content, str) else ""
+            cleaned = clean_user_prompt(raw)
+            if cleaned and not is_system_wrapper(cleaned):
+                latest_user_prompt = cleaned
+                break
+
+    pending_tool: Optional[str] = None
+    pending_permission: Optional[str] = None
+    last_phase: Optional[str] = None
+    turn_open = False
+    saw_turn_end = False
+    events_path = os.path.join(session_dir, "events.jsonl")
+    if os.path.exists(events_path):
+        for entry in _iter_jsonl_tail(events_path):
+            et = entry.get("type")
+            if et == "phase_changed":
+                last_phase = entry.get("phase") if isinstance(entry.get("phase"), str) else last_phase
+            elif et == "tool_started":
+                pending_tool = str(entry.get("tool_name") or "tool")
+                turn_open = True
+                saw_turn_end = False
+            elif et == "tool_completed":
+                pending_tool = None
+            elif et == "permission_requested":
+                pending_permission = str(entry.get("tool_name") or "tool")
+                turn_open = True
+                saw_turn_end = False
+            elif et == "permission_resolved":
+                pending_permission = None
+                # Yolo/auto-allow leaves phase_changed=permission_prompt as the
+                # last phase even after resolve; don't keep treating it as waiting.
+                if last_phase in GROK_WAITING_PHASES:
+                    last_phase = "tool_execution" if pending_tool else None
+            elif et == "turn_started":
+                turn_open = True
+                saw_turn_end = False
+                pending_tool = None
+                pending_permission = None
+            elif et == "turn_ended":
+                turn_open = False
+                saw_turn_end = True
+                pending_tool = None
+                pending_permission = None
+                last_phase = None
+
+    status_override = None
+    detail = None
+    has_question = False
+    if pending_permission:
+        status_override = "waiting"
+        detail = f"Permission: {pending_permission}"
+        has_question = True
+    elif last_phase in GROK_WAITING_PHASES:
+        status_override = "waiting"
+        detail = "Waiting for permission"
+        has_question = True
+    elif pending_tool in GROK_WAITING_TOOLS:
+        status_override = "waiting"
+        detail = "Waiting for input"
+        has_question = True
+    elif pending_tool or last_phase == "tool_execution":
+        status_override = "working"
+        detail = f"Running: {pending_tool or 'tool'}"
+    elif last_phase in GROK_WORKING_PHASES:
+        status_override = "working"
+        if last_phase == "waiting_for_model":
+            detail = "Thinking…"
+        elif last_phase == "streaming_reasoning":
+            detail = "Reasoning…"
+        else:
+            detail = "Generating response…"
+    elif turn_open:
+        status_override = "working"
+        detail = "Thinking…"
+    elif saw_turn_end:
+        status_override = "completed"
+        detail = last_turn_summary or "Task completed"
+    else:
+        status_override = "idle"
+        detail = "Ready for prompt"
+
+    return latest_user_prompt, detail, model_name or "", status_override, has_question
+
+
 def is_valid_agent_process(pid: int) -> bool:
     """Validate that a PID actually corresponds to an active AI agent process before signaling."""
     if pid <= 1:
@@ -273,7 +540,10 @@ def is_valid_agent_process(pid: int) -> bool:
     cmd = info["cmd"]
     tokens = cmd.split()
     first = os.path.basename(tokens[0]) if tokens else ""
-    if first in ("omp", "pi", "claude", "codex", "opencode", "cline", "cursor", "agy") and not is_claude_helper_process(cmd, info.get("argv")):
+    argv = info.get("argv")
+    if first == "grok" and not is_grok_helper_process(cmd, argv):
+        return True
+    if first in ("omp", "pi", "claude", "codex", "opencode", "cline", "cursor", "agy") and not is_claude_helper_process(cmd, argv):
         return True
     if first in ("python", "python3") and is_hermes_cli_process(cmd):
         return True
@@ -404,6 +674,22 @@ def read_claude_hook_status(pid: int) -> Optional[Dict[str, str]]:
 
 def find_session_for_process(agent_type: str, pid: int, cwd: str, claimed_sessions: Set[str]) -> Optional[str]:
     """Find active or recent session file strictly belonging to this specific process."""
+    if agent_type == "grok":
+        active = grok_active_session_for_pid(pid)
+        if active and active not in claimed_sessions:
+            return active
+        p_start = get_process_start_time(pid)
+        for session_dir in grok_sessions_for_cwd(cwd):
+            if session_dir in claimed_sessions or grok_session_is_subagent(session_dir):
+                continue
+            try:
+                mtime = os.path.getmtime(os.path.join(session_dir, "summary.json"))
+            except Exception:
+                continue
+            if p_start > 0 and mtime >= (p_start - 5.0):
+                return session_dir
+        return None
+
     if agent_type == "omp":
         # 1. Check PTS terminal session mapping in ~/.omp/agent/terminal-sessions/pts-<N>
         try:
@@ -477,6 +763,14 @@ def match_hypr_client_for_terminal(ancestor_pids: List[int], cwd: str, agent_typ
 def find_latest_session_for_cwd(agent_type: str, cwd: str, claimed_sessions: Optional[Set[str]] = None) -> Optional[str]:
     """Find the most recent session file matching a working directory that is not already claimed."""
     claimed = claimed_sessions or set()
+    if agent_type == "grok":
+        try:
+            for session_dir in grok_sessions_for_cwd(cwd):
+                if session_dir not in claimed and not grok_session_is_subagent(session_dir):
+                    return session_dir
+        except Exception:
+            pass
+        return None
     if agent_type == "omp" and os.path.exists(OMP_SESSIONS_DIR):
         try:
             folder_part = os.path.basename(cwd.rstrip("/")) if cwd else ""
@@ -980,6 +1274,7 @@ _ORCA_AGENT_ALIASES = {
     "agy": "agy",
     "cursor": "cursor",
     "cline": "cline",
+    "grok": "grok",
 }
 
 # Bare shells / system programs that mean "no agent in this terminal".
@@ -1015,6 +1310,7 @@ _ORCA_MODEL_AGENT_HINTS = (
     ("o3", "codex"),
     ("o4", "codex"),
     ("gemini", "gemini"),
+    ("grok", "grok"),
 )
 
 # Unambiguous agent-TUI chrome strings (beyond the CLI's own name) that can
@@ -1027,11 +1323,12 @@ _ORCA_PREVIEW_CHROME_MARKERS = {
     "codex": (),
     "opencode": (),
     "agy": (),
+    "grok": (),
 }
 
 # Agent names looked up literally (as words) in the preview when the title's
 # model token yields no hint. Ordered most-specific first.
-_ORCA_PREVIEW_AGENT_NAMES = ("hermes", "opencode", "gemini", "claude", "codex", "omp", "agy", "pi")
+_ORCA_PREVIEW_AGENT_NAMES = ("hermes", "opencode", "gemini", "claude", "codex", "omp", "agy", "pi", "grok")
 
 
 def _contains_word(haystack: str, word: str) -> bool:
@@ -1261,6 +1558,8 @@ def scan_orca_agents(claimed_sessions: Set[str]) -> List[Dict[str, Any]]:
                 claimed_sessions.add(session_path)
                 if agent_type == "omp" and os.path.exists(session_path):
                     user_goal, detail_text, model_name, status_override, has_question = extract_omp_task_from_session(session_path)
+                elif agent_type == "grok":
+                    user_goal, detail_text, model_name, status_override, has_question = extract_grok_task_from_session(session_path)
                 elif agent_type == "hermes":
                     _, model_name, _, _, detail_text, status_override, has_question = extract_hermes_session_info(source_preference="cli")
             elif agent_type == "omp":
@@ -1340,7 +1639,7 @@ def scan_standalone_agents(herdr_server_pids: List[int], seen_cwds: Set[str], cl
             )
 
             # Skip anything running inside Herdr, spawned as an internal background worker, or system usage script
-            if is_in_herdr or is_broker_child or is_claude_helper_process(cmd, info.get("argv")) or "omarchy-agent-usage" in cmd or "__omp_worker" in cmd or "gateway run" in cmd or "serve --host" in cmd or "zygote" in cmd or "agent_ctl.py" in cmd:
+            if is_in_herdr or is_broker_child or is_claude_helper_process(cmd, info.get("argv")) or is_grok_helper_process(cmd, info.get("argv")) or "omarchy-agent-usage" in cmd or "__omp_worker" in cmd or "gateway run" in cmd or "serve --host" in cmd or "zygote" in cmd or "agent_ctl.py" in cmd:
                 continue
 
             # Check if this is a Hermes Desktop GUI process
@@ -1381,6 +1680,8 @@ def scan_standalone_agents(herdr_server_pids: List[int], seen_cwds: Set[str], cl
             elif first == "agy":
                 # Google Antigravity CLI - no JSONL transcripts; generic enrichment
                 agent_type = "agy"
+            elif first == "grok":
+                agent_type = "grok"
             elif first in ("claude", "codex", "opencode", "cline", "cursor"):
                 agent_type = first
             elif first in ("python", "python3") and is_hermes_cli_process(cmd):
@@ -1442,6 +1743,8 @@ def scan_standalone_agents(herdr_server_pids: List[int], seen_cwds: Set[str], cl
                             user_goal, detail_text, model_name, status_override, has_question = extract_omp_task_from_session(session_path)
                         else:
                             model_name = get_omp_default_model()
+                    elif agent_type == "grok":
+                        user_goal, detail_text, model_name, status_override, has_question = extract_grok_task_from_session(session_path)
                     elif agent_type == "hermes":
                         p_st = get_process_start_time(pid)
                         user_goal, model_name, _, _, detail_text, status_override, has_question = extract_hermes_session_info(source_preference="cli", min_start_time=p_st)
@@ -1578,6 +1881,8 @@ def fetch_all_agents() -> Dict[str, Any]:
 
             if agent_type == "omp" and session_path:
                 user_goal, detail_text, model_name, status_override, has_question = extract_omp_task_from_session(session_path)
+            elif agent_type == "grok" and session_path:
+                user_goal, detail_text, model_name, status_override, has_question = extract_grok_task_from_session(session_path)
             elif agent_type == "hermes":
                 hermes_p_start = None
                 for hp in glob.glob("/proc/[0-9]*"):

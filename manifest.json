@@ -5,7 +5,7 @@
   "version": "1.0.0",
   "author": "meviusisback",
   "license": "MIT",
-  "description": "Live monitor and workspace orchestrator for AI coding agents (Herdr, OMP, Hermes, Claude, Codex) in the Omarchy bar.",
+  "description": "Live monitor and workspace orchestrator for AI coding agents (Herdr, OMP, Hermes, Claude, Codex, Grok) in the Omarchy bar.",
   "kinds": [
     "bar-widget"
   ],

@@ -1,12 +1,12 @@
 # Agent Orchestrator for Omarchy
 
-Real-time status, active tasks, and one-click workspace switching for AI coding agents (**Herdr**, **OMP**, **Hermes**, **Claude**, **Codex**, **OpenCode**, **Agy** (Antigravity CLI)) in the Omarchy bar.
+Real-time status, active tasks, and one-click workspace switching for AI coding agents (**Herdr**, **OMP**, **Hermes**, **Claude**, **Codex**, **OpenCode**, **Agy** (Antigravity CLI), **Grok**) in the Omarchy bar.
 
 ![Agent Orchestrator](preview.png)
 
 ## Features
 
-- **Live Multi-Source Agent Tracking**: Seamlessly tracks AI coding agents across **Herdr** daemon panes (`~/.config/herdr/herdr.sock`), standalone terminal windows (Ghostty, Foot, Kitty, Alacritty, WezTerm), **OMP** sessions (`~/.omp/agent/sessions/`), and **Hermes** CLI & Desktop app databases (`~/.hermes/state.db`).
+- **Live Multi-Source Agent Tracking**: Seamlessly tracks AI coding agents across **Herdr** daemon panes (`~/.config/herdr/herdr.sock`), standalone terminal windows (Ghostty, Foot, Kitty, Alacritty, WezTerm), **OMP** sessions (`~/.omp/agent/sessions/`), **Hermes** CLI & Desktop app databases (`~/.hermes/state.db`), and **Grok** Build TUI sessions (`$GROK_HOME/active_sessions.json` + `events.jsonl`).
 - **One-Click Workspace & Window Switching**: Click any agent card to switch Hyprland workspaces and focus the exact terminal window, Herdr pane, or Hermes Desktop window.
 - **Visual Status Bar Display**:
   - **`Icon` Mode**: Agent orchestrator glyph with dynamic activity badge and spinner animation when agents are actively working.
@@ -117,6 +117,22 @@ session that was `SIGKILL`ed are pruned on the next one.
 
 Installing the hook is purely additive: without it, Claude Code sessions behave
 exactly as they do today (generic idle fallback).
+
+## Grok Build TUI
+
+Grok already writes a live roster (`$GROK_HOME/active_sessions.json`, default
+`~/.grok`) and a status event stream (`events.jsonl`) per session. The collector
+reads those files directly — no hook install is required.
+
+Interactive sessions are `grok`, `grok --resume …`, `grok --session-id …`, or
+`grok "<prompt>"`. CLI verbs (`grok login`, `grok mcp`, `grok agent`,
+`grok doctor`, …) share the same binary and are skipped by an exact `argv[1]`
+match, the same way Claude Code helpers are. The mise `node …/bin/grok` wrapper
+is not counted: its `argv[0]` is `node`. Forked `subagent*` sessions are skipped
+so the parent card is not doubled.
+
+Status mapping: `streaming_*` / `tool_execution` → `working`; `permission_prompt`
+→ `waiting`; `turn_ended` → `completed`; otherwise `idle`.
 
 ## Keybinding
 
