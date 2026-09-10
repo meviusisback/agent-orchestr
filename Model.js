@@ -107,12 +107,13 @@ function agentDisplayName(agent) {
   if (a === "claude") return "Claude"
   if (a === "codex") return "Codex"
   if (a === "opencode") return "OpenCode"
+  if (a === "grok") return "Grok"
   return a ? a.charAt(0).toUpperCase() + a.slice(1) : "Agent"
 }
 
 function agentIconPath(agent) {
   var a = String(agent || "").toLowerCase()
-  var known = ["omp", "hermes", "herdr", "claude", "codex", "opencode"]
+  var known = ["omp", "hermes", "herdr", "claude", "codex", "opencode", "grok"]
   if (known.indexOf(a) >= 0) {
     return "assets/icons/" + a + ".svg"
   }
