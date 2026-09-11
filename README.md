@@ -140,12 +140,15 @@ and only as a last resort by working directory — the session id is the reliabl
 key, so concurrent sessions in one directory stay distinct and the layout Grok
 uses for very long paths (a slug+hash group with the real path in a `.cwd`
 marker file, used when the URL-encoded directory name exceeds 255 bytes) is
-found without guessing its name. When an invocation passes `--cwd`, the process
-working directory is ignored and the session's own directory is shown. A session
-that cannot be resolved gets no card rather than a wrong one; the cwd fallback is
-the one place where a session the roster has not recorded can be attributed by
-recency instead, which is why it needs the process-start window and never reuses
-a session another card already claimed.
+found without guessing its name. The deterministic encoded group name is always
+preferred: a `.cwd` marker is local file content, so a group that merely *claims*
+a working directory can never outrank the real one, nor spend the budget the real
+card's summary and event reads need. When an invocation passes `--cwd`, the
+process working directory is ignored and the session's own directory is shown. A
+session that cannot be resolved gets no card rather than a wrong one; the cwd
+fallback is the one place where a session the roster has not recorded can be
+attributed by recency instead, which is why it needs the process-start window and
+never reuses a session another card already claimed.
 
 Status mapping: `streaming_*` / `tool_execution` → `working`; `permission_prompt`
 and an unanswered `permission_requested` → `waiting`; `turn_ended` →

@@ -298,18 +298,23 @@ GROK_JSONL_TAIL_BYTES = 65536
 GROK_JSONL_MAX_LINE_BYTES = 512 * 1024
 GROK_MAX_GROUP_DIRS = 512
 GROK_MAX_GROUP_ENTRIES = 512
-# Marker files are only needed for the slug+hash (long path) layout. They are
-# tiny in practice, but a hostile tree can hold thousands of maximum-size ones, so
-# they are charged to their own small allowance: a crafted tree then cannot eat
-# the byte budget that real cards need for their summary/events reads.
-GROK_MARKER_MAX_TOTAL_BYTES = 256 * 1024
+# Marker files are only needed for the slug+hash (long path) layout. They get
+# their own allowance, sized so every group the scan is willing to visit can
+# still be read — a marker flood must not be able to hide a real long-path
+# session. Marker bytes are a separate bucket, so they never starve the session
+# summary/events reads that share the main cycle budget.
+GROK_MARKER_MAX_TOTAL_BYTES = GROK_MAX_GROUP_DIRS * GROK_CWD_MARKER_MAX_BYTES
+# How many marker-matched groups may be enumerated for one cwd. Markers are
+# attacker-controllable text, so a pile of groups all claiming the same cwd must
+# not be able to spend the cycle budget (or take over the card) by volume.
+GROK_MAX_MATCHED_GROUPS = 8
 GROK_CYCLE_MAX_BYTES = 2 * 1024 * 1024
 # A marker-bearing tree of GROK_MAX_GROUP_DIRS groups costs ~3 ops per group for
 # the trust walks plus one listing, so 512 groups need ~1.6k ops; the ceiling is
 # set well above that so several cards can resolve in one tick without any of
 # them silently losing their session.
 GROK_CYCLE_MAX_OPS = 16384
-GROK_CACHE_MAX_ENTRIES = 32
+GROK_CACHE_MAX_ENTRIES = 128
 GROK_WAITING_TOOLS = ("ask_user_question",)
 GROK_WORKING_PHASES = (
     "waiting_for_model", "streaming_reasoning", "streaming_text", "tool_execution",
@@ -385,7 +390,13 @@ class _GrokBudget:
         return not self.exhausted()
 
     def get(self, key: Tuple[str, int, int, int, int, int]) -> Any:
-        return self.cache.get(key)
+        # Touch on hit so eviction is LRU rather than FIFO: with a FIFO, a working
+        # set larger than the cache re-reads files on every look-up.
+        if key not in self.cache:
+            return None
+        value = self.cache.pop(key)
+        self.cache[key] = value
+        return value
 
     def has(self, key: Tuple[str, int, int, int, int, int]) -> bool:
         return key in self.cache
@@ -473,13 +484,15 @@ def _grok_fd_within_home(fd: int) -> bool:
 _GROK_OPEN_FLAGS = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK
 
 
-def _grok_open_verified(path: str, max_size: Optional[int] = None) -> Optional[int]:
+def _grok_open_verified(path: str, max_size: Optional[int] = None, marker: bool = False, whole: bool = False) -> Optional[int]:
     """Open a trusted Grok file and return a verified fd, or None.
 
     One place owns the security-critical steps: the trust walk on the path, the
     O_NOFOLLOW|O_NONBLOCK open, and fd-level verification (regular file, current
-    owner, single link, optional size cap, containment in $GROK_HOME). The caller
-    owns closing the fd.
+    owner, single link, optional size cap, containment in $GROK_HOME). With
+    `whole=True` the file must also fit in the budget it is charged to — a
+    truncated prefix must never be mistaken for the file itself. The caller owns
+    closing the fd.
     """
     if _GROK_BUDGET.exhausted() or not grok_trusted_path(path):
         return None
@@ -493,6 +506,10 @@ def _grok_open_verified(path: str, max_size: Optional[int] = None) -> Optional[i
             raise OSError("not a regular, owned, single-link file")
         if max_size is not None and st.st_size > max_size:
             raise OSError("file larger than the allowed size")
+        if whole:
+            allowance = (GROK_MARKER_MAX_TOTAL_BYTES - _GROK_BUDGET.marker_bytes) if marker else _grok_allowance()
+            if allowance <= 0 or st.st_size > allowance:
+                raise OSError("remaining budget cannot cover the whole file")
         if not _grok_fd_within_home(fd):
             raise OSError("not contained in GROK_HOME")
     except OSError:
@@ -513,8 +530,8 @@ def _grok_read_at(fd: int, offset: int, length: int, marker: bool = False) -> Op
     """Read `length` bytes at `offset` from a verified fd.
 
     Reads are charged to the cycle budget and can never take it over the ceiling.
-    `marker=True` charges the separate, small marker allowance instead, so a tree
-    full of large `.cwd` markers cannot starve real session reads.
+    `marker=True` charges the separate marker allowance instead, so a tree full of
+    large `.cwd` markers cannot starve real session reads.
     """
     if marker:
         allowance = GROK_MARKER_MAX_TOTAL_BYTES - _GROK_BUDGET.marker_bytes
@@ -543,7 +560,7 @@ def grok_read_bytes(path: str, max_bytes: int) -> Optional[bytes]:
     swapped in after the path check cannot redirect the read and a FIFO cannot
     block it. Returns None — never raises — whenever anything is off.
     """
-    fd = _grok_open_verified(path, max_size=max_bytes)
+    fd = _grok_open_verified(path, max_size=max_bytes, whole=True)
     if fd is None:
         return None
     try:
@@ -555,31 +572,16 @@ def grok_read_bytes(path: str, max_bytes: int) -> Optional[bytes]:
             pass
 
 
-def grok_read_tail_bytes(path: str, tail_bytes: int = GROK_JSONL_TAIL_BYTES) -> Optional[bytes]:
-    """Read the last `tail_bytes` of a trusted Grok file.
-
-    Files that legitimately grow large (events.jsonl, chat_history.jsonl) are only
-    ever read from the end, so no total size cap applies here.
-    """
-    fd = _grok_open_verified(path)
-    if fd is None:
-        return None
-    try:
-        size = os.fstat(fd).st_size
-        limit = max(1, int(tail_bytes))
-        return _grok_read_at(fd, max(0, size - limit), limit)
-    finally:
-        try:
-            os.close(fd)
-        except OSError:
-            pass
-
-
 def grok_read_marker_bytes(path: str) -> Optional[bytes]:
-    """Read a `.cwd` marker file against the marker allowance (see _grok_read_at)."""
+    """Read a whole `.cwd` marker against the marker allowance.
+
+    Whole-file only: a marker read that the remaining allowance would truncate is
+    refused, because a truncated marker is a wrong path and would be accepted as a
+    breadcrumb or a group match.
+    """
     if _GROK_BUDGET.exhausted() or _GROK_BUDGET.marker_bytes >= GROK_MARKER_MAX_TOTAL_BYTES:
         return None
-    fd = _grok_open_verified(path, max_size=GROK_CWD_MARKER_MAX_BYTES)
+    fd = _grok_open_verified(path, max_size=GROK_CWD_MARKER_MAX_BYTES, marker=True, whole=True)
     if fd is None:
         return None
     try:
@@ -596,21 +598,34 @@ def grok_read_last_lines(path: str, max_lines: int = 200, chunk_bytes: int = GRO
 
     Chunks are read from the end and each is charged once — no window is re-read —
     so the byte cost is proportional to what is actually needed. A single very
-    long line widens the read one chunk at a time up to `max_total`, which is what
-    keeps a decisive but huge event from being truncated into a fragment. The
-    returned bytes may start mid-line; callers drop that first fragment.
+    long line widens the read one chunk at a time up to `max_total`; a line larger
+    than that absolute ceiling is dropped (documented limit) rather than parsed
+    from a fragment. The returned bytes may start mid-line; callers drop that
+    first fragment.
     """
     fd = _grok_open_verified(path)
     if fd is None:
         return None
     try:
-        size = os.fstat(fd).st_size
+        try:
+            size = os.fstat(fd).st_size
+        except OSError:
+            return b""
         parts: List[bytes] = []
         total = 0
         newlines = 0
         pos = size
         while pos > 0 and total < max_total and newlines <= max_lines:
-            take = min(chunk_bytes, pos, max_total - total)
+            allowance = _grok_allowance()
+            if allowance <= 0:
+                break
+            # Clamp the WINDOW before computing the offset: this reader walks
+            # backwards, so a length-clamped read would hand back the oldest bytes
+            # of the window instead of the newest, silently losing the events that
+            # decide the card's status.
+            take = min(chunk_bytes, pos, max_total - total, allowance)
+            if take <= 0:
+                break
             data = _grok_read_at(fd, pos - take, take)
             if data is None or not data:
                 break
@@ -870,14 +885,18 @@ def grok_group_cwd(group_dir: str) -> str:
 
 
 def grok_sessions_for_cwd(cwd: str) -> List[str]:
-    """Session directories for a cwd, newest summary.json first.
+    """Session directories for a cwd, best-first (encoded group, then markers).
 
-    Covers both group-naming schemes: the URL-encoded cwd (literal and realpath
-    forms) and any slug+hash group whose `.cwd` marker names this cwd.
+    Two group-naming schemes are covered: the URL-encoded cwd (literal and
+    realpath forms) and slug+hash groups whose `.cwd` marker names this cwd. The
+    encoded name is deterministic, so it is tried first and, when it yields a
+    session, the marker scan is skipped entirely: marker contents are
+    attacker-controllable text, and a group that merely claims this cwd must never
+    outrank the real one or spend the budget its summary/events reads need. For the
+    same reason the number of marker-matched groups enumerated per cwd is capped.
     """
     if not cwd:
         return []
-    root = grok_sessions_root()
     wanted = [cwd]
     try:
         real = os.path.realpath(cwd)
@@ -886,27 +905,39 @@ def grok_sessions_for_cwd(cwd: str) -> List[str]:
     if real and real not in wanted:
         wanted.append(real)
 
-    folders: List[str] = []
+    fast_folders: List[str] = []
     for value in wanted:
         try:
             folder = grok_group_dir_for_name(quote(value, safe=""))
         except (OSError, ValueError):
             folder = None
-        if folder and folder not in folders:
-            folders.append(folder)
-    for group in grok_group_dirs():
-        if group in folders:
-            continue
-        if grok_group_cwd(group) in wanted:
-            folders.append(group)
+        if folder and folder not in fast_folders:
+            fast_folders.append(folder)
 
     found: List[str] = []
-    for folder in folders:
+    for folder in fast_folders:
         for name in grok_listdir(folder):
             path = os.path.join(folder, name)
             if grok_is_regular_file(os.path.join(path, "summary.json")) and not grok_session_is_subagent(path):
                 found.append(path)
-    found.sort(key=grok_summary_mtime, reverse=True)
+    if found:
+        found.sort(key=grok_summary_mtime, reverse=True)
+        return found
+
+    matched = 0
+    for group in grok_group_dirs():
+        if group in fast_folders or matched >= GROK_MAX_MATCHED_GROUPS:
+            continue
+        if grok_group_cwd(group) not in wanted:
+            continue
+        matched += 1
+        group_found: List[str] = []
+        for name in grok_listdir(group):
+            path = os.path.join(group, name)
+            if grok_is_regular_file(os.path.join(path, "summary.json")) and not grok_session_is_subagent(path):
+                group_found.append(path)
+        group_found.sort(key=grok_summary_mtime, reverse=True)
+        found.extend(group_found)
     return found
 
 
@@ -985,7 +1016,7 @@ def extract_grok_task_from_session(
             latest_user_prompt = grok_clean_detail(clean_user_prompt(title), 300)
         turn = summary.get("last_turn_summary")
         if isinstance(turn, str) and turn.strip():
-            last_turn_summary = extract_first_line(turn)
+            last_turn_summary = grok_clean_detail(extract_first_line(turn), 200)
 
     history_path = os.path.join(session_dir, "chat_history.jsonl")
     if grok_is_regular_file(history_path):
@@ -996,7 +1027,7 @@ def extract_grok_task_from_session(
                 continue
             content = entry.get("content")
             raw = content if isinstance(content, str) else ""
-            cleaned = clean_user_prompt(raw)
+            cleaned = grok_clean_detail(clean_user_prompt(raw), MAX_PROMPT_CHARS)
             if cleaned and not is_system_wrapper(cleaned):
                 latest_user_prompt = cleaned
                 break
@@ -1358,7 +1389,7 @@ def extract_first_line(text: str, max_len: int = 140) -> str:
         line = re.sub(r"\*\*([^*]+)\*\*", r"\1", line)
         line = re.sub(r"\*([^*]+)\*", r"\1", line)
         line = re.sub(r"`([^`]+)`", r"\1", line)
-        line = " ".join(line.split())
+        line = " ".join(re.sub(r"[\x00-\x1f\x7f-\x9f]", " ", clean_ansi(line)).split())
         if not line:
             continue
         line = redact_secrets(line)
@@ -1379,6 +1410,11 @@ def clean_user_prompt(text: str) -> str:
     cleaned = re.sub(r"<system-directive>.*?</system-directive>", "", cleaned, flags=re.DOTALL).strip()
     cleaned = re.sub(r"<[^>]+>", "", cleaned).strip()
     cleaned = re.sub(r"^#+\s*", "", cleaned).strip()
+    # Untrusted text (session transcripts, terminal titles): drop escape sequences
+    # and control bytes before redaction — an embedded control byte both reaches
+    # the UI and splits a credential so the token regex no longer matches it.
+    cleaned = clean_ansi(cleaned)
+    cleaned = re.sub(r"[\x00-\x1f\x7f-\x9f]", " ", cleaned)
     cleaned = redact_secrets(cleaned)
     # Display text only, but it ends up in card titles and the bar headline, so cap
     # it: an unbounded prompt would otherwise inflate the whole status payload.
@@ -2865,12 +2901,41 @@ STATUS_MAX_BYTES = 262144    # hard ceiling on the serialized status payload
 
 
 _STATUS_TEXT_MAX = 400       # per-string clip applied to agent-supplied fields
+_STATUS_NUMBER_BOUND = 10 ** 12
 
 
 def _clip_text(value: Any, limit: int = _STATUS_TEXT_MAX) -> str:
     """Coerce a display string to a whitespace-flattened, clipped form."""
     text = value if isinstance(value, str) else ("" if value is None else str(value))
     return " ".join(text.split())[:limit]
+
+
+def _bounded_number(value: Any) -> Any:
+    """Bound numeric payload fields so a pathological int cannot break json.dumps.
+
+    Python refuses to serialize ints past ~4300 digits; this is not reachable from
+    session files today (every file-sourced value is str()-coerced or a bounded
+    count) but the serializer is the last line of defence, so it is clamped here.
+    """
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return value
+    try:
+        if isinstance(value, float):
+            return value if value == value and abs(value) != float("inf") else 0.0
+        return max(-_STATUS_NUMBER_BOUND, min(_STATUS_NUMBER_BOUND, int(value)))
+    except Exception:
+        return 0
+
+
+def _dumps(payload: Dict[str, Any]) -> str:
+    """json.dumps that never raises: unencodable values fall back to their str()."""
+    try:
+        return json.dumps(payload, indent=2)
+    except Exception:
+        try:
+            return json.dumps(payload, indent=2, default=str)
+        except Exception:
+            return ""
 
 
 def dump_status_json(data: Dict[str, Any]) -> str:
@@ -2890,23 +2955,27 @@ def dump_status_json(data: Dict[str, Any]) -> str:
         clipped: List[Any] = []
         for agent in agents[:STATUS_MAX_AGENTS]:
             if isinstance(agent, dict):
-                clipped.append({k: (_clip_text(v) if isinstance(v, str) else v) for k, v in agent.items()})
+                clipped.append({k: (_clip_text(v) if isinstance(v, str) else _bounded_number(v)) for k, v in agent.items()})
         payload["agents"] = clipped
     summary = payload.get("summary")
     if isinstance(summary, dict):
-        payload["summary"] = {k: (_clip_text(v, 300) if isinstance(v, str) else v) for k, v in summary.items()}
+        payload["summary"] = {
+            k: (_clip_text(v, 300) if isinstance(v, str) else _bounded_number(v))
+            for k, v in summary.items()
+        }
     workspaces = payload.get("workspaces")
     if isinstance(workspaces, list):
         payload["workspaces"] = [_clip_text(w, 200) for w in workspaces[:STATUS_MAX_WORKSPACES]]
-    text = json.dumps(payload, indent=2)
-    if len(text) <= STATUS_MAX_BYTES:
+    text = _dumps(payload)
+    if text and len(text) <= STATUS_MAX_BYTES:
         return text
 
-    # Still oversized: keep the counts, drop every free-text field.
+    # Still oversized (or unserializable): keep the counts, drop every free-text
+    # field, and bound the numbers so this reply cannot grow with any input.
     counts: Dict[str, Any] = {}
     for key, value in (summary if isinstance(summary, dict) else {}).items():
-        if isinstance(value, bool) or isinstance(value, (int, float)):
-            counts[key] = value
+        if isinstance(value, (bool, int, float)):
+            counts[key] = _bounded_number(value)
         elif key == "active_agents" and isinstance(value, list):
             counts[key] = [_clip_text(item, 40) for item in value[:32]]
     trimmed = {
@@ -2919,10 +2988,16 @@ def dump_status_json(data: Dict[str, Any]) -> str:
         "workspaces": [],
         "truncated": True,
     }
-    text = json.dumps(trimmed, indent=2)
-    if len(text) > STATUS_MAX_BYTES:
-        # Fixed-shape last resort: cannot grow with any input.
-        text = json.dumps({"ok": True, "connected": False, "summary": {"total": int(counts.get("total") or 0)}, "agents": [], "workspaces": [], "truncated": True})
+    text = _dumps(trimmed)
+    if not text or len(text) > STATUS_MAX_BYTES:
+        text = _dumps({
+            "ok": True,
+            "connected": False,
+            "summary": {"total": _bounded_number(counts.get("total") or 0)},
+            "agents": [],
+            "workspaces": [],
+            "truncated": True,
+        })
     return text
 
 

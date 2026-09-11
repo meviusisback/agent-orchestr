@@ -580,16 +580,25 @@ class TestMarkerAndBudget(GrokFixtureCase):
         self.assertIsNotNone(ac.grok_active_session_for_pid(os.getpid()))
         self.assertEqual(ac._GROK_BUDGET.bytes_read, bytes_after_first)
 
-    def test_read_is_clamped_to_remaining_allowance(self):
+    def test_whole_file_read_refused_when_allowance_is_smaller(self):
+        """A read that the remaining allowance would truncate is refused outright.
+
+        Accepting the prefix would mean parsing half a JSON document (or, for a
+        marker, a wrong path), so the reader fails closed instead of guessing.
+        """
         sid = str(uuid.uuid4())
         session_dir = self.make_session("group", sid)
         path = os.path.join(session_dir, "summary.json")
+        size = os.path.getsize(path)
+        self.assertGreater(size, 10)
         ac._GROK_BUDGET.reset()
-        ac._GROK_BUDGET.bytes_read = ac.GROK_CYCLE_MAX_BYTES - 5
+        ac._GROK_BUDGET.bytes_read = ac.GROK_CYCLE_MAX_BYTES - (size - 1)
+        self.assertIsNone(ac.grok_read_bytes(path, ac.GROK_SUMMARY_MAX_BYTES))
+        ac._GROK_BUDGET.reset()
+        ac._GROK_BUDGET.bytes_read = ac.GROK_CYCLE_MAX_BYTES - size
         data = ac.grok_read_bytes(path, ac.GROK_SUMMARY_MAX_BYTES)
-        self.assertIsNotNone(data)
-        self.assertLessEqual(len(data), 5)
-        self.assertLessEqual(ac._GROK_BUDGET.bytes_read, ac.GROK_CYCLE_MAX_BYTES + 1)
+        self.assertEqual(len(data), size)
+        self.assertLessEqual(ac._GROK_BUDGET.bytes_read, ac.GROK_CYCLE_MAX_BYTES)
 
 
 class TestLargeEventsAndStatusPayload(GrokFixtureCase):
@@ -634,18 +643,72 @@ class TestLargeEventsAndStatusPayload(GrokFixtureCase):
         self.assertLessEqual(len(parsed["summary"]["headline"]), 300)
 
     def test_hostile_large_markers_do_not_starve_real_reads(self):
-        """A tree of maximum-size markers must not eat the session read budget."""
+        """A tree of maximum-size markers must not hide a real long-path card."""
         target_cwd = "/home/agent/wanted"
         for i in range(200):
             self.make_session("hostile-%03d" % i, str(uuid.uuid4()), cwd_marker="x" * ac.GROK_CWD_MARKER_MAX_BYTES)
         session_dir = self.make_session("hostile-target", str(uuid.uuid4()), cwd_marker=target_cwd, summary={"generated_title": "real work"})
         ac._GROK_BUDGET.reset()
-        ac.grok_sessions_for_cwd(target_cwd)
+        found = ac.grok_sessions_for_cwd(target_cwd)
+        # The marker allowance is sized for the whole group scan, so the real
+        # session is still discovered after a flood of maximum-size markers.
+        self.assertIn(session_dir, found)
         self.assertFalse(ac._GROK_BUDGET.exhausted(), "budget exhausted by markers at %d bytes" % ac._GROK_BUDGET.bytes_read)
-        # The marker allowance caps the marker cost; a real summary still reads.
         self.assertLessEqual(ac._GROK_BUDGET.marker_bytes, ac.GROK_MARKER_MAX_TOTAL_BYTES)
         prompt, _, _, _, _ = ac.extract_grok_task_from_session(session_dir)
         self.assertEqual(prompt, "real work")
+
+    def test_marker_groups_cannot_hijack_the_encoded_group(self):
+        """A marker merely claiming the cwd must not outrank the encoded group."""
+        cwd = "/home/agent/shared"
+        legit = self.make_session(ac.quote(cwd, safe=""), str(uuid.uuid4()), summary={"generated_title": "legit"}, events=[{"type": "permission_requested", "tool_name": "bash"}])
+        for i in range(4):
+            plant = self.make_session("plant-%d" % i, str(uuid.uuid4()), cwd_marker=cwd, summary={"generated_title": "HIJACK"})
+            os.utime(os.path.join(plant, "summary.json"), (10 ** 6, 10 ** 6))  # far newer
+        ac._GROK_BUDGET.reset()
+        found = ac.grok_sessions_for_cwd(cwd)
+        self.assertEqual(found[0], legit)
+        _, _, _, status, _ = ac.extract_grok_task_from_session(found[0])
+        self.assertEqual(status, "waiting")
+
+    def test_truncated_marker_is_never_accepted(self):
+        self.make_session("slug", str(uuid.uuid4()), cwd_marker="/home/agent/project-with-a-long-name")
+        group = os.path.join(self.tmp, "sessions", "slug")
+        ac._GROK_BUDGET.reset()
+        ac._GROK_BUDGET.marker_bytes = ac.GROK_MARKER_MAX_TOTAL_BYTES - 10
+        self.assertIsNone(ac.grok_read_marker_bytes(os.path.join(group, ".cwd")))
+        self.assertIsNone(ac.grok_group_cwd_marker(group))
+
+    def test_partial_budget_still_reads_the_newest_event(self):
+        """A clamped tail read must return the NEWEST bytes, not the oldest."""
+        sid = str(uuid.uuid4())
+        session_dir = self.make_session("group", sid, events=[{"type": "turn_started"}, {"type": "turn_ended", "outcome": "completed"}])
+        ac._GROK_BUDGET.reset()
+        ac._GROK_BUDGET.bytes_read = ac.GROK_CYCLE_MAX_BYTES - 5000
+        _, _, _, status, _ = ac.extract_grok_task_from_session(session_dir)
+        self.assertEqual(status, "completed")
+
+    def test_control_bytes_are_stripped_from_prompt_and_turn_summary(self):
+        sid = str(uuid.uuid4())
+        session_dir = self.make_session(
+            "group",
+            sid,
+            summary={"generated_title": "t", "last_turn_summary": "\x1b[31mRED\x07\x00DONE"},
+            events=[{"type": "turn_started"}, {"type": "turn_ended"}],
+            history=[{"type": "user", "content": "\x1b]8;;http://evil.example/x\x07CLICK\x1b]8;;\x07 \x00prompt"}],
+        )
+        prompt, detail, _, status, _ = ac.extract_grok_task_from_session(session_dir)
+        for value in (prompt, detail):
+            self.assertFalse(any(ch in value for ch in ("\x1b", "\x07", "\x00")), repr(value))
+        self.assertIn("CLICK", prompt)
+        self.assertIn("DONE", detail)
+
+    def test_status_payload_survives_pathological_numbers(self):
+        text = ac.dump_status_json({"ok": True, "summary": {"total": 10 ** 6000, "headline": "h"}, "agents": [], "workspaces": []})
+        self.assertLessEqual(len(text), ac.STATUS_MAX_BYTES)
+        json.loads(text)
+        text = ac.dump_status_json({"ok": True, "summary": {"total": {1, 2}}, "agents": [], "workspaces": []})
+        json.loads(text)
 
     def test_marker_with_nul_or_space_is_rejected(self):
         for marker in ["/tmp/a\x00b", "/tmp/a b", "/tmp/a\nb"]:
