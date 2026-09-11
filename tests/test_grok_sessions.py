@@ -537,7 +537,7 @@ class TestMarkerAndBudget(GrokFixtureCase):
         self.assertIsNone(ac.grok_group_cwd_marker(group))
 
     def test_marker_with_ansi_and_secret_is_cleaned(self):
-        self.make_session("slug", str(uuid.uuid4()), cwd_marker="/tmp/proj\x1b[31m sk-abcdefghijklmnopqrstuvwx\x1b[0m")
+        self.make_session("slug", str(uuid.uuid4()), cwd_marker="/tmp/proj-sk-abcdefghijklmnopqrstuvwx\x1b[31m\x1b[0m")
         group = os.path.join(self.tmp, "sessions", "slug")
         marker = ac.grok_group_cwd_marker(group)
         self.assertIsNotNone(marker)
@@ -617,12 +617,51 @@ class TestLargeEventsAndStatusPayload(GrokFixtureCase):
         parsed = json.loads(text)
         self.assertEqual(len(parsed["agents"]), ac.STATUS_MAX_AGENTS)
 
+    def test_status_payload_overflow_in_summary_only(self):
+        """An oversized headline (not agents) must still respect the ceiling."""
+        payload = {
+            "ok": True,
+            "connected": False,
+            "summary": {"total": 1, "working": 1, "headline": "Grok: " + "y" * 900000},
+            "agents": [{"pane_id": "p", "title": "t", "detail": "d"}],
+            "workspaces": ["w"],
+        }
+        text = ac.dump_status_json(payload)
+        self.assertLessEqual(len(text), ac.STATUS_MAX_BYTES)
+        # What the panel actually does: slice, then parse — the headline is clipped
+        # rather than allowed to blow the reply past the panel's own truncation.
+        parsed = json.loads(text[:ac.STATUS_MAX_BYTES])
+        self.assertLessEqual(len(parsed["summary"]["headline"]), 300)
+
+    def test_hostile_large_markers_do_not_starve_real_reads(self):
+        """A tree of maximum-size markers must not eat the session read budget."""
+        target_cwd = "/home/agent/wanted"
+        for i in range(200):
+            self.make_session("hostile-%03d" % i, str(uuid.uuid4()), cwd_marker="x" * ac.GROK_CWD_MARKER_MAX_BYTES)
+        session_dir = self.make_session("hostile-target", str(uuid.uuid4()), cwd_marker=target_cwd, summary={"generated_title": "real work"})
+        ac._GROK_BUDGET.reset()
+        ac.grok_sessions_for_cwd(target_cwd)
+        self.assertFalse(ac._GROK_BUDGET.exhausted(), "budget exhausted by markers at %d bytes" % ac._GROK_BUDGET.bytes_read)
+        # The marker allowance caps the marker cost; a real summary still reads.
+        self.assertLessEqual(ac._GROK_BUDGET.marker_bytes, ac.GROK_MARKER_MAX_TOTAL_BYTES)
+        prompt, _, _, _, _ = ac.extract_grok_task_from_session(session_dir)
+        self.assertEqual(prompt, "real work")
+
+    def test_marker_with_nul_or_space_is_rejected(self):
+        for marker in ["/tmp/a\x00b", "/tmp/a b", "/tmp/a\nb"]:
+            self.make_session("slug-nul", str(uuid.uuid4()), cwd_marker=marker)
+            group = os.path.join(self.tmp, "sessions", "slug-nul")
+            ac._GROK_BUDGET.reset()
+            self.assertIsNone(ac.grok_group_cwd_marker(group), repr(marker))
+
     def test_status_payload_falls_back_to_valid_json(self):
+        """When clipping still cannot fit, the reply degrades to counts only."""
+        bulky = {("field%02d" % n): "y" * 400 for n in range(40)}
         payload = {
             "ok": True,
             "connected": True,
-            "summary": {"total": 1},
-            "agents": [{"pane_id": "p", "title": "y" * 40000} for _ in range(256)],
+            "summary": {"total": 1, "headline": "z" * 400},
+            "agents": [dict(bulky, pane_id="p%d" % i) for i in range(256)],
             "workspaces": [],
         }
         text = ac.dump_status_json(payload)
@@ -630,6 +669,8 @@ class TestLargeEventsAndStatusPayload(GrokFixtureCase):
         parsed = json.loads(text)
         self.assertTrue(parsed.get("truncated"))
         self.assertEqual(parsed["agents"], [])
+        # The panel's own slice-then-parse stays valid too.
+        json.loads(text[:ac.STATUS_MAX_BYTES])
 
 
 if __name__ == "__main__":
