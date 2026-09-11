@@ -304,10 +304,13 @@ GROK_MAX_GROUP_ENTRIES = 512
 # session. Marker bytes are a separate bucket, so they never starve the session
 # summary/events reads that share the main cycle budget.
 GROK_MARKER_MAX_TOTAL_BYTES = GROK_MAX_GROUP_DIRS * GROK_CWD_MARKER_MAX_BYTES
-# How many marker-matched groups may be enumerated for one cwd. Markers are
-# attacker-controllable text, so a pile of groups all claiming the same cwd must
-# not be able to spend the cycle budget (or take over the card) by volume.
-GROK_MAX_MATCHED_GROUPS = 8
+# How many marker-matched groups may be enumerated for one cwd, and how many
+# sessions are taken from each. Markers are attacker-controllable text, so a pile
+# of groups all claiming the same cwd must not be able to spend the cycle budget
+# (or take over the card) by volume. Claiming groups are ranked by their newest
+# session first, so the most recent real session still wins the cap.
+GROK_MAX_MATCHED_GROUPS = 32
+GROK_MAX_MATCHED_SESSIONS = 32
 GROK_CYCLE_MAX_BYTES = 2 * 1024 * 1024
 # A marker-bearing tree of GROK_MAX_GROUP_DIRS groups costs ~3 ops per group for
 # the trust walks plus one listing, so 512 groups need ~1.6k ops; the ceiling is
@@ -924,20 +927,31 @@ def grok_sessions_for_cwd(cwd: str) -> List[str]:
         found.sort(key=grok_summary_mtime, reverse=True)
         return found
 
-    matched = 0
+    # Fallback: groups whose `.cwd` marker claims this cwd (the slug+hash layout
+    # Grok uses for very long paths). Marker content is local file text, so a group
+    # that merely claims the directory must not crowd out the real session: claiming
+    # groups are ranked by their newest session BEFORE the cap is applied, and the
+    # final list is ordered by recency — the heuristic the cwd fallback documents.
+    candidates: List[Tuple[float, str]] = []
     for group in grok_group_dirs():
-        if group in fast_folders or matched >= GROK_MAX_MATCHED_GROUPS:
+        if group in fast_folders or grok_group_cwd(group) not in wanted:
             continue
-        if grok_group_cwd(group) not in wanted:
-            continue
-        matched += 1
+        newest = max((grok_summary_mtime(os.path.join(group, name)) for name in grok_listdir(group)), default=0.0)
+        candidates.append((newest, group))
+    candidates.sort(reverse=True)
+
+    found = []
+    for _, group in candidates[:GROK_MAX_MATCHED_GROUPS]:
         group_found: List[str] = []
         for name in grok_listdir(group):
+            if len(group_found) >= GROK_MAX_MATCHED_SESSIONS:
+                break
             path = os.path.join(group, name)
             if grok_is_regular_file(os.path.join(path, "summary.json")) and not grok_session_is_subagent(path):
                 group_found.append(path)
         group_found.sort(key=grok_summary_mtime, reverse=True)
-        found.extend(group_found)
+        found.extend(group_found[:GROK_MAX_MATCHED_SESSIONS])
+    found.sort(key=grok_summary_mtime, reverse=True)
     return found
 
 

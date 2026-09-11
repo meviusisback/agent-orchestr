@@ -180,7 +180,12 @@ can neither disable refresh nor be left behind.
 > documented URL-encoding plus the `.cwd` marker; the `session_kind` values that
 > mark subagent sessions are likewise taken from the documented layout. Both
 > degrade to a missing card, never a wrong one — and PID-resolved sessions do
-> not depend on either. A single event line larger than 512 KiB is still skipped
+> not depend on either. The cwd-only fallback cannot bind a session to a process:
+> it considers at most 32 `.cwd`-claiming groups and the 32 newest sessions in
+> each, ranked by recency, so the newest session in that directory is what an
+> Orca/Herdr card shows and a locally planted newer session there would win that
+> card (PID-resolved cards never look at markers). A single event line larger than
+> 512 KiB is still skipped
 > (the window stops widening there), and the per-cycle budget is a bound on work,
 > not a promise that every card is enriched when a tree is pathological. The path
 > guard reads POSIX mode bits, so a directory whose write access comes only from

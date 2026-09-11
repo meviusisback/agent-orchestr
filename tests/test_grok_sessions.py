@@ -671,6 +671,30 @@ class TestLargeEventsAndStatusPayload(GrokFixtureCase):
         _, _, _, status, _ = ac.extract_grok_task_from_session(found[0])
         self.assertEqual(status, "waiting")
 
+    def test_marker_matches_rank_by_recency(self):
+        """A name-sorting decoy must not outrank a newer real session."""
+        cwd = "/home/agent/long-path-project"
+        decoy = self.make_session("aaa-decoy", str(uuid.uuid4()), cwd_marker=cwd, summary={"generated_title": "HIJACK"})
+        legit = self.make_session("zzz-legit", str(uuid.uuid4()), cwd_marker=cwd, summary={"generated_title": "real work"})
+        os.utime(os.path.join(decoy, "summary.json"), (1000, 1000))
+        os.utime(os.path.join(legit, "summary.json"), (2 * 10 ** 6, 2 * 10 ** 6))
+        ac._GROK_BUDGET.reset()
+        found = ac.grok_sessions_for_cwd(cwd)
+        self.assertEqual(found[0], legit)
+
+    def test_many_claiming_groups_do_not_hide_the_newest_real_session(self):
+        """The 32-claiming-group cap is applied after ranking, so recency wins."""
+        cwd = "/home/agent/contested"
+        for i in range(40):
+            plant = self.make_session("claim-%03d" % i, str(uuid.uuid4()), cwd_marker=cwd, summary={"generated_title": "plant"})
+            os.utime(os.path.join(plant, "summary.json"), (1000, 1000))
+        legit = self.make_session("zzz-legit", str(uuid.uuid4()), cwd_marker=cwd, summary={"generated_title": "real work"})
+        os.utime(os.path.join(legit, "summary.json"), (2 * 10 ** 6, 2 * 10 ** 6))
+        ac._GROK_BUDGET.reset()
+        found = ac.grok_sessions_for_cwd(cwd)
+        self.assertEqual(found[0], legit)
+        self.assertLessEqual(len(found), ac.GROK_MAX_MATCHED_GROUPS * ac.GROK_MAX_MATCHED_SESSIONS)
+
     def test_truncated_marker_is_never_accepted(self):
         self.make_session("slug", str(uuid.uuid4()), cwd_marker="/home/agent/project-with-a-long-name")
         group = os.path.join(self.tmp, "sessions", "slug")
