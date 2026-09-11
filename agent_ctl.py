@@ -382,6 +382,32 @@ def get_process_open_session(pid: int) -> Optional[str]:
 def read_claude_hook_status(pid: int) -> Optional[Dict[str, str]]:
     """Read the live status Claude Code's own hooks wrote for this PID."""
     path = os.path.join(CLAUDE_HOOK_STATUS_DIR, f"{pid}.json")
+
+    # Owner and symlink checks: verify the directory is not a symlink, is owned
+    # by the current user, and that none of its ancestor directories are symlinks.
+    try:
+        if os.path.islink(CLAUDE_HOOK_STATUS_DIR):
+            return None
+        if os.stat(CLAUDE_HOOK_STATUS_DIR).st_uid != os.getuid():
+            return None
+        # Check ancestors for symlinks
+        check_dir = CLAUDE_HOOK_STATUS_DIR
+        while check_dir != os.path.expanduser("~") and check_dir != "/":
+            parent = os.path.dirname(check_dir)
+            if os.path.islink(parent):
+                return None
+            try:
+                if os.stat(parent).st_uid != os.getuid():
+                    return None
+            except Exception:
+                return None
+            check_dir = parent
+        # Verify the file itself is not a symlink
+        if os.path.islink(path):
+            return None
+    except Exception:
+        return None
+
     try:
         with open(path, "r", encoding="utf-8") as f:
             data = json.load(f)
