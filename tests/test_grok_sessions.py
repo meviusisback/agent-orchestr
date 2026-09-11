@@ -1,0 +1,365 @@
+#!/usr/bin/env python3
+"""Fixture tests for Grok Build session discovery in agent_ctl.py.
+
+Hermetic by construction: every case points GROK_HOME at a fresh temporary
+directory, so the suite never reads the real ~/.grok, never touches the network,
+hyprctl, Orca or Herdr, and never calls fetch_all_agents(). Only the pure Grok
+helpers run here, which keeps this safe to execute on a live desktop.
+
+Run:  python3 tests/test_grok_sessions.py
+"""
+
+import importlib.util
+import json
+import os
+import shutil
+import sys
+import tempfile
+import unittest
+import uuid
+from unittest import mock
+
+REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+
+def _load_agent_ctl():
+    """Import agent_ctl.py from the repo without installing it as a package."""
+    spec = importlib.util.spec_from_file_location("agent_ctl_under_test", os.path.join(REPO_ROOT, "agent_ctl.py"))
+    assert spec is not None and spec.loader is not None, "cannot load agent_ctl.py"
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+ac = _load_agent_ctl()
+
+# Long path whose URL-encoded form far exceeds the 255-byte group-name limit,
+# i.e. the case Grok stores as a slug+hash group with a `.cwd` marker file.
+LONG_CWD = "/home/agent/very/deep/" + "/".join("segment-%02d-abcdefghijklmnopqrstuvwxyz" % i for i in range(12))
+
+
+class GrokFixtureCase(unittest.TestCase):
+    """Common fixture helpers: temp GROK_HOME, session/event writers."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="grok-test-")
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        patcher = mock.patch.dict(os.environ, {"GROK_HOME": self.tmp})
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        ac._GROK_BUDGET.reset()
+
+    # -- writers -----------------------------------------------------------
+    def make_session(self, group, session_id, summary=None, events=None, history=None, cwd_marker=None):
+        group_dir = os.path.join(self.tmp, "sessions", group)
+        session_dir = os.path.join(group_dir, session_id)
+        os.makedirs(session_dir, exist_ok=True)
+        with open(os.path.join(session_dir, "summary.json"), "w", encoding="utf-8") as f:
+            json.dump(summary if summary is not None else {"current_model_id": "grok-4.6", "generated_title": "Fix the build"}, f)
+        if events is not None:
+            with open(os.path.join(session_dir, "events.jsonl"), "w", encoding="utf-8") as f:
+                for entry in events:
+                    f.write(json.dumps(entry) + "\n")
+        if history is not None:
+            with open(os.path.join(session_dir, "chat_history.jsonl"), "w", encoding="utf-8") as f:
+                for entry in history:
+                    f.write(json.dumps(entry) + "\n")
+        if cwd_marker is not None:
+            with open(os.path.join(group_dir, ".cwd"), "w", encoding="utf-8") as f:
+                f.write(cwd_marker)
+        return session_dir
+
+    def write_roster(self, rows):
+        with open(os.path.join(self.tmp, "active_sessions.json"), "w", encoding="utf-8") as f:
+            json.dump(rows, f)
+
+
+class TestInvocationClassification(GrokFixtureCase):
+    def test_cli_verbs_are_not_sessions(self):
+        for verb in ac.GROK_HELPER_SUBCOMMANDS:
+            self.assertTrue(ac.is_grok_helper_process("grok %s" % verb, ["grok", verb]), verb)
+
+    def test_interactive_forms_are_sessions(self):
+        cases = [
+            ["grok"],
+            ["grok", "--resume"],
+            ["grok", "--resume", "some-title"],
+            ["grok", "--session-id", str(uuid.uuid4())],
+            ["grok", "fix the failing test"],
+            ["grok", "agent loop rewrite"],  # prompt text, not the `agent` verb
+        ]
+        for argv in cases:
+            self.assertFalse(ac.is_grok_helper_process(" ".join(argv), argv), argv)
+
+    def test_headless_and_info_invocations_are_not_sessions(self):
+        cases = [
+            ["grok", "-p", "hi"],
+            ["grok", "--single", "hi"],
+            ["grok", "--prompt-file", "/tmp/p.txt"],
+            ["grok", "--prompt-json", "[]"],
+            ["grok", "--output-format", "json", "hi"],
+            ["grok", "--json-schema", "{}"],
+            ["grok", "-v"],
+            ["grok", "--version"],
+            ["grok", "-h"],
+            ["grok", "--help"],
+            ["grok", "--show-current"],
+        ]
+        for argv in cases:
+            self.assertTrue(ac.is_grok_helper_process(" ".join(argv), argv), argv)
+
+    def test_headless_flag_late_in_argv_is_still_detected(self):
+        argv = ["grok", "--model", "grok-4.6", "--cwd", "/tmp", "-p", "hi"]
+        self.assertTrue(ac.is_grok_helper_process(" ".join(argv), argv))
+
+    def test_other_binaries_are_ignored(self):
+        self.assertFalse(ac.is_grok_helper_process("claude daemon", ["claude", "daemon"]))
+        self.assertFalse(ac.is_grok_helper_process("node /usr/bin/grok", ["node", "/usr/bin/grok"]))
+
+    def test_cwd_override_detection(self):
+        self.assertTrue(ac.grok_argv_has_cwd_override(["grok", "--cwd", "/tmp"]))
+        self.assertTrue(ac.grok_argv_has_cwd_override(["grok", "--cwd=/tmp"]))
+        self.assertFalse(ac.grok_argv_has_cwd_override(["grok", "--resume"]))
+
+
+class TestSessionIdAndTraversal(GrokFixtureCase):
+    def test_validator_rejects_traversal_and_junk(self):
+        bad = ["", "..", "../..", "/etc/passwd", "abc", "%2e%2e", "..%2f..", "....", "x" * 8, "a" * 10000, "id\n"]
+        for value in bad:
+            self.assertIsNone(ac.GROK_SESSION_ID_RE.match(value), value)
+
+    def test_validator_accepts_uuid_shape(self):
+        self.assertIsNotNone(ac.GROK_SESSION_ID_RE.match(str(uuid.uuid4())))
+
+    def test_traversal_id_resolves_nothing(self):
+        outside = tempfile.mkdtemp(prefix="grok-outside-")
+        self.addCleanup(shutil.rmtree, outside, ignore_errors=True)
+        with open(os.path.join(outside, "summary.json"), "w", encoding="utf-8") as f:
+            json.dump({"generated_title": "secret"}, f)
+        os.makedirs(os.path.join(self.tmp, "sessions"), exist_ok=True)
+        self.assertIsNone(ac.grok_session_dir_for_id("/tmp", "../../" + os.path.basename(outside)))
+        self.assertIsNone(ac.grok_session_dir_for_id("/tmp", "/etc"))
+
+
+class TestRosterResolution(GrokFixtureCase):
+    def test_pid_maps_to_session_without_matching_the_group_name(self):
+        """The session id is the key, so a slug+hash group still resolves."""
+        sid = str(uuid.uuid4())
+        session_dir = self.make_session("slug-8f2a1b3c", sid, summary={"current_model_id": "grok-4.6"})
+        self.write_roster([{"session_id": sid, "pid": os.getpid(), "cwd": "/home/agent/project", "opened_at": "2026-09-11T10:00:00Z"}])
+        self.assertEqual(ac.grok_active_session_for_pid(os.getpid()), session_dir)
+
+    def test_encoded_group_fast_path(self):
+        sid = str(uuid.uuid4())
+        cwd = "/home/agent/project"
+        session_dir = self.make_session(ac.quote(cwd, safe=""), sid)
+        self.write_roster([{"session_id": sid, "pid": os.getpid(), "cwd": cwd, "opened_at": "x"}])
+        self.assertEqual(ac.grok_active_session_for_pid(os.getpid()), session_dir)
+
+    def test_other_pid_is_not_matched(self):
+        sid = str(uuid.uuid4())
+        self.make_session("group", sid)
+        self.write_roster([{"session_id": sid, "pid": 999999, "cwd": "/tmp", "opened_at": "x"}])
+        self.assertIsNone(ac.grok_active_session_for_pid(os.getpid()))
+
+    def test_malformed_roster_is_ignored(self):
+        with open(os.path.join(self.tmp, "active_sessions.json"), "w", encoding="utf-8") as f:
+            f.write('{"session_id": "truncated')
+        self.assertIsNone(ac.grok_active_session_for_pid(os.getpid()))
+
+    def test_roster_rows_with_traversal_ids_are_dropped(self):
+        self.make_session("group", str(uuid.uuid4()))
+        self.write_roster([{"session_id": "../../etc", "pid": os.getpid(), "cwd": "/tmp", "opened_at": "x"}])
+        self.assertIsNone(ac.grok_active_session_for_pid(os.getpid()))
+
+    def test_oversized_roster_is_refused(self):
+        big = [{"session_id": str(uuid.uuid4()), "pid": os.getpid(), "cwd": "/tmp", "opened_at": "x" * 4096} for _ in range(128)]
+        self.write_roster(big)
+        self.assertGreater(os.path.getsize(os.path.join(self.tmp, "active_sessions.json")), ac.GROK_ROSTER_MAX_BYTES)
+        self.assertIsNone(ac.grok_active_session_for_pid(os.getpid()))
+
+    def test_subagent_session_is_skipped(self):
+        sid = str(uuid.uuid4())
+        self.make_session("group", sid, summary={"current_model_id": "grok-4.6", "session_kind": "subagent:explorer"})
+        self.write_roster([{"session_id": sid, "pid": os.getpid(), "cwd": "/tmp", "opened_at": "x"}])
+        self.assertIsNone(ac.grok_active_session_for_pid(os.getpid()))
+
+
+class TestPathIntegrity(GrokFixtureCase):
+    def test_symlinked_session_dir_is_not_trusted(self):
+        outside = tempfile.mkdtemp(prefix="grok-outside-")
+        self.addCleanup(shutil.rmtree, outside, ignore_errors=True)
+        sid = str(uuid.uuid4())
+        with open(os.path.join(outside, "summary.json"), "w", encoding="utf-8") as f:
+            json.dump({"generated_title": "outside"}, f)
+        group = os.path.join(self.tmp, "sessions", "group")
+        os.makedirs(group, exist_ok=True)
+        os.symlink(outside, os.path.join(group, sid))
+        self.write_roster([{"session_id": sid, "pid": os.getpid(), "cwd": "/tmp", "opened_at": "x"}])
+        self.assertFalse(ac.grok_trusted_path(os.path.join(group, sid)))
+        self.assertIsNone(ac.grok_active_session_for_pid(os.getpid()))
+        self.assertEqual(ac.extract_grok_task_from_session(os.path.join(group, sid)), (None, None, None, None, False))
+
+    def test_symlinked_summary_file_is_not_read(self):
+        sid = str(uuid.uuid4())
+        session_dir = self.make_session("group", sid, summary={"generated_title": "real"})
+        outside = tempfile.mkdtemp(prefix="grok-outside-")
+        self.addCleanup(shutil.rmtree, outside, ignore_errors=True)
+        decoy = os.path.join(outside, "summary.json")
+        with open(decoy, "w", encoding="utf-8") as f:
+            json.dump({"generated_title": "decoy"}, f)
+        os.remove(os.path.join(session_dir, "summary.json"))
+        os.symlink(decoy, os.path.join(session_dir, "summary.json"))
+        self.assertIsNone(ac.grok_read_json(os.path.join(session_dir, "summary.json"), ac.GROK_SUMMARY_MAX_BYTES))
+
+    def test_path_outside_grok_home_is_not_trusted(self):
+        outside = tempfile.mkdtemp(prefix="grok-outside-")
+        self.addCleanup(shutil.rmtree, outside, ignore_errors=True)
+        self.assertFalse(ac.grok_trusted_path(outside))
+
+    def test_group_world_writable_is_not_trusted(self):
+        sid = str(uuid.uuid4())
+        group = os.path.join(self.tmp, "sessions", "group")
+        self.make_session("group", sid)
+        os.chmod(group, 0o777)
+        self.addCleanup(os.chmod, group, 0o755)
+        self.assertFalse(ac.grok_trusted_path(os.path.join(group, sid)))
+
+
+class TestCwdResolution(GrokFixtureCase):
+    def test_encoded_group_finds_session(self):
+        cwd = "/home/agent/project"
+        sid = str(uuid.uuid4())
+        session_dir = self.make_session(ac.quote(cwd, safe=""), sid)
+        self.assertEqual(ac.grok_sessions_for_cwd(cwd), [session_dir])
+
+    def test_long_cwd_group_is_found_via_cwd_marker(self):
+        sid = str(uuid.uuid4())
+        session_dir = self.make_session("slug-abc123-deadbeef", sid, cwd_marker=LONG_CWD)
+        self.assertGreater(len(ac.quote(LONG_CWD, safe="")), 255)
+        self.assertEqual(ac.grok_sessions_for_cwd(LONG_CWD), [session_dir])
+
+    def test_unrelated_group_is_not_matched(self):
+        cwd = "/home/agent/project"
+        sid = str(uuid.uuid4())
+        self.make_session("some-other-group", sid, cwd_marker="/elsewhere")
+        self.assertEqual(ac.grok_sessions_for_cwd(cwd), [])
+
+    def test_newest_session_first(self):
+        cwd = "/home/agent/project"
+        group = ac.quote(cwd, safe="")
+        older = self.make_session(group, str(uuid.uuid4()))
+        newer = self.make_session(group, str(uuid.uuid4()))
+        os.utime(os.path.join(older, "summary.json"), (1000, 1000))
+        os.utime(os.path.join(newer, "summary.json"), (2000, 2000))
+        self.assertEqual(ac.grok_sessions_for_cwd(cwd), [newer, older])
+
+    def test_subagent_session_is_not_listed(self):
+        cwd = "/home/agent/project"
+        parent = self.make_session(ac.quote(cwd, safe=""), str(uuid.uuid4()), summary={"generated_title": "parent"})
+        self.make_session(ac.quote(cwd, safe=""), str(uuid.uuid4()), summary={"session_kind": "subagent:x"})
+        self.assertEqual(ac.grok_sessions_for_cwd(cwd), [parent])
+
+    def test_group_cwd_marker_read(self):
+        sid = str(uuid.uuid4())
+        self.make_session("slug-hash", sid, cwd_marker=LONG_CWD)
+        self.assertEqual(ac.grok_group_cwd(os.path.join(self.tmp, "sessions", "slug-hash")), LONG_CWD)
+        encoded = "/home/agent/project"
+        self.make_session(ac.quote(encoded, safe=""), str(uuid.uuid4()))
+        self.assertEqual(ac.grok_group_cwd(os.path.join(self.tmp, "sessions", ac.quote(encoded, safe=""))), encoded)
+
+
+class TestStatusMapping(GrokFixtureCase):
+    def extract(self, events=None, summary=None, history=None):
+        session_dir = self.make_session("group", str(uuid.uuid4()), summary=summary, events=events, history=history)
+        return ac.extract_grok_task_from_session(session_dir)
+
+    def test_permission_prompt_is_waiting(self):
+        prompt, detail, model, status, has_q = self.extract(events=[{"type": "phase_changed", "phase": "permission_prompt"}])
+        self.assertEqual(status, "waiting")
+        self.assertTrue(has_q)
+        self.assertIn("permission", detail.lower())
+
+    def test_permission_requested_is_waiting_with_tool(self):
+        _, detail, _, status, has_q = self.extract(events=[{"type": "permission_requested", "tool_name": "bash"}])
+        self.assertEqual(status, "waiting")
+        self.assertTrue(has_q)
+        self.assertIn("bash", detail)
+
+    def test_tool_execution_is_working(self):
+        _, detail, _, status, _ = self.extract(events=[{"type": "tool_started", "tool_name": "grep"}, {"type": "tool_completed", "tool_name": "grep"}, {"type": "phase_changed", "phase": "tool_execution"}])
+        self.assertEqual(status, "working")
+
+    def test_waiting_for_model_is_working(self):
+        _, detail, _, status, _ = self.extract(events=[{"type": "turn_started"}, {"type": "phase_changed", "phase": "waiting_for_model"}])
+        self.assertEqual(status, "working")
+        self.assertEqual(detail, "Thinking…")
+
+    def test_turn_ended_is_completed_with_turn_summary(self):
+        session_dir = self.make_session(
+            "group",
+            str(uuid.uuid4()),
+            summary={"current_model_id": "grok-4.6", "generated_title": "Fix build", "last_turn_summary": "Short answer given"},
+            events=[{"type": "turn_started"}, {"type": "turn_ended", "outcome": "completed"}],
+        )
+        _, detail, _, status, _ = ac.extract_grok_task_from_session(session_dir)
+        self.assertEqual(status, "completed")
+        self.assertEqual(detail, "Short answer given")
+
+    def test_no_events_is_idle(self):
+        _, detail, _, status, _ = self.extract()
+        self.assertEqual(status, "idle")
+        self.assertEqual(detail, "Ready for prompt")
+
+    def test_latest_user_prompt_wins_over_title(self):
+        prompt, _, _, _, _ = self.extract(
+            summary={"generated_title": "auto title"},
+            history=[{"type": "user", "content": "please fix the failing test"}, {"type": "assistant", "content": "ok"}],
+        )
+        self.assertEqual(prompt, "please fix the failing test")
+
+    def test_synthetic_and_secret_bearing_entries(self):
+        prompt, _, _, _, _ = self.extract(
+            summary={"generated_title": "auto title"},
+            history=[
+                {"type": "user", "content": "leak sk-abcdefghijklmnopqrstuvwx here"},
+                {"type": "user", "content": "synthetic", "synthetic_reason": "auto_continue"},
+            ],
+        )
+        self.assertIn("REDACTED", prompt)
+        self.assertNotIn("abcdefghijklmnopqrstuvwx", prompt)
+
+    def test_model_and_title_from_summary(self):
+        prompt, _, model, _, _ = self.extract(summary={"current_model_id": "xai/grok-4.6", "generated_title": "Rename helper"})
+        self.assertEqual(model, "grok-4.6")
+        self.assertEqual(prompt, "Rename helper")
+
+    def test_oversized_summary_is_refused_but_events_still_read(self):
+        session_dir = self.make_session("group", str(uuid.uuid4()), events=[{"type": "turn_ended"}])
+        with open(os.path.join(session_dir, "summary.json"), "w", encoding="utf-8") as f:
+            f.write(json.dumps({"generated_title": "x" * (ac.GROK_SUMMARY_MAX_BYTES + 16)}))
+        _, _, model, status, _ = ac.extract_grok_task_from_session(session_dir)
+        self.assertEqual(model, "")
+        self.assertEqual(status, "completed")
+
+
+class TestBudget(GrokFixtureCase):
+    def test_budget_stops_reads_and_listings(self):
+        sid = str(uuid.uuid4())
+        session_dir = self.make_session("group", sid)
+        ac._GROK_BUDGET.spend(ac.GROK_CYCLE_MAX_BYTES + 1)
+        self.assertTrue(ac._GROK_BUDGET.exhausted())
+        self.assertIsNone(ac.grok_read_json(os.path.join(session_dir, "summary.json"), ac.GROK_SUMMARY_MAX_BYTES))
+        self.assertEqual(ac.grok_listdir(os.path.join(self.tmp, "sessions")), [])
+        self.assertFalse(ac.grok_trusted_path(session_dir))
+
+    def test_cycle_reset_restores_reads(self):
+        sid = str(uuid.uuid4())
+        session_dir = self.make_session("group", sid)
+        ac._GROK_BUDGET.spend(ac.GROK_CYCLE_MAX_BYTES + 1)
+        ac._GROK_BUDGET.reset()
+        self.assertEqual(ac.grok_read_json(os.path.join(session_dir, "summary.json"), ac.GROK_SUMMARY_MAX_BYTES)["current_model_id"], "grok-4.6")
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)
