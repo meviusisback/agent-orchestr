@@ -30,6 +30,10 @@ Panel {
   readonly property string barDisplay: String(root.setting("barDisplay", "Icon"))
   readonly property bool showIdleInBar: Boolean(root.setting("showIdleInBar", false))
   readonly property int maxTaskLength: Math.max(20, Number(root.setting("maxTaskLength", 45)) || 45)
+  // Privacy option for screen-sharing: when on, no agent-supplied prompt/task
+  // text is rendered anywhere in the widget (bar ticker or card), only counts,
+  // status words and the repo breadcrumb. The collector still returns the text.
+  readonly property bool privacyHidePrompts: Boolean(root.setting("privacyHidePrompts", false))
 
   readonly property bool barShowsText: barDisplay.toLowerCase() === "status" || barDisplay.toLowerCase() === "compact"
 
@@ -280,7 +284,7 @@ Panel {
 
       Text {
         id: chipLabel
-        text: Model.formatBarHeadline(root.summary, root.barDisplay, root.maxTaskLength)
+        text: Model.formatBarHeadline(root.summary, root.barDisplay, root.maxTaskLength, root.privacyHidePrompts)
         textFormat: Text.PlainText
         font.family: root.fontFamily
         font.pixelSize: Style.font.caption || Style.space(11)
@@ -665,7 +669,7 @@ Panel {
               // Task Title
               Text {
                 Layout.fillWidth: true
-                text: modelData.title || "Active agent session"
+                text: root.privacyHidePrompts ? "Session details hidden" : (modelData.title || "Active agent session")
                 textFormat: Text.PlainText
                 font.family: root.fontFamily
                 font.pixelSize: Style.font.caption
@@ -678,7 +682,7 @@ Panel {
 
               // Activity Detail (if running tool, prompt question, or concluding tail)
               Text {
-                visible: Boolean(modelData.detail) && modelData.detail !== modelData.title
+                visible: !root.privacyHidePrompts && Boolean(modelData.detail) && modelData.detail !== modelData.title
                 Layout.fillWidth: true
                 text: modelData.detail || ""
                 textFormat: Text.PlainText

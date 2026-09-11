@@ -26,7 +26,8 @@
       "refreshIntervalSec": 3,
       "barDisplay": "Icon",
       "showIdleInBar": false,
-      "maxTaskLength": 45
+      "maxTaskLength": 45,
+      "privacyHidePrompts": false
     },
     "schema": [
       {
@@ -67,6 +68,13 @@
         "step": 5,
         "defaultValue": 45,
         "description": "Maximum characters shown in the bar ticker for active tasks."
+      },
+      {
+        "key": "privacyHidePrompts",
+        "type": "boolean",
+        "label": "Hide prompt text (screen sharing)",
+        "defaultValue": false,
+        "description": "Hide agent-supplied task and prompt text in the bar and cards, showing only counts, status and location — useful when recording or sharing your screen."
       }
     ]
   }

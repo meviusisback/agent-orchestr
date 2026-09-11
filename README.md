@@ -127,12 +127,44 @@ reads those files directly — no hook install is required.
 Interactive sessions are `grok`, `grok --resume …`, `grok --session-id …`, or
 `grok "<prompt>"`. CLI verbs (`grok login`, `grok mcp`, `grok agent`,
 `grok doctor`, …) share the same binary and are skipped by an exact `argv[1]`
-match, the same way Claude Code helpers are. The mise `node …/bin/grok` wrapper
-is not counted: its `argv[0]` is `node`. Forked `subagent*` sessions are skipped
-so the parent card is not doubled.
+match, the same way Claude Code helpers are. **Headless and info-only
+invocations are not sessions either** — `grok -p/--single`, `--prompt-file`,
+`--prompt-json`, `--output-format`, `--json-schema`, `-v/--version`,
+`-h/--help` and `--show-current` are recognised by exact token anywhere in the
+argument list, so a one-shot run never produces a card. The mise
+`node …/bin/grok` wrapper is not counted: its `argv[0]` is `node`. Forked
+`subagent*` sessions are skipped so the parent card is not doubled.
+
+A live session is resolved from the roster by **PID**, then by its session id,
+and only as a last resort by working directory — the session id is the reliable
+key, so concurrent sessions in one directory stay distinct and the layout Grok
+uses for very long paths (a slug+hash group with the real path in a `.cwd`
+marker file, used when the URL-encoded directory name exceeds 255 bytes) is
+found without guessing its name. When an invocation passes `--cwd`, the process
+working directory is ignored and the session's own directory is shown. A
+session that cannot be resolved gets no card rather than a wrong one.
 
 Status mapping: `streaming_*` / `tool_execution` → `working`; `permission_prompt`
-→ `waiting`; `turn_ended` → `completed`; otherwise `idle`.
+and an unanswered `permission_requested` → `waiting`; `turn_ended` →
+`completed`; otherwise `idle`.
+
+Everything read under `$GROK_HOME` goes through one guarded reader: it refuses
+symlinked, foreign-owned or group/world-writable paths, opens files with
+`O_NOFOLLOW`, verifies the opened file descriptor (owner, type, containment in
+`$GROK_HOME`), caps each file and the total work per refresh cycle, and memoizes
+parsed JSON per `(path, mtime, size)`. A malformed, half-written, oversized or
+planted file therefore degrades to "no detail" instead of a wrong card, a hang
+or a read outside the Grok data directory.
+
+> Known limits (honest, not aspirational): the exact byte-for-byte encoding Grok
+> uses for group names has not been captured on a live session, so cwd-only
+> resolution (used for Orca/Herdr panes, which have no PID) relies on the
+> documented URL-encoding plus the `.cwd` marker; the `session_kind` values that
+> mark subagent sessions are likewise taken from the documented layout. Both
+> degrade to a missing card, never a wrong one — and PID-resolved sessions do
+> not depend on either. The ancestor-path check cannot fully close a TOCTOU race
+> without an `openat` chain; the plugin is a local read-only collector, so that
+> residual is accepted rather than claimed fixed.
 
 ## Keybinding
 
@@ -165,7 +197,18 @@ omarchy shell meviusisback.agent-orchestr refresh
 | `refreshIntervalSec` | `3` | Polling frequency in seconds |
 | `showIdleInBar` | `false` | Whether to display badge count when all agents are idle |
 | `maxTaskLength` | `45` | Maximum characters shown in the bar status ticker |
+| `privacyHidePrompts` | `false` | Hide agent-supplied prompt/task text in the bar and cards (counts, status and location only) — for screen sharing and recordings |
 
+
+## Tests
+
+`agent_ctl.py` ships a hermetic fixture suite for the Grok collector. It points
+`GROK_HOME` at a temporary directory, touches no network, no `hyprctl`, no Orca
+and no real `~/.grok`, and never runs a full `fetch_all_agents()` cycle:
+
+```bash
+python3 tests/test_grok_sessions.py
+```
 
 ## Security & Privacy
 
@@ -173,6 +216,8 @@ omarchy shell meviusisback.agent-orchestr refresh
 - **Automatic Secret Redaction**: Prompts and status lines automatically redact API keys (OpenAI, Anthropic, OpenRouter, Groq), GitHub tokens, AWS keys, and Bearer tokens before UI rendering or IPC output.
 - **Read-Only SQLite & Session Parsing**: Hermes databases are queried strictly with `?mode=ro`, and OMP transcripts are parsed in read-only mode.
 - **Validated Hook Input**: Claude Code status files are trusted only when they carry a known status value and a fresh timestamp, and their detail line passes through the same redaction as every other agent detail.
+- **Guarded Grok Session Reads**: Everything read under `$GROK_HOME` is refused unless the whole path chain is user-owned, not a symlink and not group/world-writable; files are opened with `O_NOFOLLOW` and the opened descriptor is re-verified (owner, type, containment) before any bytes are read. Session ids from `active_sessions.json` are validated as UUIDs before they are used in a path, per-file sizes and total work per refresh cycle are capped, and anything that fails degrades to *no card* rather than a wrong one.
+- **Prompt Hiding Option**: `privacyHidePrompts` keeps agent-supplied prompt and task text out of the bar ticker and the cards entirely (counts, status and location only) for screen sharing or recordings. Secret redaction stays on regardless.
 - **Safe Process Signaling**: Process termination verifies the target PID against active AI agent process signatures before signaling.
 - **Shell & Injection Safety**: All subprocess and Hyprland dispatch operations use discrete argument vectors without shell evaluation, and QML Text components enforce plain-text formatting.
 - **Plain-Text Convention**: Every `Text` element in `Panel.qml` must declare `textFormat: Text.PlainText` explicitly — agent-supplied strings (titles, labels, paths) must never render through QML's default `AutoText`, which would interpret rich-text markup as shell UI. New widgets should preserve this invariant.
