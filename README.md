@@ -159,13 +159,17 @@ symlinked, foreign-owned or group/world-writable paths, opens files with
 `O_NOFOLLOW | O_NONBLOCK`, and verifies the opened file descriptor (owner,
 regular file, single hard link, size cap, containment in `$GROK_HOME`) before
 reading. It caps each file and the total work per refresh cycle, memoizes parsed
-JSON and directory listings per `(path, mtime, size)` for the cycle, and treats
-every string it returns — including event tool names — as untrusted UI text
-through the same secret redaction as the rest of the plugin. A malformed,
-half-written, oversized, hard-linked or planted file therefore degrades to "no
-detail" instead of a wrong card, a hang or a read outside the Grok data
-directory. A stalled collector tick is also bounded by a watchdog in the panel,
-so a wedged helper cannot disable refresh until the shell restarts.
+JSON, the group list and the group → `.cwd` mapping for the cycle, and widens a
+JSONL tail when the window would otherwise start inside a line — the newest
+events decide the status, so a large-but-valid event must not be lost. Every
+string it returns is treated as untrusted UI text through the same secret
+redaction as the rest of the plugin: prompts, titles, event tool names, the model
+id, and the `.cwd` marker (accepted only when it actually looks like an absolute
+path). A malformed, half-written, oversized, hard-linked or planted file
+therefore degrades to "no detail" instead of a wrong card, a hang or a read
+outside the Grok data directory. The panel also runs the collector as a direct
+child (no shell pipeline) and aborts a tick that overstays, so a wedged helper
+can neither disable refresh nor be left behind.
 
 > Known limits (honest, not aspirational): the exact byte-for-byte encoding Grok
 > uses for group names has not been captured on a live session, so cwd-only
@@ -173,12 +177,15 @@ so a wedged helper cannot disable refresh until the shell restarts.
 > documented URL-encoding plus the `.cwd` marker; the `session_kind` values that
 > mark subagent sessions are likewise taken from the documented layout. Both
 > degrade to a missing card, never a wrong one — and PID-resolved sessions do
-> not depend on either. The path guard reads POSIX mode bits, so a directory
-> whose write access comes only from an ACL is not detected (Grok's own tree is
-> 0755/0644 by default); the descriptor containment check needs `/proc`, making
-> Grok enrichment Linux-only; and the ancestor-path check cannot fully close a
-> TOCTOU race without an `openat` chain. The plugin is a local read-only
-> collector, so those residuals are accepted rather than claimed fixed.
+> not depend on either. A single event line larger than 512 KiB is still skipped
+> (the window stops widening there), and the per-cycle budget is a bound on work,
+> not a promise that every card is enriched when a tree is pathological. The path
+> guard reads POSIX mode bits, so a directory whose write access comes only from
+> an ACL is not detected (Grok's own tree is 0755/0644 by default); the descriptor
+> containment check needs `/proc`, making Grok enrichment Linux-only; and the
+> ancestor-path check cannot fully close a TOCTOU race without an `openat` chain.
+> The plugin is a local read-only collector, so those residuals are accepted
+> rather than claimed fixed.
 
 ## Keybinding
 
@@ -233,7 +240,8 @@ python3 tests/test_grok_sessions.py
 - **Guarded Grok Session Reads**: Everything read under `$GROK_HOME` is refused unless the whole path chain is user-owned, not a symlink and not group/world-writable; files are opened with `O_NOFOLLOW | O_NONBLOCK` (so a planted FIFO cannot block the collector) and the opened descriptor is re-verified — owner, regular file, single hard link, size, containment — before any bytes are read. Session ids from `active_sessions.json` are validated as UUIDs before they are used in a path, event-supplied detail text passes through the same redaction as every other detail, per-file sizes and total work per refresh cycle are capped, and anything that fails degrades to *no card* rather than a wrong one.
 - **Prompt Hiding Option**: `privacyHidePrompts` keeps agent-supplied prompt and task text out of the bar ticker and the cards entirely — including tab/pane labels, which can carry task text — leaving counts, status, repo path and workspace name. Secret redaction stays on regardless.
 - **Safe Process Signaling**: Process termination verifies the target PID against active AI agent process signatures before signaling.
-- **Shell & Injection Safety**: All subprocess and Hyprland dispatch operations use discrete argument vectors without shell evaluation, and QML Text components enforce plain-text formatting.
+- **Shell & Injection Safety**: All subprocess and Hyprland dispatch operations use discrete argument vectors without shell evaluation (the status refresh execs the collector directly, with the payload bounded inside it rather than by a shell pipeline), and QML Text components enforce plain-text formatting.
+- **Bounded Status Payload**: the collector caps the number of agent cards and the serialized reply size, so a pathological machine cannot make the widget's stdio collector accumulate unbounded output.
 - **Plain-Text Convention**: Every `Text` element in `Panel.qml` must declare `textFormat: Text.PlainText` explicitly — agent-supplied strings (titles, labels, paths) must never render through QML's default `AutoText`, which would interpret rich-text markup as shell UI. New widgets should preserve this invariant.
 ## License
 

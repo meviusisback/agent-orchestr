@@ -528,5 +528,109 @@ class TestGroupCwdMarker(GrokFixtureCase):
         self.assertEqual(ac.grok_group_cwd(group), LONG_CWD)
 
 
+class TestMarkerAndBudget(GrokFixtureCase):
+    """The `.cwd` marker is untrusted text and must not become UI text or cost."""
+
+    def test_relative_marker_text_is_rejected(self):
+        self.make_session("slug", str(uuid.uuid4()), cwd_marker="not/a/path\nINJECT")
+        group = os.path.join(self.tmp, "sessions", "slug")
+        self.assertIsNone(ac.grok_group_cwd_marker(group))
+
+    def test_marker_with_ansi_and_secret_is_cleaned(self):
+        self.make_session("slug", str(uuid.uuid4()), cwd_marker="/tmp/proj\x1b[31m sk-abcdefghijklmnopqrstuvwx\x1b[0m")
+        group = os.path.join(self.tmp, "sessions", "slug")
+        marker = ac.grok_group_cwd_marker(group)
+        self.assertIsNotNone(marker)
+        self.assertNotIn("\x1b", marker)
+        self.assertIn("REDACTED", marker)
+        self.assertNotIn("abcdefghijklmnopqrstuvwx", marker)
+
+    def test_marker_read_is_memoized_per_cycle(self):
+        self.make_session("slug", str(uuid.uuid4()), cwd_marker="/tmp/proj")
+        group = os.path.join(self.tmp, "sessions", "slug")
+        ac._GROK_BUDGET.reset()
+        first = ac.grok_group_cwd_marker(group)
+        ops_after_first = ac._GROK_BUDGET.ops
+        second = ac.grok_group_cwd_marker(group)
+        self.assertEqual(first, second)
+        self.assertEqual(ac._GROK_BUDGET.ops, ops_after_first)
+
+    def test_many_marker_groups_still_resolve_within_budget(self):
+        """A 200-group marker-bearing tree must not exhaust the op budget."""
+        target_cwd = "/home/agent/target-project"
+        dirs = {}
+        for i in range(200):
+            cwd = "/home/agent/other-%03d" % i
+            dirs[cwd] = self.make_session("slug-%03d" % i, str(uuid.uuid4()), cwd_marker=cwd)
+        session_dir = self.make_session("slug-target", str(uuid.uuid4()), cwd_marker=target_cwd)
+        ac._GROK_BUDGET.reset()
+        found = ac.grok_sessions_for_cwd(target_cwd)
+        self.assertIn(session_dir, found)
+        self.assertFalse(ac._GROK_BUDGET.exhausted(), "op budget exhausted at %d ops" % ac._GROK_BUDGET.ops)
+        # A second card in the same tick must still resolve.
+        self.assertEqual(ac.grok_sessions_for_cwd("/home/agent/other-199"), [dirs["/home/agent/other-199"]])
+
+    def test_roster_is_read_once_per_cycle(self):
+        sid = str(uuid.uuid4())
+        self.make_session("group", sid)
+        self.write_roster([{"session_id": sid, "pid": os.getpid(), "cwd": "/tmp", "opened_at": "x"}])
+        ac._GROK_BUDGET.reset()
+        self.assertIsNotNone(ac.grok_active_session_for_pid(os.getpid()))
+        bytes_after_first = ac._GROK_BUDGET.bytes_read
+        self.assertIsNotNone(ac.grok_active_session_for_pid(os.getpid()))
+        self.assertEqual(ac._GROK_BUDGET.bytes_read, bytes_after_first)
+
+    def test_read_is_clamped_to_remaining_allowance(self):
+        sid = str(uuid.uuid4())
+        session_dir = self.make_session("group", sid)
+        path = os.path.join(session_dir, "summary.json")
+        ac._GROK_BUDGET.reset()
+        ac._GROK_BUDGET.bytes_read = ac.GROK_CYCLE_MAX_BYTES - 5
+        data = ac.grok_read_bytes(path, ac.GROK_SUMMARY_MAX_BYTES)
+        self.assertIsNotNone(data)
+        self.assertLessEqual(len(data), 5)
+        self.assertLessEqual(ac._GROK_BUDGET.bytes_read, ac.GROK_CYCLE_MAX_BYTES + 1)
+
+
+class TestLargeEventsAndStatusPayload(GrokFixtureCase):
+    def test_single_huge_event_line_still_sets_status(self):
+        """A decisive event larger than the 64 KiB window must not be lost."""
+        sid = str(uuid.uuid4())
+        session_dir = self.make_session("group", sid)
+        with open(os.path.join(session_dir, "events.jsonl"), "w", encoding="utf-8") as f:
+            f.write(json.dumps({"type": "taskId", "pad": "z" * 100000}) + "\n")
+            f.write(json.dumps({"type": "permission_requested", "tool_name": "bash", "payload": "z" * 100000}) + "\n")
+        _, detail, _, status, _ = ac.extract_grok_task_from_session(session_dir)
+        self.assertEqual(status, "waiting")
+        self.assertIn("bash", detail)
+
+    def test_model_id_is_redacted(self):
+        sid = str(uuid.uuid4())
+        session_dir = self.make_session("group", sid, summary={"current_model_id": "xai/sk-abcdefghijklmnopqrstuvwx", "generated_title": "x"})
+        _, _, model, _, _ = ac.extract_grok_task_from_session(session_dir)
+        self.assertNotIn("abcdefghijklmnopqrstuvwx", model)
+        self.assertIn("REDACTED", model)
+
+    def test_status_payload_caps_agents(self):
+        payload = {"ok": True, "connected": False, "summary": {"total": 300}, "agents": [{"pane_id": "x%d" % i, "title": "t"} for i in range(300)], "workspaces": []}
+        text = ac.dump_status_json(payload)
+        parsed = json.loads(text)
+        self.assertEqual(len(parsed["agents"]), ac.STATUS_MAX_AGENTS)
+
+    def test_status_payload_falls_back_to_valid_json(self):
+        payload = {
+            "ok": True,
+            "connected": True,
+            "summary": {"total": 1},
+            "agents": [{"pane_id": "p", "title": "y" * 40000} for _ in range(256)],
+            "workspaces": [],
+        }
+        text = ac.dump_status_json(payload)
+        self.assertLessEqual(len(text), ac.STATUS_MAX_BYTES)
+        parsed = json.loads(text)
+        self.assertTrue(parsed.get("truncated"))
+        self.assertEqual(parsed["agents"], [])
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

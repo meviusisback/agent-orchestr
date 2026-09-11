@@ -126,10 +126,12 @@ Panel {
   // Background processes
   Process {
     id: fetchProc
-    // head -c bounds the stream structurally: after 256 KiB head exits and
-    // SIGPIPE stops the helper, so the collector below can never accumulate
-    // more than the cap regardless of helper output size.
-    command: ["sh", "-c", "python3 '" + root.scriptPath() + "' status | head -c 262144"]
+    // The payload is bounded inside agent_ctl.py (dump_status_json: agent cap
+    // plus a hard byte ceiling) rather than by `python3 … | head -c`, so the
+    // collector itself is Quickshell's direct child. That matters for the stall
+    // timer below: terminating the process only signals the direct child, and a
+    // shell wrapper would leave the real collector running and leaked.
+    command: ["python3", root.scriptPath(), "status"]
     stdout: StdioCollector {
       waitForEnd: true
       onStreamFinished: {
@@ -156,12 +158,12 @@ Panel {
   // session tree is the realistic case) must not leave the widget stuck on
   // "Loading…" forever: fetchStatus() no-ops while fetchProc.running, so a
   // Process that never exits can't be re-run. Give up on one that overstays,
-  // exactly as the shell's own widgets do, so the next refresh gets through.
+  // exactly as the shell's own widgets do, and keep trying on the next tick.
   Timer {
     id: fetchStallTimer
     interval: 18000
     running: fetchProc.running
-    repeat: false
+    repeat: true
     onTriggered: {
       if (fetchProc.running) {
         fetchProc.running = false
