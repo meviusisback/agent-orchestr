@@ -13,6 +13,7 @@ import importlib.util
 import json
 import os
 import shutil
+import signal
 import sys
 import tempfile
 import unittest
@@ -359,6 +360,172 @@ class TestBudget(GrokFixtureCase):
         ac._GROK_BUDGET.spend(ac.GROK_CYCLE_MAX_BYTES + 1)
         ac._GROK_BUDGET.reset()
         self.assertEqual(ac.grok_read_json(os.path.join(session_dir, "summary.json"), ac.GROK_SUMMARY_MAX_BYTES)["current_model_id"], "grok-4.6")
+
+
+class TestHostileFiles(GrokFixtureCase):
+    """Files that would otherwise hang, mislead or leak must degrade safely."""
+
+    def _with_timeout(self, seconds, fn):
+        """Run fn with an alarm so a blocking regression fails instead of hanging."""
+        def _raise(signum, frame):
+            raise AssertionError("call blocked for more than %ss" % seconds)
+
+        previous = signal.signal(signal.SIGALRM, _raise)
+        signal.setitimer(signal.ITIMER_REAL, seconds)
+        try:
+            return fn()
+        finally:
+            signal.setitimer(signal.ITIMER_REAL, 0)
+            signal.signal(signal.SIGALRM, previous)
+
+    def test_fifo_instead_of_roster_does_not_block(self):
+        os.mkfifo(os.path.join(self.tmp, "active_sessions.json"))
+        self.assertIsNone(self._with_timeout(5, lambda: ac.grok_active_session_for_pid(os.getpid())))
+
+    def test_fifo_instead_of_summary_does_not_block(self):
+        sid = str(uuid.uuid4())
+        session_dir = self.make_session("group", sid)
+        os.remove(os.path.join(session_dir, "summary.json"))
+        os.mkfifo(os.path.join(session_dir, "summary.json"))
+        self.assertIsNone(self._with_timeout(5, lambda: ac.grok_read_json(os.path.join(session_dir, "summary.json"), ac.GROK_SUMMARY_MAX_BYTES)))
+        # The session degrades to a bare idle card rather than blocking or raising.
+        self.assertEqual(self._with_timeout(5, lambda: ac.extract_grok_task_from_session(session_dir)), (None, "Ready for prompt", "", "idle", False))
+
+    def test_fifo_instead_of_events_does_not_block(self):
+        sid = str(uuid.uuid4())
+        session_dir = self.make_session("group", sid)
+        os.mkfifo(os.path.join(session_dir, "events.jsonl"))
+        _, _, _, status, _ = self._with_timeout(5, lambda: ac.extract_grok_task_from_session(session_dir))
+        self.assertEqual(status, "idle")
+
+    def test_fifo_cwd_marker_does_not_block(self):
+        group = os.path.join(self.tmp, "sessions", "g")
+        os.makedirs(group, exist_ok=True)
+        os.mkfifo(os.path.join(group, ".cwd"))
+        self.assertIsNone(self._with_timeout(5, lambda: ac.grok_group_cwd_marker(group)))
+
+    def test_hardlinked_summary_is_refused(self):
+        outside = tempfile.mkdtemp(prefix="grok-outside-")
+        self.addCleanup(shutil.rmtree, outside, ignore_errors=True)
+        planted = os.path.join(outside, "secret.json")
+        with open(planted, "w", encoding="utf-8") as f:
+            json.dump({"generated_title": "HARDLINKED"}, f)
+        sid = str(uuid.uuid4())
+        session_dir = self.make_session("group", sid)
+        os.remove(os.path.join(session_dir, "summary.json"))
+        os.link(planted, os.path.join(session_dir, "summary.json"))
+        self.assertFalse(ac.grok_is_regular_file(os.path.join(session_dir, "summary.json")))
+        self.assertIsNone(ac.grok_read_json(os.path.join(session_dir, "summary.json"), ac.GROK_SUMMARY_MAX_BYTES))
+        prompt, _, _, _, _ = ac.extract_grok_task_from_session(session_dir)
+        self.assertNotEqual(prompt, "HARDLINKED")
+
+    def test_long_but_valid_event_is_not_dropped(self):
+        """The newest event decides the status, so a large one must still parse."""
+        sid = str(uuid.uuid4())
+        events = [{"type": "turn_started"}, {"type": "permission_requested", "tool_name": "bash", "payload": "y" * 20000}]
+        session_dir = self.make_session("group", sid, events=events)
+        _, detail, _, status, has_q = ac.extract_grok_task_from_session(session_dir)
+        self.assertEqual(status, "waiting")
+        self.assertTrue(has_q)
+        self.assertIn("bash", detail)
+
+    def test_secret_in_tool_name_is_redacted(self):
+        sid = str(uuid.uuid4())
+        session_dir = self.make_session("group", sid, events=[{"type": "tool_started", "tool_name": "sk-abcdefghijklmnopqrstuvwx"}])
+        _, detail, _, status, _ = ac.extract_grok_task_from_session(session_dir)
+        self.assertEqual(status, "working")
+        self.assertIn("REDACTED", detail)
+        self.assertNotIn("abcdefghijklmnopqrstuvwx", detail)
+
+    def test_secret_in_permission_tool_name_is_redacted(self):
+        sid = str(uuid.uuid4())
+        session_dir = self.make_session("group", sid, events=[{"type": "permission_requested", "tool_name": "ghp_abcdEFGHIJKLMNOPQRSTUV"}])
+        _, detail, _, status, _ = ac.extract_grok_task_from_session(session_dir)
+        self.assertEqual(status, "waiting")
+        self.assertIn("REDACTED", detail)
+
+    def test_dot_cwd_does_not_escape_into_grok_home(self):
+        """quote() leaves '.' alone, so a roster cwd of '..' must be refused."""
+        sid = str(uuid.uuid4())
+        planted = os.path.join(self.tmp, sid)
+        os.makedirs(planted, exist_ok=True)
+        with open(os.path.join(planted, "summary.json"), "w", encoding="utf-8") as f:
+            json.dump({"generated_title": "ABOVE SESSIONS"}, f)
+        self.assertIsNone(ac.grok_session_dir_for_id("..", sid))
+        self.assertIsNone(ac.grok_session_dir_for_id(".", sid))
+
+    def test_trailing_newline_session_id_is_rejected(self):
+        self.assertIsNone(ac.GROK_SESSION_ID_RE.match(str(uuid.uuid4()) + "\n"))
+        self.assertIsNotNone(ac.GROK_SESSION_ID_RE.match(str(uuid.uuid4())))
+
+
+class TestEventOrdering(GrokFixtureCase):
+    """Event order decides the status: the newest event must win."""
+
+    def state(self, events):
+        session_dir = self.make_session("group", str(uuid.uuid4()), events=events)
+        _, detail, _, status, has_q = ac.extract_grok_task_from_session(session_dir)
+        return status, detail, has_q
+
+    def test_tool_started_after_permission_prompt_is_working(self):
+        status, detail, _ = self.state([{"type": "phase_changed", "phase": "permission_prompt"}, {"type": "tool_started", "tool_name": "bash"}])
+        self.assertEqual(status, "working")
+        self.assertIn("bash", detail)
+
+    def test_permission_resolved_clears_the_stale_phase(self):
+        status, _, _ = self.state([
+            {"type": "turn_started"},
+            {"type": "phase_changed", "phase": "permission_prompt"},
+            {"type": "permission_requested", "tool_name": "bash"},
+            {"type": "permission_resolved", "tool_name": "bash"},
+        ])
+        self.assertEqual(status, "working")
+
+    def test_permission_prompt_after_resolve_still_waits(self):
+        status, _, has_q = self.state([
+            {"type": "permission_requested", "tool_name": "bash"},
+            {"type": "permission_resolved", "tool_name": "bash"},
+            {"type": "phase_changed", "phase": "permission_prompt"},
+        ])
+        self.assertEqual(status, "waiting")
+        self.assertTrue(has_q)
+
+    def test_turn_completed_after_tools_is_completed(self):
+        status, detail, _ = self.state([
+            {"type": "turn_started"},
+            {"type": "tool_started", "tool_name": "grep"},
+            {"type": "tool_completed", "tool_name": "grep"},
+            {"type": "phase_changed", "phase": "streaming_text"},
+            {"type": "turn_ended", "outcome": "completed"},
+        ])
+        self.assertEqual(status, "completed")
+
+    def test_partial_tail_starting_mid_line_still_parses(self):
+        """A tail that starts inside a line must drop only that partial line."""
+        sid = str(uuid.uuid4())
+        session_dir = self.make_session("group", sid)
+        filler = json.dumps({"type": "phase_changed", "phase": "streaming_text", "pad": "x" * 200}) + "\n"
+        with open(os.path.join(session_dir, "events.jsonl"), "w", encoding="utf-8") as f:
+            f.write(filler * 400)
+            f.write(json.dumps({"type": "turn_ended"}) + "\n")
+        _, _, _, status, _ = ac.extract_grok_task_from_session(session_dir)
+        self.assertEqual(status, "completed")
+
+
+class TestGroupCwdMarker(GrokFixtureCase):
+    def test_marker_is_optional(self):
+        sid = str(uuid.uuid4())
+        self.make_session("plain-group", sid)
+        group = os.path.join(self.tmp, "sessions", "plain-group")
+        self.assertIsNone(ac.grok_group_cwd_marker(group))
+        self.assertEqual(ac.grok_group_cwd(group), "plain-group")
+
+    def test_marker_wins_over_group_name(self):
+        sid = str(uuid.uuid4())
+        self.make_session("slug-hash", sid, cwd_marker=LONG_CWD)
+        group = os.path.join(self.tmp, "sessions", "slug-hash")
+        self.assertEqual(ac.grok_group_cwd_marker(group), LONG_CWD)
+        self.assertEqual(ac.grok_group_cwd(group), LONG_CWD)
 
 
 if __name__ == "__main__":

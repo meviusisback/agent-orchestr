@@ -50,7 +50,7 @@
           "Compact"
         ],
         "defaultValue": "Icon",
-        "description": "Icon shows the orchestrator glyph + badge; Status shows the top active task; Compact shows total and busy count."
+        "description": "Icon shows the orchestrator glyph + badge; Status shows the top active task; Compact shows total and busy count. With privacyHidePrompts enabled, Status falls back to the counts form so no task text is shown."
       },
       {
         "key": "showIdleInBar",
@@ -74,7 +74,7 @@
         "type": "boolean",
         "label": "Hide prompt text (screen sharing)",
         "defaultValue": false,
-        "description": "Hide agent-supplied task and prompt text in the bar and cards, showing only counts, status and location — useful when recording or sharing your screen."
+        "description": "Hide agent-supplied task and prompt text in the bar and cards, showing counts, status, repo and workspace only — useful when recording or sharing your screen."
       }
     ]
   }

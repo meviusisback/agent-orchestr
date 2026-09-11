@@ -152,6 +152,24 @@ Panel {
     }
   }
 
+  // A collector tick that wedges (an unreadable or odd file in some agent's
+  // session tree is the realistic case) must not leave the widget stuck on
+  // "Loading…" forever: fetchStatus() no-ops while fetchProc.running, so a
+  // Process that never exits can't be re-run. Give up on one that overstays,
+  // exactly as the shell's own widgets do, so the next refresh gets through.
+  Timer {
+    id: fetchStallTimer
+    interval: 18000
+    running: fetchProc.running
+    repeat: false
+    onTriggered: {
+      if (fetchProc.running) {
+        fetchProc.running = false
+        root.loading = false
+      }
+    }
+  }
+
   Process {
     id: focusProc
   }
@@ -733,10 +751,14 @@ Panel {
                   }
                 }
 
-                // Workspace & Tab Location
+                // Workspace & Tab Location. With privacyHidePrompts on, only the
+                // workspace name is shown: tab and pane labels can carry the
+                // task text too (Orca renames its tab to "<task> · <model>"), so
+                // they are task text and must be hidden like the title.
                 Text {
                   Layout.fillWidth: true
                   text: {
+                    if (root.privacyHidePrompts) return modelData.workspace || ""
                     var parts = []
                     if (modelData.workspace) parts.push(modelData.workspace)
                     if (modelData.tab) parts.push(modelData.tab)
