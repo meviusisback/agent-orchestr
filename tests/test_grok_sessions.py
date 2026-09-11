@@ -683,9 +683,9 @@ class TestLargeEventsAndStatusPayload(GrokFixtureCase):
         self.assertEqual(found[0], legit)
 
     def test_many_claiming_groups_do_not_hide_the_newest_real_session(self):
-        """The 32-claiming-group cap is applied after ranking, so recency wins."""
+        """Groups are ranked by recency before the cap, so the real newest wins."""
         cwd = "/home/agent/contested"
-        for i in range(40):
+        for i in range(70):
             plant = self.make_session("claim-%03d" % i, str(uuid.uuid4()), cwd_marker=cwd, summary={"generated_title": "plant"})
             os.utime(os.path.join(plant, "summary.json"), (1000, 1000))
         legit = self.make_session("zzz-legit", str(uuid.uuid4()), cwd_marker=cwd, summary={"generated_title": "real work"})
@@ -693,7 +693,43 @@ class TestLargeEventsAndStatusPayload(GrokFixtureCase):
         ac._GROK_BUDGET.reset()
         found = ac.grok_sessions_for_cwd(cwd)
         self.assertEqual(found[0], legit)
-        self.assertLessEqual(len(found), ac.GROK_MAX_MATCHED_GROUPS * ac.GROK_MAX_MATCHED_SESSIONS)
+        self.assertLessEqual(len(found), ac.GROK_MAX_CWD_SESSIONS)
+
+    def test_per_group_session_cap_selects_newest_not_alphabetical(self):
+        """The per-group cap picks the newest sessions, not the alphabetically first."""
+        cwd = "/home/agent/big-group"
+        group = ac.grok_group_dir_for_name(ac.quote(cwd, safe=""))
+        self.assertIsNotNone(group)
+        for i in range(40):
+            name = "s-%02d" % i
+            d = os.path.join(group, name)
+            os.makedirs(d, exist_ok=True)
+            with open(os.path.join(d, "summary.json"), "w") as f:
+                json.dump({"generated_title": "t%d" % i}, f)
+            os.utime(os.path.join(d, "summary.json"), (1000 + i, 1000 + i))
+        newest = os.path.join(group, "z-newest")
+        os.makedirs(newest, exist_ok=True)
+        with open(os.path.join(newest, "summary.json"), "w") as f:
+            json.dump({"generated_title": "newest"}, f)
+        os.utime(os.path.join(newest, "summary.json"), (9 * 10 ** 6, 9 * 10 ** 6))
+        ac._GROK_BUDGET.reset()
+        found = ac.grok_sessions_for_cwd(cwd)
+        self.assertEqual(found[0], newest)
+        self.assertIn(newest, found)
+
+    def test_subagent_only_groups_do_not_hide_real_session(self):
+        """Claiming groups that yield only subagent sessions are skipped."""
+        cwd = "/home/agent/subagent-trap"
+        for i in range(ac.GROK_MAX_MATCHED_GROUPS + 5):
+            d = self.make_session("sub-%03d" % i, str(uuid.uuid4()), cwd_marker=cwd,
+                                  summary={"session_kind": "subagent:x", "generated_title": "sub"})
+            os.utime(os.path.join(d, "summary.json"), (8 * 10 ** 6, 8 * 10 ** 6))
+        real = self.make_session("aaa-real", str(uuid.uuid4()), cwd_marker=cwd,
+                                 summary={"generated_title": "real work"})
+        os.utime(os.path.join(real, "summary.json"), (10 ** 6, 10 ** 6))
+        ac._GROK_BUDGET.reset()
+        found = ac.grok_sessions_for_cwd(cwd)
+        self.assertEqual(found, [real])
 
     def test_truncated_marker_is_never_accepted(self):
         self.make_session("slug", str(uuid.uuid4()), cwd_marker="/home/agent/project-with-a-long-name")
