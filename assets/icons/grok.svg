@@ -1,0 +1,6 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none">
+  <rect width="24" height="24" rx="5" fill="#9CA3AF" fill-opacity="0.15"/>
+  <!-- Original four-point spark; not the xAI wordmark -->
+  <path d="M12 3.5L13.4 10.6L20.5 12L13.4 13.4L12 20.5L10.6 13.4L3.5 12L10.6 10.6Z" fill="#D1D5DB"/>
+  <circle cx="12" cy="12" r="1.6" fill="#111827"/>
+</svg>
