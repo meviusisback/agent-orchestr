@@ -30,6 +30,10 @@ Panel {
   readonly property string barDisplay: String(root.setting("barDisplay", "Icon"))
   readonly property bool showIdleInBar: Boolean(root.setting("showIdleInBar", false))
   readonly property int maxTaskLength: Math.max(20, Number(root.setting("maxTaskLength", 45)) || 45)
+  // Privacy option for screen-sharing: when on, no agent-supplied prompt/task
+  // text is rendered anywhere in the widget (bar ticker or card), only counts,
+  // status words and the repo breadcrumb. The collector still returns the text.
+  readonly property bool privacyHidePrompts: Boolean(root.setting("privacyHidePrompts", false))
 
   readonly property bool barShowsText: barDisplay.toLowerCase() === "status" || barDisplay.toLowerCase() === "compact"
 
@@ -122,10 +126,12 @@ Panel {
   // Background processes
   Process {
     id: fetchProc
-    // head -c bounds the stream structurally: after 256 KiB head exits and
-    // SIGPIPE stops the helper, so the collector below can never accumulate
-    // more than the cap regardless of helper output size.
-    command: ["sh", "-c", "python3 '" + root.scriptPath() + "' status | head -c 262144"]
+    // The payload is bounded inside agent_ctl.py (dump_status_json: agent cap
+    // plus a hard byte ceiling) rather than by `python3 … | head -c`, so the
+    // collector itself is Quickshell's direct child. That matters for the stall
+    // timer below: terminating the process only signals the direct child, and a
+    // shell wrapper would leave the real collector running and leaked.
+    command: ["python3", root.scriptPath(), "status"]
     stdout: StdioCollector {
       waitForEnd: true
       onStreamFinished: {
@@ -145,6 +151,24 @@ Panel {
     stderr: StdioCollector {
       waitForEnd: true
       onStreamFinished: root.loading = false
+    }
+  }
+
+  // A collector tick that wedges (an unreadable or odd file in some agent's
+  // session tree is the realistic case) must not leave the widget stuck on
+  // "Loading…" forever: fetchStatus() no-ops while fetchProc.running, so a
+  // Process that never exits can't be re-run. Give up on one that overstays,
+  // exactly as the shell's own widgets do, and keep trying on the next tick.
+  Timer {
+    id: fetchStallTimer
+    interval: 18000
+    running: fetchProc.running
+    repeat: true
+    onTriggered: {
+      if (fetchProc.running) {
+        fetchProc.running = false
+        root.loading = false
+      }
     }
   }
 
@@ -280,7 +304,7 @@ Panel {
 
       Text {
         id: chipLabel
-        text: Model.formatBarHeadline(root.summary, root.barDisplay, root.maxTaskLength)
+        text: Model.formatBarHeadline(root.summary, root.barDisplay, root.maxTaskLength, root.privacyHidePrompts)
         textFormat: Text.PlainText
         font.family: root.fontFamily
         font.pixelSize: Style.font.caption || Style.space(11)
@@ -665,7 +689,7 @@ Panel {
               // Task Title
               Text {
                 Layout.fillWidth: true
-                text: modelData.title || "Active agent session"
+                text: root.privacyHidePrompts ? "Session details hidden" : (modelData.title || "Active agent session")
                 textFormat: Text.PlainText
                 font.family: root.fontFamily
                 font.pixelSize: Style.font.caption
@@ -678,7 +702,7 @@ Panel {
 
               // Activity Detail (if running tool, prompt question, or concluding tail)
               Text {
-                visible: Boolean(modelData.detail) && modelData.detail !== modelData.title
+                visible: !root.privacyHidePrompts && Boolean(modelData.detail) && modelData.detail !== modelData.title
                 Layout.fillWidth: true
                 text: modelData.detail || ""
                 textFormat: Text.PlainText
@@ -729,10 +753,14 @@ Panel {
                   }
                 }
 
-                // Workspace & Tab Location
+                // Workspace & Tab Location. With privacyHidePrompts on, only the
+                // workspace name is shown: tab and pane labels can carry the
+                // task text too (Orca renames its tab to "<task> · <model>"), so
+                // they are task text and must be hidden like the title.
                 Text {
                   Layout.fillWidth: true
                   text: {
+                    if (root.privacyHidePrompts) return modelData.workspace || ""
                     var parts = []
                     if (modelData.workspace) parts.push(modelData.workspace)
                     if (modelData.tab) parts.push(modelData.tab)

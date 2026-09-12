@@ -5,6 +5,7 @@ Discovers and manages AI agents across:
 1. Herdr workspaces & panes (Herdr daemon socket + process tree correlation)
 2. Standard terminal windows (Foot, Alacritty, Kitty, Ghostty)
 3. Hermes Desktop GUI instances (Electron app)
+4. Grok Build TUI sessions ($GROK_HOME/active_sessions.json + events.jsonl)
 """
 
 import glob
@@ -14,10 +15,12 @@ import re
 import signal
 import socket
 import sqlite3
+import stat
 import subprocess
 import sys
 import time
 from typing import Any, Dict, List, Optional, Set, Tuple
+from urllib.parse import quote, unquote
 
 HERDR_SOCK_PATH = os.path.expanduser(os.environ.get("HERDR_SOCKET_PATH", "~/.config/herdr/herdr.sock"))
 OMP_SESSIONS_DIR = os.path.expanduser("~/.omp/agent/sessions")
@@ -88,7 +91,9 @@ def clean_model_name(model_str: Optional[str]) -> str:
     m = str(model_str).strip()
     if "/" in m:
         parts = m.split("/")
-        if parts[0] in ("google-antigravity", "openrouter", "anthropic", "openai", "deepseek", "groq", "together"):
+        # Provider prefixes that only add noise to a small badge. `xai` is Grok's
+        # own provider id, and Grok session summaries may carry it.
+        if parts[0] in ("google-antigravity", "openrouter", "anthropic", "openai", "deepseek", "groq", "together", "xai"):
             m = "/".join(parts[1:])
     return m
 
@@ -263,6 +268,874 @@ def is_claude_helper_process(cmd: str, argv: Optional[List[str]] = None) -> bool
     return tokens[1] in CLAUDE_HELPER_SUBCOMMANDS
 
 
+# Grok Build's interactive TUI is argv[0] == "grok" with a flag, a prompt, or
+# nothing in argv[1]. The same binary also hosts one-shot CLI verbs (login,
+# mcp, doctor, agent, …) and headless single-turn runs (`grok -p …`).
+# Discriminate on exact argv tokens the same way Claude helpers are
+# (issue #10 / PR #11): a prompt whose first word is "agent" is a single argv
+# element and must not be mistaken for `grok agent`.
+GROK_HELPER_SUBCOMMANDS = (
+    "agent", "clone", "completions", "dashboard", "doctor", "du", "disk-usage",
+    "export", "help", "inspect", "leader", "login", "logout", "mcp", "memory",
+    "models", "plugin", "sessions", "setup", "trace", "update", "usage",
+    "version", "v", "worktree", "wrap",
+)
+# Tokens that mark a non-interactive invocation: headless single-turn runs and
+# info-only flags. They are matched anywhere in argv (a `grok --model x -p "…"`
+# run is still not a TUI session), which costs us a prompt that is *exactly*
+# one of these tokens — the same tradeoff the Claude helper filter accepts, and
+# it fails in the safe direction (no card beats a wrong card).
+GROK_NON_INTERACTIVE_FLAGS = (
+    "-p", "--single", "--prompt-file", "--prompt-json", "--output-format",
+    "--json-schema", "-v", "--version", "-h", "--help", "--show-current",
+)
+GROK_ARG_SCAN_LIMIT = 64            # argv elements inspected when classifying
+GROK_SESSION_ID_RE = re.compile(r"\A[0-9a-fA-F-]{8,64}\Z")
+GROK_ROSTER_MAX_BYTES = 256 * 1024
+GROK_SUMMARY_MAX_BYTES = 1024 * 1024
+GROK_CWD_MARKER_MAX_BYTES = 4096
+GROK_JSONL_TAIL_BYTES = 65536
+GROK_JSONL_MAX_LINE_BYTES = 512 * 1024
+GROK_MAX_GROUP_DIRS = 512
+GROK_MAX_GROUP_ENTRIES = 512
+# Marker files are only needed for the slug+hash (long path) layout. They get
+# their own allowance, sized so every group the scan is willing to visit can
+# still be read — a marker flood must not be able to hide a real long-path
+# session. Marker bytes are a separate bucket, so they never starve the session
+# summary/events reads that share the main cycle budget.
+GROK_MARKER_MAX_TOTAL_BYTES = GROK_MAX_GROUP_DIRS * GROK_CWD_MARKER_MAX_BYTES
+# Bounds for the marker fallback of grok_sessions_for_cwd: how many claiming
+# groups may be examined, how many sessions are taken from each (newest first),
+# and how many sessions one lookup may return. Markers are attacker-controllable
+# text, so a pile of groups all claiming the same cwd must not be able to spend
+# the cycle budget (or take over the card) by volume; groups are ranked by the
+# newest session they hold, and a group that yields no session does not consume
+# the collection budget, so the freshest real session still wins.
+GROK_MAX_MATCHED_GROUPS = 64
+GROK_MAX_MATCHED_SESSIONS = 32
+GROK_MAX_CWD_SESSIONS = 64
+GROK_CYCLE_MAX_BYTES = 2 * 1024 * 1024
+# A marker-bearing tree of GROK_MAX_GROUP_DIRS groups costs ~3 ops per group for
+# the trust walks plus one listing, so 512 groups need ~1.6k ops; the ceiling is
+# set well above that so several cards can resolve in one tick without any of
+# them silently losing their session.
+GROK_CYCLE_MAX_OPS = 16384
+GROK_CACHE_MAX_ENTRIES = 128
+GROK_WAITING_TOOLS = ("ask_user_question",)
+GROK_WORKING_PHASES = (
+    "waiting_for_model", "streaming_reasoning", "streaming_text", "tool_execution",
+)
+GROK_WAITING_PHASES = ("permission_prompt",)
+
+
+def grok_home() -> str:
+    """Grok's data dir; GROK_HOME overrides, default ~/.grok."""
+    return os.path.expanduser(os.environ.get("GROK_HOME", "~/.grok"))
+
+
+def is_grok_helper_process(cmd: str, argv: Optional[List[str]] = None) -> bool:
+    """True for `grok` invocations that are not an interactive TUI session.
+
+    Two classes: CLI verbs, identified by an exact argv[1] match, and
+    headless/info-only runs, identified by an exact flag token anywhere in the
+    scanned argv. Exact token matching only — never substring or prefix
+    matching, so `grok "fix the agent loop"` stays a session.
+    """
+    tokens = list(argv) if argv is not None else cmd.split()
+    if len(tokens) < 2 or os.path.basename(tokens[0]) != "grok":
+        return False
+    rest = tokens[1:1 + GROK_ARG_SCAN_LIMIT]
+    if rest[0] in GROK_HELPER_SUBCOMMANDS:
+        return True
+    return any(tok in GROK_NON_INTERACTIVE_FLAGS for tok in rest)
+
+
+def grok_argv_has_cwd_override(argv: Optional[List[str]]) -> bool:
+    """True when the invocation passes `--cwd`, so /proc cwd != session cwd."""
+    for tok in (argv or [])[:GROK_ARG_SCAN_LIMIT]:
+        if tok == "--cwd" or tok.startswith("--cwd="):
+            return True
+    return False
+
+
+class _GrokBudget:
+    """Per-fetch-cycle read budget and memo for Grok session files.
+
+    The bar collector re-runs agent_ctl.py every few seconds against whatever
+    exists under $GROK_HOME, so a single tick must never become unbounded work:
+    these counters cap the total bytes read and the number of file/dir
+    operations, and parsed JSON is memoized by (path, mtime, size) so a large
+    session tree costs one read per change rather than one per card. Counters
+    reset at the start of every fetch_all_agents() call.
+    """
+
+    def __init__(self) -> None:
+        self.reset()
+
+    def reset(self) -> None:
+        self.bytes_read = 0
+        self.ops = 0
+        # Parsed-JSON memo keyed by (path, inode, mtime_ns, size, cap), plus
+        # path-level memos so resolving several cards against one session tree
+        # inside a tick does not re-walk and re-stat every group directory: the
+        # trust cache holds the verdict per absolute path, the group list and the
+        # group -> `.cwd` mapping are built once. All stay bounded because every
+        # cache miss pays the op budget.
+        self.cache: Dict[Tuple[str, int, int, int, int, int], Any] = {}
+        self.trusted: Dict[str, bool] = {}
+        self.group_dirs: Optional[List[str]] = None
+        self.group_cwd: Dict[str, Optional[str]] = {}
+        self.marker_bytes = 0
+
+    def exhausted(self) -> bool:
+        return self.bytes_read > GROK_CYCLE_MAX_BYTES or self.ops > GROK_CYCLE_MAX_OPS
+
+    def spend(self, nbytes: int, ops: int = 1) -> bool:
+        self.bytes_read += max(0, int(nbytes))
+        self.ops += max(0, int(ops))
+        return not self.exhausted()
+
+    def get(self, key: Tuple[str, int, int, int, int, int]) -> Any:
+        # Touch on hit so eviction is LRU rather than FIFO: with a FIFO, a working
+        # set larger than the cache re-reads files on every look-up.
+        if key not in self.cache:
+            return None
+        value = self.cache.pop(key)
+        self.cache[key] = value
+        return value
+
+    def has(self, key: Tuple[str, int, int, int, int, int]) -> bool:
+        return key in self.cache
+
+    def store(self, key: Tuple[str, int, int, int, int, int], value: Any) -> Any:
+        # Evict the oldest entry rather than refusing to store: a machine with
+        # more sessions than the cache holds would otherwise re-read and re-parse
+        # the same files on every lookup, which is exactly what exhausts the byte
+        # budget on the machines this memo exists to protect.
+        while len(self.cache) >= GROK_CACHE_MAX_ENTRIES:
+            try:
+                self.cache.pop(next(iter(self.cache)))
+            except (StopIteration, KeyError):
+                break
+        self.cache[key] = value
+        return value
+
+
+_GROK_BUDGET = _GrokBudget()
+
+
+def grok_trusted_path(path: str) -> bool:
+    """True when `path` sits inside GROK_HOME with no symlinked or foreign component.
+
+    The plugin only ever *reads* Grok session data, so a path that is a symlink,
+    owned by another user or group/world-writable is never trusted: enrichment
+    degrades to "no card / no detail" instead of following a redirect. (Same
+    standard the Claude status-dir hardening applies to its write path.)
+    Verdicts are memoized for the duration of one fetch cycle — the op budget
+    bounds how many distinct paths can be walked, so the memo cannot grow past
+    that.
+    """
+    if _GROK_BUDGET.exhausted():
+        return False
+    try:
+        target = os.path.abspath(path)
+    except (OSError, ValueError):
+        return False
+    cached = _GROK_BUDGET.trusted.get(target)
+    if cached is not None:
+        return cached
+    verdict = _grok_trusted_path_uncached(target)
+    _GROK_BUDGET.trusted[target] = verdict
+    return verdict
+
+
+def _grok_trusted_path_uncached(target: str) -> bool:
+    """Walk every component of an absolute path up to (and including) GROK_HOME."""
+    home = os.path.abspath(grok_home())
+    if target != home and not target.startswith(home + os.sep):
+        return False
+    uid = os.getuid()
+    current = target
+    try:
+        while True:
+            st = os.lstat(current)
+            if stat.S_ISLNK(st.st_mode) or st.st_uid != uid or (st.st_mode & 0o022):
+                return False
+            if not _GROK_BUDGET.spend(0, 1):
+                return False
+            if current == home:
+                return True
+            parent = os.path.dirname(current)
+            if parent == current:
+                return False
+            current = parent
+    except (OSError, ValueError):
+        return False
+
+
+def _grok_fd_within_home(fd: int) -> bool:
+    """Containment check on the opened fd's real target, not on a pre-open path."""
+    try:
+        resolved = os.path.realpath(f"/proc/self/fd/{fd}")
+    except (OSError, ValueError):
+        return False
+    home = os.path.realpath(grok_home())
+    return resolved == home or resolved.startswith(home + os.sep)
+
+
+# O_NONBLOCK is not decoration: the file type is only known *after* the open, so
+# without it opening a FIFO (or device node) planted under $GROK_HOME blocks
+# until a writer appears — turning a hostile file into a wedged collector tick
+# instead of a "no detail" card. It is a no-op for regular files.
+_GROK_OPEN_FLAGS = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK
+
+
+def _grok_open_verified(path: str, max_size: Optional[int] = None, marker: bool = False, whole: bool = False) -> Optional[int]:
+    """Open a trusted Grok file and return a verified fd, or None.
+
+    One place owns the security-critical steps: the trust walk on the path, the
+    O_NOFOLLOW|O_NONBLOCK open, and fd-level verification (regular file, current
+    owner, single link, optional size cap, containment in $GROK_HOME). With
+    `whole=True` the file must also fit in the budget it is charged to — a
+    truncated prefix must never be mistaken for the file itself. The caller owns
+    closing the fd.
+    """
+    if _GROK_BUDGET.exhausted() or not grok_trusted_path(path):
+        return None
+    try:
+        fd = os.open(path, _GROK_OPEN_FLAGS)
+    except (OSError, ValueError):
+        return None
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode) or st.st_uid != os.getuid() or st.st_nlink > 1:
+            raise OSError("not a regular, owned, single-link file")
+        if max_size is not None and st.st_size > max_size:
+            raise OSError("file larger than the allowed size")
+        if whole:
+            allowance = (GROK_MARKER_MAX_TOTAL_BYTES - _GROK_BUDGET.marker_bytes) if marker else _grok_allowance()
+            if allowance <= 0 or st.st_size > allowance:
+                raise OSError("remaining budget cannot cover the whole file")
+        if not _grok_fd_within_home(fd):
+            raise OSError("not contained in GROK_HOME")
+    except OSError:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+        return None
+    return fd
+
+
+def _grok_allowance() -> int:
+    """Bytes still available in this cycle's read budget (<= 0 when spent)."""
+    return GROK_CYCLE_MAX_BYTES - _GROK_BUDGET.bytes_read
+
+
+def _grok_read_at(fd: int, offset: int, length: int, marker: bool = False) -> Optional[bytes]:
+    """Read `length` bytes at `offset` from a verified fd.
+
+    Reads are charged to the cycle budget and can never take it over the ceiling.
+    `marker=True` charges the separate marker allowance instead, so a tree full of
+    large `.cwd` markers cannot starve real session reads.
+    """
+    if marker:
+        allowance = GROK_MARKER_MAX_TOTAL_BYTES - _GROK_BUDGET.marker_bytes
+    else:
+        allowance = _grok_allowance()
+    if allowance <= 0 or length <= 0:
+        return None
+    try:
+        os.lseek(fd, offset, os.SEEK_SET)
+        data = os.read(fd, min(length, allowance))
+    except (OSError, ValueError):
+        return None
+    if not data:
+        return b""
+    if marker:
+        _GROK_BUDGET.marker_bytes += len(data)
+    elif not _GROK_BUDGET.spend(len(data)):
+        return None
+    return data
+
+
+def grok_read_bytes(path: str, max_bytes: int) -> Optional[bytes]:
+    """Read a whole trusted Grok file, refusing anything larger than `max_bytes`.
+
+    The opened fd is what gets verified (see _grok_open_verified), so a symlink
+    swapped in after the path check cannot redirect the read and a FIFO cannot
+    block it. Returns None — never raises — whenever anything is off.
+    """
+    fd = _grok_open_verified(path, max_size=max_bytes, whole=True)
+    if fd is None:
+        return None
+    try:
+        return _grok_read_at(fd, 0, max_bytes)
+    finally:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+
+
+def grok_read_marker_bytes(path: str) -> Optional[bytes]:
+    """Read a whole `.cwd` marker against the marker allowance.
+
+    Whole-file only: a marker read that the remaining allowance would truncate is
+    refused, because a truncated marker is a wrong path and would be accepted as a
+    breadcrumb or a group match.
+    """
+    if _GROK_BUDGET.exhausted() or _GROK_BUDGET.marker_bytes >= GROK_MARKER_MAX_TOTAL_BYTES:
+        return None
+    fd = _grok_open_verified(path, max_size=GROK_CWD_MARKER_MAX_BYTES, marker=True, whole=True)
+    if fd is None:
+        return None
+    try:
+        return _grok_read_at(fd, 0, GROK_CWD_MARKER_MAX_BYTES, marker=True)
+    finally:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+
+
+def grok_read_last_lines(path: str, max_lines: int = 200, chunk_bytes: int = GROK_JSONL_TAIL_BYTES, max_total: int = GROK_JSONL_MAX_LINE_BYTES) -> Optional[bytes]:
+    """Read the tail of a trusted JSONL file backwards until `max_lines` lines.
+
+    Chunks are read from the end and each is charged once — no window is re-read —
+    so the byte cost is proportional to what is actually needed. A single very
+    long line widens the read one chunk at a time up to `max_total`; a line larger
+    than that absolute ceiling is dropped (documented limit) rather than parsed
+    from a fragment. The returned bytes may start mid-line; callers drop that
+    first fragment.
+    """
+    fd = _grok_open_verified(path)
+    if fd is None:
+        return None
+    try:
+        try:
+            size = os.fstat(fd).st_size
+        except OSError:
+            return b""
+        parts: List[bytes] = []
+        total = 0
+        newlines = 0
+        pos = size
+        while pos > 0 and total < max_total and newlines <= max_lines:
+            allowance = _grok_allowance()
+            if allowance <= 0:
+                break
+            # Clamp the WINDOW before computing the offset: this reader walks
+            # backwards, so a length-clamped read would hand back the oldest bytes
+            # of the window instead of the newest, silently losing the events that
+            # decide the card's status.
+            take = min(chunk_bytes, pos, max_total - total, allowance)
+            if take <= 0:
+                break
+            data = _grok_read_at(fd, pos - take, take)
+            if data is None or not data:
+                break
+            parts.append(data)
+            total += len(data)
+            pos -= len(data)
+            newlines += data.count(b"\n")
+        if not parts:
+            return b""
+        return b"".join(reversed(parts))
+    finally:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+
+
+
+def grok_read_json(path: str, max_bytes: int) -> Any:
+    """Parsed JSON from a trusted Grok file, or None. Never raises."""
+    raw = grok_read_bytes(path, max_bytes)
+    if raw is None:
+        return None
+    try:
+        return json.loads(raw.decode("utf-8", errors="replace"))
+    except Exception:
+        return None
+
+
+def grok_read_json_cached(path: str, max_bytes: int) -> Any:
+    """grok_read_json memoized per (path, inode, mtime, size, cap) for one cycle."""
+    if _GROK_BUDGET.exhausted():
+        return None
+    try:
+        st = os.stat(path)
+        key = (path, int(st.st_ino), int(st.st_mtime_ns), int(st.st_ctime_ns), int(st.st_size), int(max_bytes))
+    except (OSError, ValueError):
+        return None
+    if _GROK_BUDGET.has(key):
+        return _GROK_BUDGET.get(key)
+    return _GROK_BUDGET.store(key, grok_read_json(path, max_bytes))
+
+
+def grok_is_regular_file(path: str) -> bool:
+    """True for a trusted regular, single-link file — never follows a symlink.
+
+    Used wherever the code decides "this is a session / this stream exists":
+    os.path.isfile()/exists() follow symlinks and would accept a planted link
+    even though the guarded reader then refuses its contents.
+    """
+    if _GROK_BUDGET.exhausted() or not grok_trusted_path(path):
+        return False
+    try:
+        st = os.lstat(path)
+    except (OSError, ValueError):
+        return False
+    return stat.S_ISREG(st.st_mode) and st.st_nlink == 1
+
+
+def grok_listdir(path: str, max_entries: int = GROK_MAX_GROUP_ENTRIES) -> List[str]:
+    """Bounded, trusted, sorted directory listing; [] when untrusted or over budget."""
+    if _GROK_BUDGET.exhausted() or not grok_trusted_path(path):
+        return []
+    try:
+        st = os.stat(path)
+    except (OSError, ValueError):
+        return []
+    if not stat.S_ISDIR(st.st_mode) or st.st_uid != os.getuid() or not _GROK_BUDGET.spend(0, 1):
+        return []
+    names: List[str] = []
+    try:
+        with os.scandir(path) as it:
+            for entry in it:
+                names.append(entry.name)
+                if len(names) >= max_entries:
+                    break
+    except (OSError, ValueError):
+        return []
+    return sorted(names)
+
+
+def grok_session_is_subagent(session_dir: str) -> bool:
+    """Skip forked subagent sessions so the parent card is not counted twice."""
+    summary = grok_read_json_cached(os.path.join(session_dir, "summary.json"), GROK_SUMMARY_MAX_BYTES)
+    if not isinstance(summary, dict):
+        return False
+    # session_kind is the reliable flag (agent_name is the role, e.g. general-purpose).
+    for key in ("session_kind", "agent_name", "session_relationship"):
+        val = str(summary.get(key) or "")
+        if val.startswith("subagent"):
+            return True
+    return False
+
+
+def grok_sessions_root() -> str:
+    """Grok's sessions root ($GROK_HOME/sessions)."""
+    return os.path.join(grok_home(), "sessions")
+
+
+def grok_group_dirs() -> List[str]:
+    """Trusted group directories under the sessions root, bounded and sorted.
+
+    Built once per fetch cycle: resolving several cards against one session tree
+    would otherwise re-list and re-stat every group directory each time and burn
+    the op budget.
+    """
+    if _GROK_BUDGET.group_dirs is not None:
+        return _GROK_BUDGET.group_dirs
+    root = grok_sessions_root()
+    groups: List[str] = []
+    for name in grok_listdir(root, GROK_MAX_GROUP_DIRS):
+        if len(groups) >= GROK_MAX_GROUP_DIRS:
+            break
+        path = os.path.join(root, name)
+        if grok_trusted_path(path):
+            groups.append(path)
+    _GROK_BUDGET.group_dirs = groups
+    return groups
+
+
+def grok_group_dir_for_name(encoded: str) -> Optional[str]:
+    """Map an encoded cwd name to a real group directory, refusing dot components.
+
+    quote(cwd, safe="") deliberately leaves '.' unescaped, so a roster cwd of
+    '.' or '..' would otherwise resolve to the sessions root or to GROK_HOME
+    itself. The candidate must be a direct child of the sessions root.
+    """
+    if not encoded or encoded in (".", "..") or "/" in encoded or os.sep in encoded:
+        return None
+    root = os.path.abspath(grok_sessions_root())
+    candidate = os.path.abspath(os.path.join(root, encoded))
+    if os.path.dirname(candidate) != root:
+        return None
+    return candidate
+
+
+def grok_session_dir_for_id(cwd: str, session_id: str) -> Optional[str]:
+    """Resolve a live session's directory from its (uuid) session id.
+
+    The id — not the group name — is the reliable key. The encoded-cwd fast path
+    short-circuits when it works; the bounded group scan then finds the session
+    whatever Grok called the group, including the slug+hash group it uses when
+    the encoded cwd exceeds 255 bytes (documented layout), and regardless of
+    whether our encoder matches Grok's byte for byte.
+    """
+    if not GROK_SESSION_ID_RE.match(session_id or ""):
+        return None
+    root = grok_sessions_root()
+    if cwd:
+        encoded_names: List[str] = []
+        try:
+            for value in (cwd, os.path.realpath(cwd)):
+                encoded = quote(value, safe="")
+                if encoded not in encoded_names:
+                    encoded_names.append(encoded)
+        except (OSError, ValueError):
+            encoded_names = []
+        for encoded in encoded_names:
+            group = grok_group_dir_for_name(encoded)
+            if not group:
+                continue
+            candidate = os.path.join(group, session_id)
+            if grok_is_regular_file(os.path.join(candidate, "summary.json")):
+                return candidate
+    for group in grok_group_dirs():
+        candidate = os.path.join(group, session_id)
+        if grok_is_regular_file(os.path.join(candidate, "summary.json")):
+            return candidate
+    return None
+
+
+def grok_active_session_for_pid(pid: int) -> Optional[str]:
+    """Map a live grok PID to its session directory via active_sessions.json.
+
+    The roster is read-only input: a row only counts when its pid is this live
+    process, its session_id passes the uuid check, and the resolved directory is
+    inside the trusted tree. Anything else is dropped rather than guessed at.
+    """
+    if pid <= 1 or not os.path.exists(f"/proc/{pid}"):
+        return None
+    rows = grok_read_json_cached(os.path.join(grok_home(), "active_sessions.json"), GROK_ROSTER_MAX_BYTES)
+    if not isinstance(rows, list):
+        return None
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        try:
+            row_pid = int(row.get("pid"))
+        except (TypeError, ValueError, OverflowError):
+            continue
+        if row_pid != pid:
+            continue
+        session_id = str(row.get("session_id") or "")
+        cwd = str(row.get("cwd") or "")
+        if not GROK_SESSION_ID_RE.match(session_id):
+            continue
+        session_dir = grok_session_dir_for_id(cwd, session_id)
+        if session_dir and not grok_session_is_subagent(session_dir):
+            return session_dir
+    return None
+
+
+def grok_summary_mtime(session_dir: str) -> float:
+    """summary.json mtime of a session dir (0.0 when it is not a plain file).
+
+    lstat, not getmtime: a symlinked summary.json that every reader refuses must
+    not contribute its target's mtime to the newest-first ordering.
+    """
+    try:
+        st = os.lstat(os.path.join(session_dir, "summary.json"))
+    except (OSError, ValueError):
+        return 0.0
+    if not stat.S_ISREG(st.st_mode) or st.st_nlink > 1:
+        return 0.0
+    return float(st.st_mtime)
+
+
+def grok_group_cwd_marker(group_dir: str) -> Optional[str]:
+    """The absolute cwd recorded in a group's `.cwd` marker file, or None.
+
+    Grok writes this marker only for groups whose name is a slug+hash, i.e. when
+    the URL-encoded path exceeded 255 bytes. The file's contents are untrusted
+    text — a local file can hold anything — so they are flattened, redacted and
+    capped before use, and only a value that actually looks like an absolute path
+    is accepted. The marker is never used to build a path, and the mapping is
+    memoized for the cycle, which is also what keeps a 512-group scan inside the
+    op budget.
+    """
+    if group_dir in _GROK_BUDGET.group_cwd:
+        return _GROK_BUDGET.group_cwd[group_dir]
+    recorded = None
+    marker = grok_read_marker_bytes(os.path.join(group_dir, ".cwd"))
+    if marker is not None:
+        text = grok_clean_detail(marker.decode("utf-8", errors="replace"), GROK_CWD_MARKER_MAX_BYTES)
+        # A marker is only ever a path: absolute, with no space or control byte
+        # left in it after cleaning. Anything else is dropped rather than rendered
+        # as "the repo path".
+        if text.startswith("/") and " " not in text:
+            recorded = text
+    _GROK_BUDGET.group_cwd[group_dir] = recorded
+    return recorded
+
+
+def grok_group_cwd(group_dir: str) -> str:
+    """The working directory a session group belongs to.
+
+    Prefers the `.cwd` marker and falls back to the decoded group name, which is
+    how Grok names groups for ordinary (short) paths.
+    """
+    recorded = grok_group_cwd_marker(group_dir)
+    if recorded:
+        return recorded
+    try:
+        return unquote(os.path.basename(group_dir))
+    except Exception:
+        return ""
+
+
+def grok_sessions_for_cwd(cwd: str) -> List[str]:
+    """Session directories for a cwd, best-first (encoded group, then markers).
+
+    Two group-naming schemes are covered: the URL-encoded cwd (literal and
+    realpath forms) and slug+hash groups whose `.cwd` marker names this cwd. The
+    encoded name is deterministic, so it is tried first and, when it yields a
+    session, the marker scan is skipped entirely: marker contents are
+    attacker-controllable text, and a group that merely claims this cwd must never
+    outrank the real one or spend the budget its summary/events reads need. For the
+    same reason the number of marker-matched groups enumerated per cwd is capped.
+    """
+    if not cwd:
+        return []
+    wanted = [cwd]
+    try:
+        real = os.path.realpath(cwd)
+    except (OSError, ValueError):
+        real = ""
+    if real and real not in wanted:
+        wanted.append(real)
+
+    fast_folders: List[str] = []
+    for value in wanted:
+        try:
+            folder = grok_group_dir_for_name(quote(value, safe=""))
+        except (OSError, ValueError):
+            folder = None
+        if folder and folder not in fast_folders:
+            fast_folders.append(folder)
+
+    found: List[str] = []
+    for folder in fast_folders:
+        for name in grok_listdir(folder):
+            path = os.path.join(folder, name)
+            if grok_is_regular_file(os.path.join(path, "summary.json")) and not grok_session_is_subagent(path):
+                found.append(path)
+    if found:
+        found.sort(key=grok_summary_mtime, reverse=True)
+        return found
+
+    # Fallback: groups whose `.cwd` marker claims this cwd (the slug+hash layout
+    # Grok uses for very long paths). Marker content is local file text, so a group
+    # that merely claims the directory must not crowd out the real session. Two
+    # rules keep that true: groups are ranked by the newest session they hold, and
+    # only sessions that actually pass the filters count — a group that yields
+    # nothing (empty, or subagent-only) never consumes the collection budget, so a
+    # pile of claimants cannot bury the real session behind the cap.
+    candidates: List[Tuple[float, str]] = []
+    for group in grok_group_dirs():
+        if group in fast_folders or grok_group_cwd(group) not in wanted:
+            continue
+        newest = max(
+            (grok_summary_mtime(os.path.join(group, name)) for name in grok_listdir(group)),
+            default=0.0,
+        )
+        candidates.append((newest, group))
+    candidates.sort(reverse=True)
+
+    found: List[str] = []
+    for _, group in candidates:
+        if len(found) >= GROK_MAX_CWD_SESSIONS:
+            break
+        # Newest-first *before* truncating: taking the first N in name order would
+        # keep whichever sessions happen to sort first, not the freshest ones.
+        ranked = [n for n in grok_listdir(group) if grok_is_regular_file(os.path.join(group, n, "summary.json"))]
+        ranked.sort(key=lambda n: grok_summary_mtime(os.path.join(group, n)), reverse=True)
+        for name in ranked[:GROK_MAX_MATCHED_SESSIONS]:
+            path = os.path.join(group, name)
+            if grok_session_is_subagent(path):
+                continue
+            found.append(path)
+            if len(found) >= GROK_MAX_CWD_SESSIONS:
+                break
+    found.sort(key=grok_summary_mtime, reverse=True)
+    return found
+
+
+def _iter_jsonl_tail(path: str, max_lines: int = 200) -> List[Dict[str, Any]]:
+    """Parsed events from the tail of a trusted Grok JSONL file (newest kept).
+
+    The tail is read backwards in chunks until `max_lines` lines are covered (or
+    the 512 KiB ceiling is reached), so a decisive event larger than a single
+    chunk is still parsed rather than truncated into a fragment. Lines are parsed
+    whole and only the newest `max_lines` non-empty ones are returned.
+    """
+    raw = grok_read_last_lines(path, max_lines=max_lines)
+    if not raw:
+        return []
+    lines = [line.strip() for line in raw.decode("utf-8", errors="replace").split("\n")]
+    entries: List[Dict[str, Any]] = []
+    for line in [line for line in lines if line][-max_lines:]:
+        try:
+            obj = json.loads(line)
+        except Exception:
+            continue
+        if isinstance(obj, dict):
+            entries.append(obj)
+    return entries
+
+
+def grok_clean_detail(text: str, max_len: int = 200) -> str:
+    """Redact, flatten and cap an event-supplied detail line for the UI.
+
+    events.jsonl is agent-written content like every other detail source, so it
+    takes the same secret-redaction pass every other detail does — a tool name
+    is normally harmless, but nothing here may leak a token into an always-on
+    bar just because it arrived in the wrong field. C0/C1 control bytes are
+    dropped as well: clean_ansi() only understands CSI/Fe sequences, so an OSC or
+    a bare BEL would otherwise survive into a Text element.
+    """
+    cleaned = clean_ansi(str(text or ""))
+    cleaned = re.sub(r"[\x00-\x1f\x7f-\x9f]", " ", cleaned)
+    return " ".join(redact_secrets(cleaned).split())[:max_len]
+
+
+def grok_phase_detail(phase: str) -> str:
+    """Human-readable detail text for a Grok phase name."""
+    if phase == "waiting_for_model":
+        return "Thinking…"
+    if phase == "streaming_reasoning":
+        return "Reasoning…"
+    if phase == "tool_execution":
+        return "Running tool"
+    return "Generating response…"
+
+
+def extract_grok_task_from_session(
+    session_dir: str,
+) -> Tuple[Optional[str], Optional[str], Optional[str], Optional[str], bool]:
+    """Read a Grok session directory.
+
+    Returns (latest_user_prompt, detail_text, model_name, status_override, has_question).
+    Status comes from a bounded tail of events.jsonl; the title/model from summary.json
+    plus the last real user line in chat_history.jsonl.
+    """
+    if not session_dir or not grok_trusted_path(session_dir):
+        return None, None, None, None, False
+
+    model_name = None
+    latest_user_prompt = None
+    last_turn_summary = None
+    summary_path = os.path.join(session_dir, "summary.json")
+    summary = grok_read_json_cached(summary_path, GROK_SUMMARY_MAX_BYTES)
+    if isinstance(summary, dict):
+        # The model id is file-supplied text like every other field, so it takes
+        # the same flatten/redact/cap pass before it reaches the model chip.
+        model_name = grok_clean_detail(clean_model_name(summary.get("current_model_id") or ""), 120)
+        title = summary.get("generated_title") or summary.get("session_summary") or ""
+        if isinstance(title, str) and title.strip():
+            latest_user_prompt = grok_clean_detail(clean_user_prompt(title), 300)
+        turn = summary.get("last_turn_summary")
+        if isinstance(turn, str) and turn.strip():
+            last_turn_summary = grok_clean_detail(extract_first_line(turn), 200)
+
+    history_path = os.path.join(session_dir, "chat_history.jsonl")
+    if grok_is_regular_file(history_path):
+        for entry in reversed(_iter_jsonl_tail(history_path)):
+            if entry.get("type") != "user":
+                continue
+            if entry.get("synthetic_reason"):
+                continue
+            content = entry.get("content")
+            raw = content if isinstance(content, str) else ""
+            cleaned = grok_clean_detail(clean_user_prompt(raw), MAX_PROMPT_CHARS)
+            if cleaned and not is_system_wrapper(cleaned):
+                latest_user_prompt = cleaned
+                break
+
+    # Event state is folded in log order so the LAST event wins: a tool that
+    # started after a permission prompt means "working" (not "waiting"), and a
+    # stale permission_prompt phase cannot mask the tool that is running now.
+    pending_tool: Optional[str] = None
+    pending_permission: Optional[str] = None
+    phase: Optional[str] = None
+    turn_open = False
+    turn_finished = False
+    events_path = os.path.join(session_dir, "events.jsonl")
+    if grok_is_regular_file(events_path):
+        for entry in _iter_jsonl_tail(events_path):
+            et = entry.get("type")
+            if et == "turn_started":
+                turn_open = True
+                turn_finished = False
+                pending_tool = None
+                pending_permission = None
+                phase = "waiting_for_model"
+            elif et == "turn_ended":
+                turn_open = False
+                turn_finished = True
+                pending_tool = None
+                pending_permission = None
+                phase = None
+            elif et == "phase_changed":
+                value = entry.get("phase")
+                if isinstance(value, str):
+                    phase = value
+            elif et == "tool_started":
+                pending_tool = str(entry.get("tool_name") or "tool")
+                pending_permission = None
+                phase = "tool_execution"
+            elif et == "tool_completed":
+                pending_tool = None
+            elif et == "permission_requested":
+                pending_permission = str(entry.get("tool_name") or "tool")
+                pending_tool = None
+            elif et == "permission_resolved":
+                pending_permission = None
+                # Auto-allowed asks leave phase=permission_prompt behind; the
+                # turn is no longer waiting on the user.
+                if phase in GROK_WAITING_PHASES:
+                    phase = "tool_execution" if pending_tool else "waiting_for_model"
+
+    status_override = None
+    detail = None
+    has_question = False
+    if pending_permission:
+        status_override = "waiting"
+        detail = grok_clean_detail(f"Permission: {pending_permission}")
+        has_question = True
+    elif pending_tool in GROK_WAITING_TOOLS:
+        status_override = "waiting"
+        detail = "Waiting for input"
+        has_question = True
+    elif pending_tool:
+        status_override = "working"
+        detail = grok_clean_detail(f"Running: {pending_tool}")
+    elif phase in GROK_WORKING_PHASES:
+        status_override = "working"
+        detail = grok_phase_detail(phase)
+    elif phase in GROK_WAITING_PHASES:
+        status_override = "waiting"
+        detail = "Waiting for permission"
+        has_question = True
+    elif turn_open:
+        status_override = "working"
+        detail = "Thinking…"
+    elif turn_finished:
+        status_override = "completed"
+        detail = last_turn_summary or "Task completed"
+    else:
+        status_override = "idle"
+        detail = "Ready for prompt"
+
+    return latest_user_prompt, detail, model_name or "", status_override, has_question
+
+
 def is_valid_agent_process(pid: int) -> bool:
     """Validate that a PID actually corresponds to an active AI agent process before signaling."""
     if pid <= 1:
@@ -273,7 +1146,10 @@ def is_valid_agent_process(pid: int) -> bool:
     cmd = info["cmd"]
     tokens = cmd.split()
     first = os.path.basename(tokens[0]) if tokens else ""
-    if first in ("omp", "pi", "claude", "codex", "opencode", "cline", "cursor", "agy") and not is_claude_helper_process(cmd, info.get("argv")):
+    argv = info.get("argv")
+    if first == "grok" and not is_grok_helper_process(cmd, argv):
+        return True
+    if first in ("omp", "pi", "claude", "codex", "opencode", "cline", "cursor", "agy") and not is_claude_helper_process(cmd, argv):
         return True
     if first in ("python", "python3") and is_hermes_cli_process(cmd):
         return True
@@ -428,8 +1304,29 @@ def read_claude_hook_status(pid: int) -> Optional[Dict[str, str]]:
     }
 
 
-def find_session_for_process(agent_type: str, pid: int, cwd: str, claimed_sessions: Set[str]) -> Optional[str]:
+def find_session_for_process(agent_type: str, pid: int, cwd: str, claimed_sessions: Set[str], argv: Optional[List[str]] = None) -> Optional[str]:
     """Find active or recent session file strictly belonging to this specific process."""
+    if agent_type == "grok":
+        # 1. The live roster is authoritative: it is keyed by the session's own
+        #    pid, so concurrent sessions in one cwd stay distinct, and its cwd is
+        #    Grok's view of the session directory rather than /proc's.
+        active = grok_active_session_for_pid(pid)
+        if active:
+            return active if active not in claimed_sessions else None
+        # 2. Fallback for a session the roster has not caught up with. Skip it
+        #    entirely when the invocation passed `--cwd`: the process cwd is then
+        #    not the session cwd, and a wrong card is worse than no card.
+        if grok_argv_has_cwd_override(argv):
+            return None
+        p_start = get_process_start_time(pid)
+        for session_dir in grok_sessions_for_cwd(cwd):
+            if session_dir in claimed_sessions or grok_session_is_subagent(session_dir):
+                continue
+            mtime = grok_summary_mtime(session_dir)
+            if p_start > 0 and mtime >= (p_start - 5.0):
+                return session_dir
+        return None
+
     if agent_type == "omp":
         # 1. Check PTS terminal session mapping in ~/.omp/agent/terminal-sessions/pts-<N>
         try:
@@ -503,6 +1400,14 @@ def match_hypr_client_for_terminal(ancestor_pids: List[int], cwd: str, agent_typ
 def find_latest_session_for_cwd(agent_type: str, cwd: str, claimed_sessions: Optional[Set[str]] = None) -> Optional[str]:
     """Find the most recent session file matching a working directory that is not already claimed."""
     claimed = claimed_sessions or set()
+    if agent_type == "grok":
+        try:
+            for session_dir in grok_sessions_for_cwd(cwd):
+                if session_dir not in claimed and not grok_session_is_subagent(session_dir):
+                    return session_dir
+        except Exception:
+            pass
+        return None
     if agent_type == "omp" and os.path.exists(OMP_SESSIONS_DIR):
         try:
             folder_part = os.path.basename(cwd.rstrip("/")) if cwd else ""
@@ -536,7 +1441,7 @@ def extract_first_line(text: str, max_len: int = 140) -> str:
         line = re.sub(r"\*\*([^*]+)\*\*", r"\1", line)
         line = re.sub(r"\*([^*]+)\*", r"\1", line)
         line = re.sub(r"`([^`]+)`", r"\1", line)
-        line = " ".join(line.split())
+        line = " ".join(re.sub(r"[\x00-\x1f\x7f-\x9f]", " ", clean_ansi(line)).split())
         if not line:
             continue
         line = redact_secrets(line)
@@ -544,6 +1449,9 @@ def extract_first_line(text: str, max_len: int = 140) -> str:
             return line[:max_len - 1].rstrip() + "…"
         return line
     return ""
+
+
+MAX_PROMPT_CHARS = 400  # display cap for prompt/title text (card title, bar headline)
 
 
 def clean_user_prompt(text: str) -> str:
@@ -554,8 +1462,15 @@ def clean_user_prompt(text: str) -> str:
     cleaned = re.sub(r"<system-directive>.*?</system-directive>", "", cleaned, flags=re.DOTALL).strip()
     cleaned = re.sub(r"<[^>]+>", "", cleaned).strip()
     cleaned = re.sub(r"^#+\s*", "", cleaned).strip()
+    # Untrusted text (session transcripts, terminal titles): drop escape sequences
+    # and control bytes before redaction — an embedded control byte both reaches
+    # the UI and splits a credential so the token regex no longer matches it.
+    cleaned = clean_ansi(cleaned)
+    cleaned = re.sub(r"[\x00-\x1f\x7f-\x9f]", " ", cleaned)
     cleaned = redact_secrets(cleaned)
-    return " ".join(cleaned.split())
+    # Display text only, but it ends up in card titles and the bar headline, so cap
+    # it: an unbounded prompt would otherwise inflate the whole status payload.
+    return " ".join(cleaned.split())[:MAX_PROMPT_CHARS]
 
 
 def is_system_wrapper(text: str) -> bool:
@@ -1006,6 +1921,7 @@ _ORCA_AGENT_ALIASES = {
     "agy": "agy",
     "cursor": "cursor",
     "cline": "cline",
+    "grok": "grok",
 }
 
 # Bare shells / system programs that mean "no agent in this terminal".
@@ -1041,6 +1957,7 @@ _ORCA_MODEL_AGENT_HINTS = (
     ("o3", "codex"),
     ("o4", "codex"),
     ("gemini", "gemini"),
+    ("grok", "grok"),
 )
 
 # Unambiguous agent-TUI chrome strings (beyond the CLI's own name) that can
@@ -1053,11 +1970,12 @@ _ORCA_PREVIEW_CHROME_MARKERS = {
     "codex": (),
     "opencode": (),
     "agy": (),
+    "grok": (),
 }
 
 # Agent names looked up literally (as words) in the preview when the title's
 # model token yields no hint. Ordered most-specific first.
-_ORCA_PREVIEW_AGENT_NAMES = ("hermes", "opencode", "gemini", "claude", "codex", "omp", "agy", "pi")
+_ORCA_PREVIEW_AGENT_NAMES = ("hermes", "opencode", "gemini", "claude", "codex", "omp", "agy", "pi", "grok")
 
 
 def _contains_word(haystack: str, word: str) -> bool:
@@ -1287,6 +2205,8 @@ def scan_orca_agents(claimed_sessions: Set[str]) -> List[Dict[str, Any]]:
                 claimed_sessions.add(session_path)
                 if agent_type == "omp" and os.path.exists(session_path):
                     user_goal, detail_text, model_name, status_override, has_question = extract_omp_task_from_session(session_path)
+                elif agent_type == "grok":
+                    user_goal, detail_text, model_name, status_override, has_question = extract_grok_task_from_session(session_path)
                 elif agent_type == "hermes":
                     _, model_name, _, _, detail_text, status_override, has_question = extract_hermes_session_info(source_preference="cli")
             elif agent_type == "omp":
@@ -1366,7 +2286,7 @@ def scan_standalone_agents(herdr_server_pids: List[int], seen_cwds: Set[str], cl
             )
 
             # Skip anything running inside Herdr, spawned as an internal background worker, or system usage script
-            if is_in_herdr or is_broker_child or is_claude_helper_process(cmd, info.get("argv")) or "omarchy-agent-usage" in cmd or "__omp_worker" in cmd or "gateway run" in cmd or "serve --host" in cmd or "zygote" in cmd or "agent_ctl.py" in cmd:
+            if is_in_herdr or is_broker_child or is_claude_helper_process(cmd, info.get("argv")) or is_grok_helper_process(cmd, info.get("argv")) or "omarchy-agent-usage" in cmd or "__omp_worker" in cmd or "gateway run" in cmd or "serve --host" in cmd or "zygote" in cmd or "agent_ctl.py" in cmd:
                 continue
 
             # Check if this is a Hermes Desktop GUI process
@@ -1407,6 +2327,8 @@ def scan_standalone_agents(herdr_server_pids: List[int], seen_cwds: Set[str], cl
             elif first == "agy":
                 # Google Antigravity CLI - no JSONL transcripts; generic enrichment
                 agent_type = "agy"
+            elif first == "grok":
+                agent_type = "grok"
             elif first in ("claude", "codex", "opencode", "cline", "cursor"):
                 agent_type = first
             elif first in ("python", "python3") and is_hermes_cli_process(cmd):
@@ -1450,7 +2372,16 @@ def scan_standalone_agents(herdr_server_pids: List[int], seen_cwds: Set[str], cl
                 # the session itself, so it wins over transcript inference and
                 # over the process-state guess further down.
                 claude_hook_status = read_claude_hook_status(pid) if agent_type == "claude" else None
-                session_path = None if claude_hook_status else find_session_for_process(agent_type, pid, cwd, claimed_sessions)
+                session_path = None if claude_hook_status else find_session_for_process(agent_type, pid, cwd, claimed_sessions, info.get("argv"))
+                if agent_type == "grok" and session_path:
+                    # Only a real `.cwd` marker (long-path slug+hash groups) may
+                    # override the breadcrumb: falling back to the decoded group
+                    # name here would print a slug+hash as if it were a path.
+                    session_cwd = grok_group_cwd_marker(os.path.dirname(session_path))
+                    if session_cwd:
+                        cwd = session_cwd
+                        repo_name = os.path.basename(cwd.rstrip("/")) if cwd else ""
+                        clean_cwd = shorten_path(cwd)
                 user_goal = None
                 detail_text = None
                 model_name = None
@@ -1468,6 +2399,8 @@ def scan_standalone_agents(herdr_server_pids: List[int], seen_cwds: Set[str], cl
                             user_goal, detail_text, model_name, status_override, has_question = extract_omp_task_from_session(session_path)
                         else:
                             model_name = get_omp_default_model()
+                    elif agent_type == "grok":
+                        user_goal, detail_text, model_name, status_override, has_question = extract_grok_task_from_session(session_path)
                     elif agent_type == "hermes":
                         p_st = get_process_start_time(pid)
                         user_goal, model_name, _, _, detail_text, status_override, has_question = extract_hermes_session_info(source_preference="cli", min_start_time=p_st)
@@ -1516,6 +2449,9 @@ def scan_standalone_agents(herdr_server_pids: List[int], seen_cwds: Set[str], cl
 
 def fetch_all_agents() -> Dict[str, Any]:
     """Fetch all agent data, combining Herdr snapshot, session enrichment, and standalone processes."""
+    # Grok session reads are budgeted per fetch cycle, so a large or hostile
+    # $GROK_HOME cannot turn one tick into unbounded work.
+    _GROK_BUDGET.reset()
     herdr_pids = get_herdr_server_pids()
 
     agents_list = []
@@ -1604,6 +2540,8 @@ def fetch_all_agents() -> Dict[str, Any]:
 
             if agent_type == "omp" and session_path:
                 user_goal, detail_text, model_name, status_override, has_question = extract_omp_task_from_session(session_path)
+            elif agent_type == "grok" and session_path:
+                user_goal, detail_text, model_name, status_override, has_question = extract_grok_task_from_session(session_path)
             elif agent_type == "hermes":
                 hermes_p_start = None
                 for hp in glob.glob("/proc/[0-9]*"):
@@ -2009,10 +2947,116 @@ def launch_agent(agent_name: Optional[str] = None) -> Dict[str, Any]:
         return {"ok": False, "error": str(e)}
 
 
+STATUS_MAX_AGENTS = 256      # agent cards kept in one status payload
+STATUS_MAX_WORKSPACES = 128  # workspace labels kept in one status payload
+STATUS_MAX_BYTES = 262144    # hard ceiling on the serialized status payload
+
+
+_STATUS_TEXT_MAX = 400       # per-string clip applied to agent-supplied fields
+_STATUS_NUMBER_BOUND = 10 ** 12
+
+
+def _clip_text(value: Any, limit: int = _STATUS_TEXT_MAX) -> str:
+    """Coerce a display string to a whitespace-flattened, clipped form."""
+    text = value if isinstance(value, str) else ("" if value is None else str(value))
+    return " ".join(text.split())[:limit]
+
+
+def _bounded_number(value: Any) -> Any:
+    """Bound numeric payload fields so a pathological int cannot break json.dumps.
+
+    Python refuses to serialize ints past ~4300 digits; this is not reachable from
+    session files today (every file-sourced value is str()-coerced or a bounded
+    count) but the serializer is the last line of defence, so it is clamped here.
+    """
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return value
+    try:
+        if isinstance(value, float):
+            return value if value == value and abs(value) != float("inf") else 0.0
+        return max(-_STATUS_NUMBER_BOUND, min(_STATUS_NUMBER_BOUND, int(value)))
+    except Exception:
+        return 0
+
+
+def _dumps(payload: Dict[str, Any]) -> str:
+    """json.dumps that never raises: unencodable values fall back to their str()."""
+    try:
+        return json.dumps(payload, indent=2)
+    except Exception:
+        try:
+            return json.dumps(payload, indent=2, default=str)
+        except Exception:
+            return ""
+
+
+def dump_status_json(data: Dict[str, Any]) -> str:
+    """Serialize the status payload inside a hard, structural size bound.
+
+    The panel reads this through a StdioCollector with no cap of its own and then
+    slices whatever arrives to 262144 characters before JSON.parse, so the reply
+    has to be valid JSON *within* that bound — truncating mid-JSON would just
+    freeze the widget on stale data. Every agent-supplied string is clipped first
+    (a single hostile session file must not be able to inflate the reply), then the
+    agent list is capped, and only if the result still exceeds the ceiling is the
+    payload reduced to numeric counts.
+    """
+    payload = dict(data)
+    agents = payload.get("agents")
+    if isinstance(agents, list):
+        clipped: List[Any] = []
+        for agent in agents[:STATUS_MAX_AGENTS]:
+            if isinstance(agent, dict):
+                clipped.append({k: (_clip_text(v) if isinstance(v, str) else _bounded_number(v)) for k, v in agent.items()})
+        payload["agents"] = clipped
+    summary = payload.get("summary")
+    if isinstance(summary, dict):
+        payload["summary"] = {
+            k: (_clip_text(v, 300) if isinstance(v, str) else _bounded_number(v))
+            for k, v in summary.items()
+        }
+    workspaces = payload.get("workspaces")
+    if isinstance(workspaces, list):
+        payload["workspaces"] = [_clip_text(w, 200) for w in workspaces[:STATUS_MAX_WORKSPACES]]
+    text = _dumps(payload)
+    if text and len(text) <= STATUS_MAX_BYTES:
+        return text
+
+    # Still oversized (or unserializable): keep the counts, drop every free-text
+    # field, and bound the numbers so this reply cannot grow with any input.
+    counts: Dict[str, Any] = {}
+    for key, value in (summary if isinstance(summary, dict) else {}).items():
+        if isinstance(value, (bool, int, float)):
+            counts[key] = _bounded_number(value)
+        elif key == "active_agents" and isinstance(value, list):
+            counts[key] = [_clip_text(item, 40) for item in value[:32]]
+    trimmed = {
+        "ok": bool(payload.get("ok", True)),
+        "connected": bool(payload.get("connected", False)),
+        "herdr_sessions": [],
+        "orca_connected": bool(payload.get("orca_connected", False)),
+        "summary": counts,
+        "agents": [],
+        "workspaces": [],
+        "truncated": True,
+    }
+    text = _dumps(trimmed)
+    if not text or len(text) > STATUS_MAX_BYTES:
+        text = _dumps({
+            "ok": True,
+            "connected": False,
+            "summary": {"total": _bounded_number(counts.get("total") or 0)},
+            "agents": [],
+            "workspaces": [],
+            "truncated": True,
+        })
+    return text
+
+
 def main() -> None:
     if len(sys.argv) < 2 or sys.argv[1] in ("fetch", "status", "--json", "-j"):
         data = fetch_all_agents()
-        print(json.dumps(data, indent=2))
+        print(dump_status_json(data))
         return
 
     cmd = sys.argv[1]

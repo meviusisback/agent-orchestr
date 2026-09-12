@@ -5,7 +5,7 @@
   "version": "1.0.0",
   "author": "meviusisback",
   "license": "MIT",
-  "description": "Live monitor and workspace orchestrator for AI coding agents (Herdr, OMP, Hermes, Claude, Codex) in the Omarchy bar.",
+  "description": "Live monitor and workspace orchestrator for AI coding agents (Herdr, OMP, Hermes, Claude, Codex, Grok) in the Omarchy bar.",
   "kinds": [
     "bar-widget"
   ],
@@ -26,7 +26,8 @@
       "refreshIntervalSec": 3,
       "barDisplay": "Icon",
       "showIdleInBar": false,
-      "maxTaskLength": 45
+      "maxTaskLength": 45,
+      "privacyHidePrompts": false
     },
     "schema": [
       {
@@ -49,7 +50,7 @@
           "Compact"
         ],
         "defaultValue": "Icon",
-        "description": "Icon shows the orchestrator glyph + badge; Status shows the top active task; Compact shows total and busy count."
+        "description": "Icon shows the orchestrator glyph + badge; Status shows the top active task; Compact shows total and busy count. With privacyHidePrompts enabled, Status falls back to the counts form so no task text is shown."
       },
       {
         "key": "showIdleInBar",
@@ -67,6 +68,13 @@
         "step": 5,
         "defaultValue": 45,
         "description": "Maximum characters shown in the bar ticker for active tasks."
+      },
+      {
+        "key": "privacyHidePrompts",
+        "type": "boolean",
+        "label": "Hide prompt text (screen sharing)",
+        "defaultValue": false,
+        "description": "Hide agent-supplied task and prompt text in the bar and cards, showing counts, status, repo and workspace only — useful when recording or sharing your screen."
       }
     ]
   }

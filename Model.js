@@ -107,12 +107,13 @@ function agentDisplayName(agent) {
   if (a === "claude") return "Claude"
   if (a === "codex") return "Codex"
   if (a === "opencode") return "OpenCode"
+  if (a === "grok") return "Grok"
   return a ? a.charAt(0).toUpperCase() + a.slice(1) : "Agent"
 }
 
 function agentIconPath(agent) {
   var a = String(agent || "").toLowerCase()
-  var known = ["omp", "hermes", "herdr", "claude", "codex", "opencode"]
+  var known = ["omp", "hermes", "herdr", "claude", "codex", "opencode", "grok"]
   if (known.indexOf(a) >= 0) {
     return "assets/icons/" + a + ".svg"
   }
@@ -127,13 +128,16 @@ function truncateText(text, maxLen) {
   return str.slice(0, limit - 1).trim() + "…"
 }
 
-function formatBarHeadline(summary, displayMode, maxLen) {
+function formatBarHeadline(summary, displayMode, maxLen, hideTask) {
   if (!summary) return "Agents"
   var total = Number(summary.total) || 0
   var working = Number(summary.working) || 0
   var waiting = Number(summary.waiting) || 0
   var completed = Number(summary.completed) || 0
-  var mode = String(displayMode || "Icon").toLowerCase()
+  // hideTask (privacyHidePrompts): the headline string is agent-supplied task
+  // text, so it is never rendered when the user asked for prompts to be hidden —
+  // falls through to the counts-only form below.
+  var mode = hideTask ? "compact" : String(displayMode || "Icon").toLowerCase()
 
   if (mode === "compact") {
     if (waiting > 0) return total + " ag · " + waiting + " prompt"
