@@ -168,6 +168,25 @@ def query_herdr_socket(method: str, params: Optional[Dict[str, Any]] = None, tim
         return None
 
 
+def herdr_error_message(res: Optional[Dict[str, Any]]) -> Optional[str]:
+    """Failure reason carried by a Herdr reply, or None when it succeeded.
+
+    query_herdr_socket() collapses a missing socket, a timeout and a malformed
+    reply into None, and Herdr reports a refused request as a JSON-RPC error
+    object. Both mean the call did not take effect, so callers must not treat
+    either as success.
+    """
+    if res is None:
+        return "Herdr socket did not answer"
+    err = res.get("error")
+    if isinstance(err, dict):
+        message = err.get("message") or err.get("code")
+        return str(message) if message else "Herdr refused the request"
+    if err:
+        return str(err)
+    return None
+
+
 def get_hypr_env() -> Dict[str, str]:
     """Ensure HYPRLAND_INSTANCE_SIGNATURE and XDG_RUNTIME_DIR are set for hyprctl."""
     env = dict(os.environ)
@@ -2861,6 +2880,61 @@ def focus_pane(target_id: str) -> Dict[str, Any]:
 
     return {"ok": True, "pane_id": pane_target, "herdr_session": sess_name}
 
+
+def close_hypr_window(addr: str, env: Optional[Dict[str, str]] = None) -> bool:
+    """Close the Hyprland client at a validated address."""
+    if not addr or not re.fullmatch(r"(?:0x)?[0-9a-fA-F]+", str(addr)):
+        return False
+    try:
+        subprocess.run(
+            ["hyprctl", "dispatch", f'hl.dsp.window.close({{ window = "address:{addr}" }})'],
+            env=env or get_hypr_env(),
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=0.5,
+        )
+        return True
+    except Exception:
+        return False
+
+
+def agent_pids_in_window(win_pid: int) -> List[int]:
+    """Recognized agent processes running under a terminal window's process.
+
+    Standalone cards are keyed by window address, and the window's own process
+    is the terminal emulator, so the agent to signal is a descendant of it.
+    Every candidate still has to clear is_valid_agent_process(), which keeps
+    the kill gate identical to the PID-addressed path.
+    """
+    if not isinstance(win_pid, int) or win_pid <= 1:
+        return []
+    pids = []
+    for p in glob.glob("/proc/[0-9]*"):
+        try:
+            pid = int(os.path.basename(p))
+        except ValueError:
+            continue
+        if pid == win_pid or not is_valid_agent_process(pid):
+            continue
+        if any(a["pid"] == win_pid for a in get_process_ancestors(pid)):
+            pids.append(pid)
+    return pids
+
+
+def signal_agent_pids(pids: List[int]) -> Tuple[List[int], Optional[str]]:
+    """SIGTERM each pid, reporting the first refusal."""
+    killed = []
+    for pid in pids:
+        try:
+            os.kill(pid, signal.SIGTERM)
+            killed.append(pid)
+        except ProcessLookupError:
+            continue
+        except Exception as e:
+            return killed, f"Cannot signal PID {pid}: {e}"
+    return killed, None
+
+
 def kill_target(target_id: str) -> Dict[str, Any]:
     """Gracefully terminate an agent process or close a Herdr pane."""
     if not target_id:
@@ -2868,7 +2942,24 @@ def kill_target(target_id: str) -> Dict[str, Any]:
 
     env = get_hypr_env()
 
-    # 1. Standalone terminal process
+    # 1. Standalone terminal window, the form scan_standalone_agents() emits
+    if target_id.startswith("terminal:addr:"):
+        addr = target_id[len("terminal:addr:"):]
+        if not re.fullmatch(r"(?:0x)?[0-9a-fA-F]+", addr):
+            return {"ok": False, "error": "Invalid window address format"}
+        target_win = next((c for c in get_hypr_clients() if c.get("address") == addr), None)
+        if not target_win:
+            return {"ok": False, "error": "Standalone terminal window not found"}
+        pids = agent_pids_in_window(target_win.get("pid"))
+        if not pids:
+            return {"ok": False, "error": "No recognized agent process in that terminal window"}
+        close_hypr_window(addr, env)
+        killed, err = signal_agent_pids(pids)
+        if err:
+            return {"ok": False, "error": err, "killed_pids": killed}
+        return {"ok": True, "pane_id": target_id, "killed_pids": killed}
+
+    # 2. Standalone terminal addressed by agent PID
     if target_id.startswith("terminal:pid:"):
         pid_str = target_id.replace("terminal:pid:", "")
         try:
@@ -2876,32 +2967,18 @@ def kill_target(target_id: str) -> Dict[str, Any]:
             if not is_valid_agent_process(pid):
                 return {"ok": False, "error": f"PID {pid} is not a recognized agent process"}
             ancestors = get_process_ancestors(pid)
-            clients = get_hypr_clients()
             ancestor_pids = [pid] + [a["pid"] for a in ancestors]
             matched_win = match_hypr_client_for_terminal(ancestor_pids, "", "")
             if matched_win and matched_win.get("address"):
-                win_addr = matched_win["address"]
-                if re.fullmatch(r"(?:0x)?[0-9a-fA-F]+", str(win_addr)):
-                    try:
-                        lua_close = f'hl.dsp.window.close({{ window = "address:{win_addr}" }})'
-                        subprocess.run(
-                            ["hyprctl", "dispatch", lua_close],
-                            env=env,
-                            stdout=subprocess.DEVNULL,
-                            stderr=subprocess.DEVNULL,
-                            timeout=0.5,
-                        )
-                    except Exception:
-                        pass
-            try:
-                os.kill(pid, signal.SIGTERM)
-            except ProcessLookupError:
-                pass
-            return {"ok": True, "killed_pid": pid}
+                close_hypr_window(matched_win["address"], env)
+            killed, err = signal_agent_pids([pid])
+            if err:
+                return {"ok": False, "error": err}
+            return {"ok": True, "killed_pid": pid, "killed_pids": killed}
         except Exception as e:
             return {"ok": False, "error": str(e)}
 
-    # 2. Hermes Desktop window
+    # 3. Hermes Desktop window
     if target_id.startswith("desktop:hermes:"):
         pid_str = target_id.replace("desktop:hermes:", "")
         try:
@@ -2918,22 +2995,28 @@ def kill_target(target_id: str) -> Dict[str, Any]:
                 )
             except Exception:
                 pass
-            try:
-                os.kill(pid, signal.SIGTERM)
-            except ProcessLookupError:
-                pass
-            return {"ok": True, "killed_pid": pid}
+            killed, err = signal_agent_pids([pid])
+            if err:
+                return {"ok": False, "error": err}
+            return {"ok": True, "killed_pid": pid, "killed_pids": killed}
         except Exception as e:
             return {"ok": False, "error": str(e)}
 
-    # 3. Herdr pane (session-qualified targets look like herdr:<session>|<pane_id>)
+    # 4. Herdr pane (session-qualified targets look like herdr:<session>|<pane_id>)
     if target_id.startswith("herdr:"):
         parts = target_id.split("|", 1)
         sess_name = parts[0][len("herdr:"):]
         pane_target = parts[1] if len(parts) > 1 else target_id
         res = query_herdr_socket("pane.close", {"pane_id": pane_target}, sock_path=herdr_socket_for_session(sess_name))
+        err = herdr_error_message(res)
+        if err:
+            return {"ok": False, "error": err, "pane_id": pane_target, "herdr_session": sess_name, "socket_res": res}
         return {"ok": True, "pane_id": pane_target, "herdr_session": sess_name, "socket_res": res}
+
     res = query_herdr_socket("pane.close", {"pane_id": target_id})
+    err = herdr_error_message(res)
+    if err:
+        return {"ok": False, "error": err, "pane_id": target_id, "socket_res": res}
     return {"ok": True, "pane_id": target_id, "socket_res": res}
 
 
