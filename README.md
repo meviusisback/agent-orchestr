@@ -239,6 +239,14 @@ and no real `~/.grok`, and never runs a full `fetch_all_agents()` cycle:
 python3 tests/test_grok_sessions.py
 ```
 
+`kill_target()` has its own hermetic suite. Hyprland queries, window closing,
+the Herdr socket and `os.kill` are all patched, so it signals nothing and is
+safe to run on a live desktop with real agents on screen:
+
+```bash
+python3 tests/test_kill_target.py
+```
+
 ## Security & Privacy
 
 - **Zero Network Transmission**: All agent tracking and process inspection runs 100% locally on your machine.
@@ -251,6 +259,8 @@ python3 tests/test_grok_sessions.py
 - **Shell & Injection Safety**: All subprocess and Hyprland dispatch operations use discrete argument vectors without shell evaluation (the status refresh execs the collector directly, with the payload bounded inside it rather than by a shell pipeline), and QML Text components enforce plain-text formatting.
 - **Bounded Status Payload**: the collector caps the number of agent cards and the serialized reply size, so a pathological machine cannot make the widget's stdio collector accumulate unbounded output.
 - **Plain-Text Convention**: Every `Text` element in `Panel.qml` must declare `textFormat: Text.PlainText` explicitly — agent-supplied strings (titles, labels, paths) must never render through QML's default `AutoText`, which would interpret rich-text markup as shell UI. New widgets should preserve this invariant.
+- **Card Hit-Testing Convention**: The full-card `MouseArea` that focuses a pane must stay declared *before* `cardContent` in the list delegate. Equal-`z` siblings are hit-tested in reverse declaration order, so a trailing full-card `MouseArea` silently covers the header controls and swallows the terminate button's clicks and hover.
+
 ## License
 
 MIT

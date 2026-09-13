@@ -51,6 +51,7 @@ Panel {
   property bool loading: false
   property string selectedFilter: "all" // "all" | "working" | "idle"
   property string lastFocusedPane: ""
+  property string killError: ""
 
   readonly property var filteredAgents: {
     var list = root.agents || []
@@ -92,6 +93,7 @@ Panel {
 
   function killTarget(paneId) {
     if (!paneId) return
+    root.killError = ""
     killProc.command = ["python3", root.scriptPath(), "kill", paneId]
     killProc.running = true
   }
@@ -180,7 +182,18 @@ Panel {
     id: killProc
     stdout: StdioCollector {
       waitForEnd: true
-      onStreamFinished: root.fetchStatus()
+      onStreamFinished: {
+        // kill_target reports a refused Herdr call or an unresolvable target as
+        // ok:false, so a no-op terminate has to reach the footer rather than
+        // look identical to a successful one.
+        try {
+          var res = JSON.parse(text || "{}")
+          root.killError = res.ok ? "" : String(res.error || "terminate failed")
+        } catch (e) {
+          root.killError = "terminate produced no usable reply"
+        }
+        root.fetchStatus()
+      }
     }
   }
 
@@ -528,6 +541,19 @@ Panel {
             }
             Behavior on color { ColorAnimation { duration: 120 } }
 
+            // Click entire card to focus pane / window. This must stay declared
+            // before cardContent: equal-z siblings are hit-tested in reverse
+            // declaration order, so a trailing full-card MouseArea would cover
+            // the header controls and swallow the terminate button's clicks and
+            // hover instead of letting them through.
+            MouseArea {
+              id: cardMouseArea
+              anchors.fill: parent
+              cursorShape: Qt.PointingHandCursor
+              hoverEnabled: true
+              onClicked: root.focusPane(modelData.pane_id)
+            }
+
             ColumnLayout {
               id: cardContent
               anchors.fill: parent
@@ -775,15 +801,6 @@ Panel {
                 }
               }
             }
-
-            // Click entire card to focus pane / window
-            MouseArea {
-              id: cardMouseArea
-              anchors.fill: parent
-              cursorShape: Qt.PointingHandCursor
-              hoverEnabled: true
-              onClicked: root.focusPane(modelData.pane_id)
-            }
           }
         }
       }
@@ -823,13 +840,15 @@ Panel {
 
           Item { Layout.fillWidth: true }
 
-          // Keyboard hint
+          // Keyboard hint, or the reason the last terminate did nothing
           Text {
-            text: "Click card to focus · ✕ to terminate"
+            text: root.killError ? ("Terminate failed: " + root.killError) : "Click card to focus · ✕ to terminate"
             textFormat: Text.PlainText
             font.family: root.fontFamily
             font.pixelSize: Style.space(9)
-            color: root.dim
+            color: root.killError ? root.urgent : root.dim
+            elide: Text.ElideRight
+            Layout.maximumWidth: Style.space(300)
           }
         }
       }
