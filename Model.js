@@ -23,12 +23,14 @@ function statusBadgeText(status) {
   if (s === "working") return "ACTIVE"
   if (s === "waiting") return "PROMPT"
   if (s === "error") return "ERROR"
+  if (s === "unknown") return "UNKNOWN"
   return "IDLE"
 }
 
 function originColor(origin) {
   var o = String(origin || "").toLowerCase()
   if (o === "orca") return "#22D3EE"
+  if (o === "herdr_remote") return "#F97316"
   if (o.indexOf("desktop") >= 0) return "#F59E0B"
   if (o === "terminal") return "#38BDF8"
   return "#A855F7"
@@ -37,10 +39,13 @@ function originColor(origin) {
 function originBadgeText(origin) {
   var o = String(origin || "").toLowerCase()
   if (o === "orca") return "ORCA"
+  if (o === "herdr_remote") return "HERDR · REMOTE"
   if (o === "herdr_desktop") return "HERDR · GUI"
   if (o === "desktop") return "DESKTOP APP"
+  if (o === "process") return "HERMES CLI"
   if (o === "terminal") return "TERMINAL"
-  return "HERDR"
+  if (o === "herdr") return "HERDR"
+  return String(origin || "AGENT").toUpperCase()
 }
 
 function originIcon(origin) {
@@ -66,6 +71,8 @@ function originSummaryText(agents) {
   var herdrCount = 0
   var terminalCount = 0
   var desktopCount = 0
+  var cliCount = 0
+  var unknownCount = 0
   var orcaCount = 0
 
   for (var i = 0; i < list.length; i++) {
@@ -77,8 +84,14 @@ function originSummaryText(agents) {
       desktopCount++
     } else if (o === "terminal") {
       terminalCount++
-    } else {
+    } else if (o === "herdr_remote") {
       herdrCount++
+    } else if (o === "process") {
+      cliCount++
+    } else if (o === "herdr" || o === "herdr_desktop") {
+      herdrCount++
+    } else {
+      unknownCount++
     }
   }
 
@@ -88,6 +101,12 @@ function originSummaryText(agents) {
   }
   if (terminalCount > 0) {
     parts.push(terminalCount + (terminalCount === 1 ? " on terminal" : " on terminals"))
+  }
+  if (cliCount > 0) {
+    parts.push(cliCount + (cliCount === 1 ? " Hermes CLI" : " Hermes CLI instances"))
+  }
+  if (unknownCount > 0) {
+    parts.push(unknownCount + (unknownCount === 1 ? " unknown" : " unknown agents"))
   }
   if (orcaCount > 0) {
     parts.push(orcaCount + (orcaCount === 1 ? " on Orca" : " on Orca"))
@@ -168,12 +187,14 @@ function getTooltipText(summary) {
   var completed = Number(summary.completed) || 0
   var idle = Number(summary.idle) || 0
   var waiting = Number(summary.waiting) || 0
+  var unknown = Number(summary.unknown) || 0
 
   if (total === 0) return "Agent Orchestrator: No active agents"
   var parts = []
   if (working > 0) parts.push(working + " working")
   if (waiting > 0) parts.push(waiting + " awaiting input")
   if (completed > 0) parts.push(completed + " completed")
+  if (unknown > 0) parts.push(unknown + " unknown")
   if (idle > 0) parts.push(idle + " idle")
   return "Agent Orchestrator · " + parts.join(", ") + " (" + total + " total)"
 }

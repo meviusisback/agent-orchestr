@@ -18,6 +18,11 @@ Real-time status, active tasks, and one-click workspace switching for AI coding 
   - **Process Management**: Safely terminate agent processes or close Herdr panes directly from card action buttons.
   - **Privacy First**: Automatic redaction of sensitive API keys and tokens from display prompts and status messages.
   - **Adaptive Fast Polling**: 1s live refresh while popup is open or agents are working; configurable interval when idle.
+
+### Remote source setup
+
+- **Herdr**: save a machine with `herdr machine add`, verify SSH access and matching remote Herdr installation. The plugin reads enabled rows from `herdr machine list --json` and queries each machine through the read-only `herdr --session <name> api snapshot` command. Remote cards are read-only: focus and terminate stay disabled because their windows are not on this desktop.
+- **Hermes Desktop gateways**: the plugin reads only non-secret labels and URLs from `~/.config/Hermes/connections.json`. OAuth tokens remain owned by Hermes Desktop. Full remote Hermes session cards require a future supported Desktop-to-bar roster bridge; this plugin does not scrape cookies, safeStorage, or token files.
 ## Installation
 
 ### Via Omarchy Marketplace / Plugin Manager

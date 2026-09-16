@@ -84,6 +84,8 @@ Panel {
 
   function focusPane(paneId) {
     if (!paneId) return
+    var agent = root.agents.find(function(a) { return a.pane_id === paneId })
+    if (agent && agent.can_focus === false) return
     root.lastFocusedPane = paneId
     focusProc.command = ["python3", root.scriptPath(), "focus", paneId]
     focusProc.running = true
@@ -661,6 +663,7 @@ Panel {
                 Rectangle {
                   implicitWidth: Style.space(22)
                   implicitHeight: Style.space(22)
+                  visible: modelData.can_control !== false
                   radius: Style.space(6)
                   color: killMouse.containsMouse ? root.alpha(root.urgent, 0.35) : root.alpha(root.foreground, 0.08)
                   border.width: 1
@@ -680,8 +683,8 @@ Panel {
                     id: killMouse
                     anchors.fill: parent
                     hoverEnabled: true
-                    cursorShape: Qt.PointingHandCursor
-                    onClicked: root.killTarget(modelData.pane_id)
+                    cursorShape: modelData.can_control === false ? Qt.ArrowCursor : Qt.PointingHandCursor
+                    onClicked: if (modelData.can_control !== false) root.killTarget(modelData.pane_id)
                   }
                 }
               }
@@ -780,9 +783,9 @@ Panel {
             MouseArea {
               id: cardMouseArea
               anchors.fill: parent
-              cursorShape: Qt.PointingHandCursor
+              cursorShape: modelData.can_focus === false ? Qt.ArrowCursor : Qt.PointingHandCursor
               hoverEnabled: true
-              onClicked: root.focusPane(modelData.pane_id)
+              onClicked: if (modelData.can_focus !== false) root.focusPane(modelData.pane_id)
             }
           }
         }
