@@ -918,6 +918,40 @@ class PeerTlsHostnameIdentity(unittest.TestCase):
             srv.server_close()
         self.assertEqual(captured.get("server_hostname"), "spark.lan.test")
 
+    def test_the_host_header_carries_the_configured_name_not_the_address(self):
+        # HTTPConnection.putrequest() builds the Host: header from self.host, so
+        # pinning the socket address must not change it either — a peer behind a
+        # virtual host (and every gateway) routes on that name.
+        import http.server
+        import socketserver
+
+        seen = []
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def log_message(self, format, *args):  # noqa: A002
+                pass
+
+            def do_GET(self):  # noqa: N802
+                seen.append((self.headers.get("Host"), self.path))
+                body = b'{"object":"list","data":[]}'
+                self.send_response(200)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+        srv = socketserver.TCPServer(("127.0.0.1", 0), Handler)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        try:
+            with mock.patch.object(ac, "_peer_resolve_address", return_value="127.0.0.1"):
+                ac.peer_http_get(f"http://spark.lan.test:{srv.server_address[1]}",
+                                 "/api/sessions?limit=2", PEER_KEY, deadline=time.monotonic() + 3)
+        finally:
+            srv.shutdown()
+            srv.server_close()
+        self.assertTrue(seen, "the request never reached the server")
+        self.assertEqual(seen[0][0], f"spark.lan.test:{srv.server_address[1]}")
+        self.assertEqual(seen[0][1], "/api/sessions?limit=2")
+
     def test_an_ip_literal_peer_needs_no_resolver(self):
         # 127.0.0.1 is already an address: it must short-circuit the resolver, so
         # a loopback-ish literal never depends on getaddrinfo at all.
