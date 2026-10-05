@@ -1038,10 +1038,9 @@ def peer_http_get(
         # wrap_socket as server_hostname — so SNI and certificate verification
         # still check the name the user configured, not the IP. Overwriting
         # conn.host instead would silently break every https:// peer.
-        pinned_port = conn.port
         conn._create_connection = (
-            lambda address, timeout=None, source_address=None, _addr=connect_host, _port=pinned_port:
-            socket.create_connection((_addr, _port), timeout, source_address)
+            lambda address, timeout=None, source_address=None,
+            _addr=connect_host, _port=conn.port: _connect_literal(_addr, _port, timeout, source_address)
         )
         conn.connect()
         # ENFORCE the total budget. A dribbling peer blocks inside
@@ -1093,6 +1092,29 @@ def peer_http_get(
         return json.loads(body.decode("utf-8", errors="replace"))
     except Exception:
         return None
+
+
+def _connect_literal(address: str, port: int, timeout: Optional[float], source_address: Any) -> socket.socket:
+    """Open a TCP socket to an ALREADY-RESOLVED address, consulting no resolver.
+
+    socket.create_connection((address, port)) looks the name up again, so a
+    pinned literal still cost a second getaddrinfo call — the exact unbounded
+    lookup this work set out to remove (measured: 2 calls, 20 s against a 3 s
+    deadline). Building the socket here means the address we resolved under the
+    budget is the address we connect to.
+    """
+    family = socket.AF_INET6 if ":" in address else socket.AF_INET
+    sock = socket.socket(family, socket.SOCK_STREAM)
+    try:
+        if timeout is not None:
+            sock.settimeout(timeout)
+        if source_address:
+            sock.bind(source_address)
+        sock.connect((address, port))
+    except Exception:
+        sock.close()
+        raise
+    return sock
 
 
 def _peer_resolve_address(host: str, port: Optional[int], budget: float) -> Optional[str]:
@@ -4733,6 +4755,10 @@ def dump_status_json(data: Dict[str, Any]) -> str:
                 "name": _clip_text(row.get("name"), 64),
                 "url": _clip_text(row.get("url"), 300),
                 "reachable": bool(row.get("reachable")),
+                # Carried explicitly: the footer tells a skipped peer from a failed
+                # one by this field, so dropping it here (the fallback rebuilds
+                # each row field by field) would make healthy peers look broken.
+                "state": _clip_text(row.get("state") or "", 16),
                 "sessions": _bounded_number(row.get("sessions") or 0),
                 "error": _clip_text(row.get("error"), 120),
             }

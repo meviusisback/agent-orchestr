@@ -1191,23 +1191,31 @@ class SurvivingGuardsNowPinned(unittest.TestCase):
         # The pre-resolve alone was not enough: connect() resolved the SAME name
         # again with no timeout, so a briefly-cooperative DNS still held the
         # request for the system timeout (measured 20 s against a 3 s deadline).
-        # Resolving once and connecting to the literal address closes that.
-        real = socket.getaddrinfo
-        calls = {"n": 0}
+        # Resolving once and connecting to the pinned literal closes that.
+        #
+        # The stub must ANSWER the first call itself: this test used to delegate
+        # to the real resolver for "spark.lan", which does not exist on the dev
+        # host, so the pre-resolve returned None, connect() was never reached and
+        # the assertions held for the wrong reason — a vacuous pass.
+        calls = {"n": 0, "args": []}
 
         def once_then_stall(*args, **kwargs):
             calls["n"] += 1
+            calls["args"].append(args[:2])
             if calls["n"] == 1:
-                return real(*args, **kwargs)
+                return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("127.0.0.1", args[1]))]
             time.sleep(20)
             raise OSError("blackhole")
 
         with mock.patch.object(ac.socket, "getaddrinfo", once_then_stall):
             started = time.monotonic()
-            result = ac.peer_http_get("http://spark.lan:8377", "/api/sessions", PEER_KEY,
+            result = ac.peer_http_get("http://peer.invalid.test:8377", "/api/sessions", PEER_KEY,
                                       deadline=time.monotonic() + 3.0)
             elapsed = time.monotonic() - started
-        self.assertEqual(calls["n"], 1, "the name was resolved more than once")
+        self.assertEqual(calls["n"], 1, f"the name was looked up more than once: {calls['args']}")
+        # And the single lookup must be for the NAME, not the pinned literal: a
+        # second lookup on "127.0.0.1" is the bug this test exists to catch.
+        self.assertEqual(calls["args"][0][0], "peer.invalid.test", calls["args"])
         self.assertIsNone(result)
         self.assertLess(elapsed, 4.5, f"second lookup unbounded ({elapsed:.2f}s)")
 
@@ -1344,6 +1352,94 @@ class PeerFooterDiagnostics(unittest.TestCase):
         # loopback peers are skipped with a different reason, so use plain hosts
         self.assertEqual(self.peer_problems([r for r in skipped
                                              if r["error"].startswith("skipped:")]), 0)
+
+
+class PeerTickBudgetAndExit(unittest.TestCase):
+    """A slow peer must not cost the LOCAL agents' cards.
+
+    Both halves were unverified for two rounds: reverting the explicit exit or
+    the single tick deadline left the whole suite green, even though the
+    counterfactual (a peer parked in a resolver) holds the collector's stdout
+    open past Panel.qml's 18 s stall timer, which then discards the whole
+    payload — local cards included.
+    """
+
+    def test_many_uncooperative_peers_still_cost_one_budget_not_n(self):
+        peers = [{"name": f"p{i}", "url": "http://h.lan:8377", "base": "http://h.lan:8377"}
+                 for i in range(4)]
+
+        def never_returns(base, path, key, *, deadline):
+            time.sleep(30)  # ignores its own deadline entirely
+            return None
+
+        started = time.monotonic()
+        with mock.patch.object(ac, "load_peer_registry", return_value=peers), \
+             mock.patch.object(ac, "load_peer_secret", return_value="k" * 32), \
+             mock.patch.object(ac, "peer_http_get", side_effect=never_returns):
+            cards, status = ac._collect_peer_cards()
+        elapsed = time.monotonic() - started
+        # One wall-clock deadline, not N x 4 s.
+        self.assertLess(elapsed, ac.PEER_PEER_BUDGET + 3.0,
+                        f"4 peers cost {elapsed:.1f}s — the deadline serialised")
+        self.assertTrue(all("budget" in r.get("error", "") for r in status), status)
+
+    def test_the_collector_exits_promptly_while_a_peer_is_parked(self):
+        # End to end through main(), as the widget runs it: a peer that never
+        # answers must not keep the process (and its stdout pipe) open.
+        import subprocess
+        import sys as _sys
+
+        probe = os.path.join(os.environ.get("TMPDIR", "/tmp"), f"peer-exit-{os.getpid()}.py")
+        source = os.path.join(ROOT, "agent_ctl.py")
+        with open(probe, "w", encoding="utf-8") as handle:
+            handle.write(
+                "import importlib.util, sys, time\n"
+                f"spec = importlib.util.spec_from_file_location('ac', {source!r})\n"
+                "ac = importlib.util.module_from_spec(spec); spec.loader.exec_module(ac)\n"
+                "ac.peer_http_get = lambda *a, **k: time.sleep(3600)\n"
+                "ac.load_peer_registry = lambda: [{'name': 'spark', 'url': 'http://h.lan:8377',"
+                " 'base': 'http://h.lan:8377'}]\n"
+                "ac.load_peer_secret = lambda n: 'k' * 32\n"
+                "sys.argv = ['agent_ctl.py', 'status']\n"
+                "ac.main()\n"
+            )
+        self.addCleanup(lambda: os.path.exists(probe) and os.unlink(probe))
+        started = time.monotonic()
+        proc = subprocess.run([_sys.executable, "-I", probe], capture_output=True,
+                              text=True, timeout=45)
+        elapsed = time.monotonic() - started
+        self.assertEqual(proc.returncode, 0, proc.stderr[-300:])
+        try:
+            payload = json.loads(proc.stdout)
+        except Exception:
+            self.fail(f"no valid JSON on stdout after {elapsed:.1f}s: {proc.stdout[:200]!r}")
+        self.assertTrue(payload.get("ok"))
+        self.assertLess(elapsed, 12.0, f"the parked peer held the process for {elapsed:.1f}s")
+
+    def test_the_oversized_payload_fallback_keeps_the_skipped_state(self):
+        # The fallback rebuilds each peer row field by field; dropping `state`
+        # there would make a healthy-but-unprobed peer look like a failure.
+        #
+        # Reaching that branch through dump_status_json is impractical: every
+        # field is capped or clipped and the worst payload the caps allow measures
+        # 252 KB against a 262 KB ceiling, so the branch is near-unreachable from a
+        # real payload. Pin the SOURCE line that builds it, and assert the field
+        # survives the path that IS reachable (the normal serializer).
+        source = open(os.path.join(ROOT, "agent_ctl.py"), encoding="utf-8").read()
+        self.assertIn('"state": _clip_text(row.get("state") or "", 16)', source,
+                      "the oversized-payload fallback must carry the peer state")
+        payload = ac.dump_status_json({
+            "ok": True,
+            "agents": [{"title": "t", "status": "working"}],
+            "summary": {"total": 1, "working": 1},
+            "hermes_peers": [{"name": "spark", "url": "http://h.lan:8377", "reachable": False,
+                              "state": "skipped", "sessions": 0,
+                              "error": "skipped: over the 4-peer per-tick budget"}],
+        })
+        rows = json.loads(payload).get("hermes_peers") or []
+        self.assertTrue(rows, "the peer row was dropped entirely")
+        self.assertIn("state", rows[0], f"the serializer dropped the field: {rows[0]}")
+        self.assertEqual(rows[0]["state"], "skipped", rows[0])
 
 
 class PeerReadOnlyContract(unittest.TestCase):
