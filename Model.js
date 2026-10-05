@@ -31,6 +31,7 @@ function originColor(origin) {
   var o = String(origin || "").toLowerCase()
   if (o === "orca") return "#22D3EE"
   if (o === "herdr_remote") return "#F97316"
+  if (o === "hermes_peer") return "#34D399"
   if (o.indexOf("desktop") >= 0) return "#F59E0B"
   if (o === "terminal") return "#38BDF8"
   return "#A855F7"
@@ -53,6 +54,7 @@ function originIcon(origin) {
   // instead of a possibly-missing font glyph.
   var o = String(origin || "").toLowerCase()
   if (o === "orca") return ""
+  if (o === "hermes_peer") return ""  // the agent icon already renders hermes.svg
   if (o.indexOf("desktop") >= 0) return "󰨇"
   if (o === "terminal") return ""
   return "󰘦"
@@ -74,6 +76,7 @@ function originSummaryText(agents) {
   var cliCount = 0
   var unknownCount = 0
   var orcaCount = 0
+  var peerCount = 0
 
   for (var i = 0; i < list.length; i++) {
     var a = list[i]
@@ -84,6 +87,8 @@ function originSummaryText(agents) {
       desktopCount++
     } else if (o === "terminal") {
       terminalCount++
+    } else if (o === "hermes_peer") {
+      peerCount++
     } else if (o === "herdr_remote") {
       herdrCount++
     } else if (o === "process") {
@@ -98,6 +103,9 @@ function originSummaryText(agents) {
   var parts = []
   if (herdrCount > 0) {
     parts.push(herdrCount + " on Herdr")
+  }
+  if (peerCount > 0) {
+    parts.push(peerCount + (peerCount === 1 ? " on a peer" : " on peers"))
   }
   if (terminalCount > 0) {
     parts.push(terminalCount + (terminalCount === 1 ? " on terminal" : " on terminals"))

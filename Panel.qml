@@ -76,6 +76,21 @@ Panel {
     return Qt.resolvedUrl("agent_ctl.py").toString().replace(/^file:\/\//, "")
   }
 
+  // Every collector launch goes through here. Two reasons, both security:
+  //  - an ABSOLUTE interpreter, so the binary is not a PATH lookup (this
+  //    collector now reads a credential);
+  //  - `-I` (isolated), so PYTHONPATH / PYTHONSTARTUP / user-site cannot
+  //    shadow json, ssl, http.client or urllib while the key is in memory.
+  // agent_ctl.py imports stdlib only, so isolation costs it nothing.
+  // NOT done here: dropping the inherited environment entirely. The collector
+  // still runs hyprctl / orca / herdr by name, so removing PATH needs the
+  // trusted-path resolvers; that residual is documented in the README.
+  function cliArgv(verb, extra) {
+    var argv = ["/usr/bin/python3", "-I", root.scriptPath(), verb]
+    if (extra) argv.push(extra)
+    return argv
+  }
+
   function fetchStatus() {
     if (!fetchProc.running) {
       root.loading = true
@@ -88,7 +103,7 @@ Panel {
     var agent = root.agents.find(function(a) { return a.pane_id === paneId })
     if (agent && agent.can_focus === false) return
     root.lastFocusedPane = paneId
-    focusProc.command = ["python3", root.scriptPath(), "focus", paneId]
+    focusProc.command = root.cliArgv("focus", paneId)
     focusProc.running = true
     root.close()
   }
@@ -96,12 +111,12 @@ Panel {
   function killTarget(paneId) {
     if (!paneId) return
     root.killError = ""
-    killProc.command = ["python3", root.scriptPath(), "kill", paneId]
+    killProc.command = root.cliArgv("kill", paneId)
     killProc.running = true
   }
 
   function launchAgent(agentName) {
-    launchProc.command = ["python3", root.scriptPath(), "launch", agentName || ""]
+    launchProc.command = root.cliArgv("launch", agentName || "")
     launchProc.running = true
     root.close()
   }
@@ -135,7 +150,7 @@ Panel {
     // collector itself is Quickshell's direct child. That matters for the stall
     // timer below: terminating the process only signals the direct child, and a
     // shell wrapper would leave the real collector running and leaked.
-    command: ["python3", root.scriptPath(), "status"]
+    command: root.cliArgv("status")
     stdout: StdioCollector {
       waitForEnd: true
       onStreamFinished: {
@@ -618,7 +633,9 @@ Panel {
                       color: Model.originColor(modelData.origin)
                     }
                     Text {
-                      text: Model.originBadgeText(modelData.origin)
+                      // A peer card carries its own badge ("PEER · <name>"); every
+                      // other origin maps through the shared table.
+                      text: modelData.origin_badge || Model.originBadgeText(modelData.origin)
                       textFormat: Text.PlainText
                       font.family: root.fontFamily
                       font.pixelSize: Style.space(8)
@@ -686,6 +703,8 @@ Panel {
                 }
 
                 // Terminate / Close Button (Replaces Focus button)
+                // Hidden for read-only origins: remote Herdr panes and remote
+                // Hermes peers (can_control === false, set by the collector).
                 Rectangle {
                   implicitWidth: Style.space(22)
                   implicitHeight: Style.space(22)

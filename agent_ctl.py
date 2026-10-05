@@ -9,11 +9,16 @@ Discovers and manages AI agents across:
 """
 
 import glob
+import http.client
+import ipaddress
 import json
 import os
+import pwd
 import re
 import signal
 import selectors
+import ssl
+import threading
 from concurrent.futures import ThreadPoolExecutor
 
 import socket
@@ -22,8 +27,8 @@ import stat
 import subprocess
 import sys
 import time
-from typing import Any, Dict, List, Optional, Set, Tuple
-from urllib.parse import quote, unquote, urlsplit
+from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
+from urllib.parse import quote, unquote, urljoin, urlsplit
 
 HERDR_SOCK_PATH = os.path.expanduser(os.environ.get("HERDR_SOCKET_PATH", "~/.config/herdr/herdr.sock"))
 OMP_SESSIONS_DIR = os.path.expanduser("~/.omp/agent/sessions")
@@ -32,6 +37,256 @@ HERMES_CONNECTIONS_PATH = os.path.expanduser("~/.config/Hermes/connections.json"
 HERDR_MACHINE_TIMEOUT = 0.75
 HERDR_REMOTE_TIMEOUT = 2.5
 HERDR_REMOTE_MAX_BYTES = 262144
+
+# --- Confirmed-file reads (task 2) ---------------------------------------------
+# Two profiles, one implementation. `strict` is for the credential file and only
+# the credential file; `bounded` is for non-secret config. Applying the strict
+# recipe to a 0644 config would silently empty the roster, and applying the lax
+# one to a .env would be a marketplace credential-path block.
+HERMES_READ_MAX_BYTES = {
+    "env": 65536,             # strict: ~/.hermes/.env
+    "config": 262144,         # bounded: ~/.hermes/config.yaml
+    "registry": 262144,       # bounded: ~/.config/Hermes/connections.json
+}
+HERMES_CONFINE_MODE = 0o022
+HERMES_CREDENTIAL_MODE = 0o077
+# Roots are named, never derived from an arbitrary env value: ~/.hermes,
+# ~/.config/Hermes, and $HERMES_HOME only when it resolves strictly inside a
+# validated $HOME (an env-derived root may only widen from inside).
+HERMES_HOME_ENV = "HERMES_HOME"
+
+
+class ConfinedFileError(Exception):
+    """A file was refused by the confined reader.
+
+    Callers degrade softly: one stderr line, exit 0, valid JSON on stdout. The
+    widget parses stdout, so a warning there would read as a parse error.
+    """
+
+
+class _SwappedFile(Exception):
+    """The file was replaced between validation and open; one retry is allowed."""
+
+
+def _trusted_dir(path: str, uid: int, ancestor_uids: Sequence[int], trust_mode: int = HERMES_CONFINE_MODE) -> bool:
+    """True when `path` is an existing directory, ours-or-root owned, not group/other writable."""
+    try:
+        info = os.stat(path)
+    except OSError:
+        return False
+    if not stat.S_ISDIR(info.st_mode):
+        return False
+    if info.st_uid not in ancestor_uids:
+        return False
+    return not (stat.S_IMODE(info.st_mode) & trust_mode)
+
+
+def _chain_trusted(path: str, uid: int, ancestor_uids: Sequence[int], trust_root: str) -> bool:
+    """Walk every ancestor of `path` up to the trust anchor; all must be trusted."""
+    current = os.path.dirname(path)
+    while True:
+        if not _trusted_dir(current, uid, ancestor_uids):
+            return False
+        if current == trust_root or current == "/":
+            return True
+        parent = os.path.dirname(current)
+        if parent == current:
+            return True
+        current = parent
+
+
+def validated_home(uid: Optional[int] = None, ancestor_uids: Optional[Sequence[int]] = None) -> Optional[str]:
+    """Resolve $HOME as a TRUSTED input, never via expanduser().
+
+    expanduser("~") returns "/" for an empty HOME, which makes an "inside the
+    home" test true for every absolute path; a relative HOME resolves against
+    the cwd. Both are treated as no home at all. `/` itself is no home.
+
+    `ancestor_uids` is the injectable trust anchor for the directory walk. The
+    default is (us, root). A bwrap dev session maps only our own uid, so root
+    reads as 65534 and the default correctly refuses; the suite injects the uid
+    that sandbox actually shows rather than the guard being weakened.
+    """
+    own = os.getuid() if uid is None else uid
+    trusted_uids: Sequence[int] = (own, 0) if ancestor_uids is None else tuple(ancestor_uids)
+    raw = os.environ.get("HOME") or ""
+    if not raw or not os.path.isabs(raw):
+        try:
+            raw = pwd.getpwuid(own).pw_dir or ""
+        except Exception:
+            return None
+    if not raw or not os.path.isabs(raw):
+        return None
+    real = os.path.realpath(raw)
+    if real == "/":
+        return None
+    if not _chain_trusted(real, own, trusted_uids, "/"):
+        return None
+    return real
+
+
+def hermes_confine_roots(
+    uid: Optional[int] = None,
+    home: Optional[str] = None,
+    ancestor_uids: Optional[Sequence[int]] = None,
+) -> List[str]:
+    """The roots a Hermes file may live in. An env-derived root only widens from inside."""
+    own = os.getuid() if uid is None else uid
+    base = validated_home(own, ancestor_uids) if home is None else home
+    if not base:
+        return []
+    roots = [os.path.join(base, ".hermes"), os.path.join(base, ".config", "Hermes")]
+    declared = os.environ.get(HERMES_HOME_ENV) or ""
+    if declared and os.path.isabs(declared):
+        real = os.path.realpath(declared)
+        # STRICTLY inside the validated home: with HOME=/ the inside-home test is
+        # true for everything, which is why validated_home() refuses "/".
+        if real != base and real.startswith(base.rstrip(os.sep) + os.sep):
+            roots.append(real)
+    deduped: List[str] = []
+    for root in roots:
+        if root and root not in deduped:
+            deduped.append(root)
+    return deduped
+
+
+def _within(real: str, root: str) -> bool:
+    root = os.path.realpath(root).rstrip(os.sep)
+    return real == root or real.startswith(root + os.sep)
+
+
+def confined_path(
+    path: str,
+    roots: Sequence[str],
+    *,
+    trust_root: str = "/",
+    ancestor_uids: Sequence[int] = (0,),
+    uid: Optional[int] = None,
+    home: Optional[str] = None,
+) -> str:
+    """Validate a path into a trusted root and return its realpath.
+
+    The checks, in order: non-empty, no NUL byte, absolute (after expanding `~`
+    against a validated home ourselves), no `..` component, NOT a symlink at the
+    normalised path, realpath strictly inside a named root, and every ancestor of
+    that realpath trusted. `normpath` runs BEFORE `islink` because islink("link/")
+    is False for a symlink to a regular file, so a trailing slash walks past it.
+    """
+    own = os.getuid() if uid is None else uid
+    raw = str(path or "")
+    if not raw:
+        raise ConfinedFileError("empty path")
+    if "\x00" in raw:
+        raise ConfinedFileError("NUL byte in path")
+    if raw == "~" or raw.startswith("~/"):
+        # Forward BOTH the injected home and the trust anchor: expanding `~`
+        # against the real $HOME while the roots point at a fixture would refuse
+        # every tilde path (and, on a read-only $HOME, would be unfixable).
+        base = validated_home(own, ancestor_uids) if home is None else home
+        if not base:
+            raise ConfinedFileError("no validated home")
+        raw = base if raw == "~" else os.path.join(base, raw[2:])
+    if not os.path.isabs(raw):
+        raise ConfinedFileError("path must be absolute")
+    if ".." in raw.split(os.sep):
+        raise ConfinedFileError("parent traversal in path")
+    candidate = os.path.normpath(raw)
+    if os.path.islink(candidate):
+        raise ConfinedFileError("symlink at the exact path")
+    real = os.path.realpath(candidate)
+    allowed = [r for r in roots if r]
+    if not any(_within(real, root) for root in allowed):
+        raise ConfinedFileError("outside every trusted root")
+    if not _chain_trusted(real, own, ancestor_uids, trust_root):
+        raise ConfinedFileError("unsafe directory chain")
+    return real
+
+
+def read_confined_text(
+    kind: str,
+    path: str,
+    *,
+    roots: Optional[Sequence[str]] = None,
+    trust_root: str = "/",
+    ancestor_uids: Optional[Sequence[int]] = None,
+    uid: Optional[int] = None,
+    home: Optional[str] = None,
+) -> Optional[str]:
+    """Read one confined file's text, or None after refusing softly.
+
+    `kind` selects the profile: "env" is the strict credential recipe, every
+    other kind is the bounded non-secret one. The handle is trusted, not the
+    path: os.open with O_NOFOLLOW|O_NONBLOCK, then fstat, then samestat against
+    the validated path, then /proc/self/fd containment. O_NONBLOCK is load-bearing
+    — a planted FIFO passes every path check and would wedge the open forever.
+    An unresolvable fd reference FAILS CLOSED rather than skipping the only half
+    that sees a swapped directory or mount point.
+    """
+    own = os.getuid() if uid is None else uid
+    trusted_uids: Sequence[int] = (own, 0) if ancestor_uids is None else tuple(ancestor_uids)
+    strict = kind == "env"
+    max_bytes = HERMES_READ_MAX_BYTES.get(kind, HERMES_READ_MAX_BYTES["config"])
+    effective_roots = list(roots) if roots is not None else hermes_confine_roots(own, home, trusted_uids)
+
+    failure: Optional[BaseException] = None
+    for _attempt in range(2):  # one bounded retry: an atomic os.replace can land mid-read
+        try:
+            real = confined_path(
+                path, effective_roots, trust_root=trust_root,
+                ancestor_uids=trusted_uids, uid=own, home=home,
+            )
+            fd = os.open(real, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK)
+        except FileNotFoundError:
+            return None  # absent is normal (no .env means no peers), and silent
+        except (ConfinedFileError, OSError) as exc:
+            failure = exc
+            break  # a refusal is deterministic; a retry would change nothing
+
+        try:
+            info = os.fstat(fd)
+            if not stat.S_ISREG(info.st_mode):
+                raise ConfinedFileError("not a regular file")
+            if info.st_uid != own:
+                raise ConfinedFileError("not owned by this user")
+            if info.st_size > max_bytes:
+                raise ConfinedFileError("larger than the read ceiling")
+            if strict:
+                if info.st_nlink != 1:
+                    raise ConfinedFileError("hard-linked credential file")
+                if stat.S_IMODE(info.st_mode) & HERMES_CREDENTIAL_MODE:
+                    raise ConfinedFileError("credential file readable beyond its owner")
+            if not os.path.samestat(info, os.stat(real)):
+                raise _SwappedFile()
+            descriptor = os.path.realpath(f"/proc/self/fd/{fd}")
+            if not any(_within(descriptor, root) for root in effective_roots if root):
+                raise ConfinedFileError("descriptor is not contained in a trusted root")
+            chunks: List[bytes] = []
+            remaining = max_bytes + 1
+            while remaining > 0:
+                chunk = os.read(fd, min(65536, remaining))
+                if not chunk:
+                    break
+                chunks.append(chunk)
+                remaining -= len(chunk)
+            body = b"".join(chunks)
+            if len(body) > max_bytes:
+                raise ConfinedFileError("larger than the read ceiling")
+            return body.decode("utf-8", errors="replace")
+        except _SwappedFile:
+            failure = ConfinedFileError("file changed during the read")
+            continue
+        except (ConfinedFileError, OSError) as exc:
+            failure = exc
+            break
+        finally:
+            os.close(fd)
+
+    if failure is not None:
+        print(
+            f"agent_ctl: refused {kind} file: {type(failure).__name__}: {failure}",
+            file=sys.stderr,
+        )
+    return None
 
 
 def parse_herdr_machine_list(value: Any) -> List[Dict[str, str]]:
@@ -202,11 +457,720 @@ def hermes_screen_status(text: Optional[str]) -> Optional[str]:
     return None
 
 
-def read_hermes_registry() -> Dict[str, Any]:
-    """Read Desktop registry metadata only; missing or malformed data is empty."""
+# --- Remote Hermes peers (issue #21) -------------------------------------------
+# A peer is another Hermes gateway the user registered with
+# `hermes peer add <name> --url http://host:8377 --key <API_SERVER_KEY>`. Hermes
+# owns that credential; the plugin only reads the one key it needs through the
+# strict confined reader and never touches a Desktop OAuth token. The peer
+# answers /api/sessions + /api/sessions/<id>/messages on its api_server platform.
+PEER_NAME_RE = re.compile(r"\A[a-z0-9][a-z0-9_-]{0,63}\Z")
+PEER_SESSION_ID_RE = re.compile(r"\A[A-Za-z0-9_.:-]{1,128}\Z")
+PEER_URL_MAX = 300
+PEER_MAX_PEERS_PARSED = 8      # entries kept from the config block
+PEER_MAX_PEERS_PROBED = 4      # peers actually queried per tick, in config order
+PEER_MAX_PEER_CARDS = 6        # cards per peer in the payload
+PEER_MAX_MESSAGE_READS = 3     # per-peer message reads (the HTTP budget)
+PEER_MAX_BYTES = 262144        # pre-decode ceiling on one response
+PEER_REQ_BUDGET = 1.0          # per-request socket timeout
+PEER_PEER_BUDGET = 3.0         # TOTAL per-peer budget for one tick
+PEER_ACTIVE_WINDOW = 300.0     # "active" = ended_at is None and last_active within this
+PEER_STALE_WINDOW = 14400.0    # 4 h: older than this without a lease is history, not a session
+PEER_SESSIONS_QUERY = 20       # limit= on GET /api/sessions
+PEER_BOT_CHAT_TITLE = "Bot Chat"
+# Explicit trust anchor, NOT create_default_context(): that honours SSL_CERT_FILE /
+# SSL_CERT_DIR / SSLKEYLOGFILE from the session env, which would make the trust
+# store a property of the environment instead of the code.
+PEER_CA_BUNDLE = "/etc/ssl/certs/ca-certificates.crt"
+PEER_HOST_RE = re.compile(r"\A[a-z0-9]([a-z0-9.-]*[a-z0-9])?\Z")
+
+
+def _peer_tls_context() -> Optional["ssl.SSLContext"]:
+    """TLS context pinned to the system bundle, with key logging off.
+
+    keylog_filename is only settable on a real context, and the default is
+    already None unless the env asks for it; create_default_context(cafile=…)
+    never reads SSLKEYLOGFILE on its own, so this is belt-and-braces.
+    """
     try:
-        with open(HERMES_CONNECTIONS_PATH, "r", encoding="utf-8") as handle:
-            value = json.load(handle)
+        context = ssl.create_default_context(cafile=PEER_CA_BUNDLE)
+    except Exception:
+        try:
+            context = ssl.create_default_context()
+        except Exception:
+            return None
+    return context
+
+
+def parse_bot_peers(text: Optional[str]) -> List[Dict[str, str]]:
+    """Read the `bot_peers:` block of config.yaml, keeping only well-shaped rows.
+
+    Deliberately NOT a YAML parser and NOT `hermes config get`: a vendor's
+    documented layout is not byte-level truth, so anything unexpected is
+    ignored rather than guessed (degrade to "no card"), and spawning a
+    PATH-resolved Python inside an auto-running widget is the attack surface a
+    marketplace reviewer counts. Only `^  <name>:$` + `^    url: <value>$` is
+    accepted; `note:`, comments, quoted scalars and deeper nesting are skipped.
+    """
+    if not text:
+        return []
+    peers: List[Dict[str, str]] = []
+    inside = False
+    block_indent = 0
+    for raw_line in text.split("\n"):
+        line = raw_line.rstrip("\r")
+        if not line.strip() or line.lstrip().startswith("#"):
+            continue
+        indent = len(line) - len(line.lstrip(" "))
+        stripped = line.strip()
+        if not inside:
+            # The top-level `bot_peers:` key only. A nested `bot_peers:` under
+            # another section is not ours.
+            if stripped == "bot_peers:" and indent == 0:
+                inside = True
+            continue
+        if indent <= 0:
+            break  # next top-level key: the block ended
+        if indent == 2 and stripped.endswith(":"):
+            name = stripped[:-1].strip()
+            if PEER_NAME_RE.match(name) and len(peers) < PEER_MAX_PEERS_PARSED:
+                block_indent = 2
+                peers.append({"name": name, "url": ""})
+            continue
+        if peers and indent > block_indent and stripped.startswith("url:"):
+            value = stripped[len("url:"):].strip()
+            if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+                value = value[1:-1]  # a quoted scalar is still a plain scalar here
+            peers[-1]["url"] = value
+    return [p for p in peers if p["name"] and p["url"]][:PEER_MAX_PEERS_PARSED]
+
+
+def scrub_peer_text(value: Any, secrets: Optional[Sequence[str]] = None, limit: int = 400) -> str:
+    """The ONE sanitiser for every peer-supplied string that reaches the bar.
+
+    A peer is an untrusted remote: `redact_secrets` only catches key-SHAPED text,
+    but a peer API key is an opaque string, so a peer (or anything on-path) that
+    echoes the key it just received into a title or tool name would otherwise get
+    it rendered in an always-on bar. Hence: ANSI out, control bytes out, known
+    secret patterns out, each loaded key out, then a hard length cap.
+
+    `clean_model_name` and `_clip_text` are NOT on this path — the first strips
+    nothing but a provider prefix, the second flattens whitespace and keeps
+    NUL/ESC. Callers that skip this function are the bug this exists to prevent.
+    """
+    text = value if isinstance(value, str) else ("" if value is None else str(value))
+    text = clean_ansi(text)
+    text = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]", " ", text)
+    text = redact_secrets(text)
+    for secret in secrets or ():
+        # Longest first, and only substantial values: a 1-char "key" would
+        # otherwise shred every string it appears in.
+        if isinstance(secret, str) and len(secret) >= 8:
+            text = text.replace(secret, "[REDACTED]")
+    return " ".join(text.split())[:limit]
+
+
+def peer_base_url(value: str) -> Optional[str]:
+    """Normalise a peer URL, refusing userinfo, a query, a fragment or a path.
+
+    `hermes peer add --url http://user:pass@host:8377` would otherwise send Basic
+    auth beside the Bearer header and leak that password into the payload, a
+    stderr line and a URLError message. A non-root path prefix is refused too:
+    every request target is built with urljoin on this base, so an embedded path
+    would silently change what is asked for.
+    """
+    raw = str(value or "").strip()
+    if not raw or len(raw) > PEER_URL_MAX:
+        return None
+    try:
+        parts = urlsplit(raw)
+    except ValueError:
+        return None
+    scheme = parts.scheme.lower()
+    if scheme not in ("http", "https") or not parts.hostname:
+        return None
+    if parts.username or parts.password or parts.query or parts.fragment:
+        return None
+    if parts.path not in ("", "/"):
+        return None
+    try:
+        port = parts.port  # raises ValueError on a non-numeric port
+    except ValueError:
+        return None
+    host = parts.hostname.lower().rstrip(".")
+    if not host or not PEER_HOST_RE.match(host):
+        return None
+    authority = f"[{host}]" if ":" in host else host
+    if port:
+        authority = f"{authority}:{port}"
+    return f"{scheme}://{authority}"
+
+
+def peer_host_is_loopback(base_url: str) -> bool:
+    """True for every spelling of this machine, so local cards are not duplicated.
+
+    `urlsplit().hostname` already strips IPv6 brackets, and Python's ipaddress
+    REJECTS the alternate literal forms (`127.1`, `0x7f000001`,
+    `::ffff:127.0.0.1` mapped) that a resolver still routes to loopback — so each
+    of those is handled explicitly instead of being assumed.
+    """
+    try:
+        raw = (urlsplit(base_url or "").netloc or "").lower()
+    except ValueError:
+        return False
+    if "@" in raw:  # userinfo is refused upstream; never let it steer this check
+        return False
+    if raw.startswith("["):
+        host, _, port = raw.partition("]")
+        host = host[1:]
+        port = port.lstrip(":")
+    else:
+        host, _, port = raw.partition(":")
+    host = host.rstrip(".")
+    if not host:
+        return False
+    if host == "localhost" or host.endswith(".localhost"):
+        return True
+
+    def _loopback(literal: str) -> Optional[bool]:
+        try:
+            return ipaddress.ip_address(literal).is_loopback
+        except ValueError:
+            return None
+
+    verdict = _loopback(host)
+    if verdict is not None:
+        return verdict
+    # Alternate literal spellings a resolver still routes to loopback but
+    # ipaddress rejects: `127.1`, `127.0.53`, `0x7f000001`, `2130706433`.
+    # socket.inet_aton IS the C library's parser for these, so delegate rather
+    # than re-deriving its padding and radix rules (getting them wrong would
+    # either miss a real loopback or skip a real remote host).
+    try:
+        packed = socket.inet_aton(host)
+    except OSError:
+        return False
+    return ipaddress.ip_address(packed).is_loopback
+
+
+def peer_session_status(
+    row: Dict[str, Any],
+    message: Optional[Dict[str, Any]],
+    active: bool,
+) -> Tuple[str, str, bool]:
+    """(status, detail, has_question) for one peer session.
+
+    Mirrors the local extract_hermes_session_info() semantics on the data the
+    peer's api_server actually exposes. api_server has no turn-lease table, so
+    `active` is the dashboard's 300 s heuristic and a turn that stalls with no
+    new message reads as working — stated in the README rather than hidden.
+    """
+    detail = ""
+    status = "idle"
+    has_question = False
+    if not isinstance(message, dict):
+        return ("working" if active else "idle"), ("Thinking…" if active else "Ready for prompt"), False
+
+    role = message.get("role")
+    content = message.get("content") if isinstance(message.get("content"), str) else ""
+    tool_name = message.get("tool_name") if isinstance(message.get("tool_name"), str) else ""
+    tool_calls = message.get("tool_calls")
+
+    if role == "assistant" and tool_calls:
+        status = "working"
+        detail = "Running tool"
+    elif role == "tool":
+        detail = f"Tool result: {tool_name or 'completed'}" if tool_name else "Tool result"
+        status = "working" if active else "completed"
+    elif role == "assistant" and content:
+        first_line = extract_first_line(content, max_len=140)
+        has_question = "?" in (first_line[-40:] if first_line else "")
+        if active:
+            status, detail = "working", (first_line or "Generating response…")
+        else:
+            status = "waiting" if has_question else "completed"
+            detail = first_line
+    elif role == "user":
+        if active:
+            status, detail = "working", "Thinking…"
+        else:
+            status, detail = "idle", "Ready for prompt"
+    else:
+        status = "working" if active else "completed"
+        detail = "Thinking…" if active else "Task completed"
+    return status, detail, has_question
+
+
+def peer_card_title(row: Dict[str, Any]) -> str:
+    """Title preference: an explicit title, else the cleaned preview."""
+    for key in ("title", "preview"):
+        value = row.get(key)
+        if isinstance(value, str) and value.strip():
+            return value
+    return ""
+
+
+def build_peer_agents(
+    peers: List[Dict[str, str]],
+    now: float,
+    *,
+    keys: Optional[Dict[str, str]] = None,
+    fetch: Any = None,
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    """Query each peer and build read-only cards. Returns (cards, peer_status).
+
+    Budget per peer (the bar polls every 2-3 s and this runs every tick, in a
+    FRESH process — there is no cross-tick cache to lean on):
+      1 x GET /api/sessions?limit=20
+      1 x GET /api/sessions?title=Bot Chat&include_hidden=1
+      <=3 message reads, most-recently-active first
+    all under ONE total per-peer deadline (PEER_PEER_BUDGET), peers in parallel.
+    A peer that fails yields no card and a stated reason, never an exception.
+    """
+    get = fetch or peer_http_get
+    cards: List[Dict[str, Any]] = []
+    status_rows: List[Dict[str, Any]] = []
+    for entry in peers:
+        name = str(entry.get("name") or "")
+        base = entry.get("base") or peer_base_url(entry.get("url") or "")
+        if not name or not base or not PEER_NAME_RE.match(name):
+            status_rows.append({"name": name[:64], "url": "", "reachable": False, "sessions": 0,
+                                "error": "refused: unusable peer entry"})
+            continue
+        if peer_host_is_loopback(base):
+            # This machine: local discovery already covers it, and showing both
+            # would render every session twice.
+            status_rows.append({"name": name[:64], "url": base[:PEER_URL_MAX], "reachable": True,
+                                "sessions": 0, "error": "skipped: loopback (already discovered locally)"})
+            continue
+        key = (keys or {}).get(name) or load_peer_secret(name)
+        if not key:
+            status_rows.append({"name": name[:64], "url": base[:PEER_URL_MAX], "reachable": False,
+                                "sessions": 0, "error": f"no API key ({peer_secret_env_name(name)} unset)"})
+            continue
+        try:
+            peer_cards, reachable, reason = _build_one_peer(name, base, key, now, get)
+        except Exception as exc:  # a peer must never take the roster down
+            peer_cards, reachable, reason = [], False, f"error: {type(exc).__name__}"
+        cards.extend(peer_cards)
+        status_rows.append({
+            "name": name[:64], "url": base[:PEER_URL_MAX], "reachable": reachable,
+            "sessions": len(peer_cards), "error": reason,
+        })
+    return cards[:PEER_MAX_PEERS_PROBED * PEER_MAX_PEER_CARDS], status_rows
+
+
+def _build_one_peer(
+    name: str,
+    base: str,
+    key: str,
+    now: float,
+    get: Any,
+) -> Tuple[List[Dict[str, Any]], bool, str]:
+    """One peer's cards, under a single total deadline."""
+    deadline = time.monotonic() + PEER_PEER_BUDGET
+    rows = parse_peer_sessions(get(base, f"/api/sessions?limit={PEER_SESSIONS_QUERY}", key, deadline=deadline))
+    if not rows:
+        # Distinguish "no sessions" from "unreachable" for the diagnostics row:
+        # re-ask for the Bot Chat, which a hidden filter would otherwise hide.
+        bot = parse_peer_sessions(get(
+            base,
+            f"/api/sessions?title={quote(PEER_BOT_CHAT_TITLE)}&include_hidden=1&limit=4",
+            key, deadline=deadline,
+        ))
+        return _cards_from_rows(name, base, key, bot, now, get, deadline), True, "no sessions in the last window"
+
+    combined = list(rows)
+    seen_ids = {peer_session_id(r) for r in rows}
+    if time.monotonic() < deadline:
+        bot = parse_peer_sessions(get(
+            base,
+            f"/api/sessions?title={quote(PEER_BOT_CHAT_TITLE)}&include_hidden=1&limit=4",
+            key, deadline=deadline,
+        ))
+        for row in bot:
+            sid = peer_session_id(row)
+            if sid and sid not in seen_ids:
+                seen_ids.add(sid)
+                combined.append(row)
+    return _cards_from_rows(name, base, key, combined, now, get, deadline), True, ""
+
+
+def _cards_from_rows(
+    name: str,
+    base: str,
+    key: str,
+    rows: List[Dict[str, Any]],
+    now: float,
+    get: Any,
+    deadline: float,
+) -> List[Dict[str, Any]]:
+    """Turn session rows into cards, spending at most PEER_MAX_MESSAGE_READS."""
+    candidates: List[Tuple[str, Dict[str, Any]]] = []
+    for row in rows:
+        sid = peer_session_id(row)
+        if not sid:
+            continue
+        try:
+            last_active = float(row.get("last_active") or 0)
+        except (TypeError, ValueError):
+            last_active = 0.0
+        # A row with neither messages nor a title is noise, and history older
+        # than the stale window is not a live session (same rule as the local path).
+        if not row.get("message_count") and not peer_card_title(row):
+            continue
+        if not last_active or (now - last_active) > PEER_STALE_WINDOW:
+            continue
+        candidates.append((sid, row))
+
+    # Most recently active first, so the message-read budget buys the rows that
+    # can actually be "working".
+    candidates.sort(key=lambda item: float(item[1].get("last_active") or 0), reverse=True)
+    candidates = candidates[:PEER_MAX_PEER_CARDS]
+
+    secrets = (key,)
+    cards: List[Dict[str, Any]] = []
+    reads = 0
+    for sid, row in candidates:
+        message = None
+        if reads < PEER_MAX_MESSAGE_READS and time.monotonic() < deadline:
+            reads += 1
+            encoded = quote(sid, safe="")
+            payload = get(base, f"/api/sessions/{encoded}/messages?limit=1&order=latest", key, deadline=deadline)
+            message = parse_peer_message(payload)
+        active = peer_session_is_active(row, now)
+        status, detail, has_question = peer_session_status(row, message, active)
+        title = scrub_peer_text(peer_card_title(row), secrets) or "Hermes session"
+        cards.append({
+            "pane_id": peer_target_id(name, sid),
+            "origin": "hermes_peer",
+            "origin_label": f"Hermes · {name}",
+            "origin_badge": f"PEER · {name}",
+            "agent": "hermes",
+            "agent_display": "Hermes",
+            "status": status,
+            "title": title,
+            "detail": scrub_peer_text(detail, secrets, limit=200),
+            "cwd": "",
+            "repo": "",
+            "workspace": scrub_peer_text(row.get("source") or "Remote peer", secrets, limit=80),
+            "tab": f"{name} · {sid}"[:80],
+            "pane_label": "Read-only",
+            "focused": False,
+            "model": scrub_peer_text(clean_model_name(row.get("model")) or "", secrets, limit=60),
+            "session_path": "",
+            "has_question": has_question,
+            "can_focus": False,
+            "can_control": False,
+        })
+    return cards
+
+
+def load_peer_registry() -> List[Dict[str, str]]:
+    """Peers from the confined config.yaml, normalised and de-duplicated."""
+    text = read_confined_text("config", os.path.join("~", ".hermes", "config.yaml"))
+    peers: List[Dict[str, str]] = []
+    for entry in parse_bot_peers(text):
+        base = peer_base_url(entry.get("url") or "")
+        if not base:
+            continue
+        peers.append({"name": entry["name"], "url": base, "base": base})
+    return peers
+
+
+def peer_request_target(base_url: str, path: str) -> Optional[str]:
+    """Join an API path onto a validated base, refusing traversal in `path`.
+
+    The traversal check runs on `path` BEFORE urljoin, not after: urljoin
+    normalises `/api/sessions/../messages` down to `/api/messages` (measured), so
+    a post-join check on the result never sees the traversal at all. A peer
+    session id is charset-checked by the caller too — but this is the layer that
+    holds when a caller forgets.
+    """
+    raw = str(path or "")
+    if not raw or "\\" in raw:
+        return None
+    if any(segment in (".", "..") for segment in raw.split("/")):
+        return None
+    if not raw.startswith("/"):
+        return None
+    try:
+        target = urljoin(base_url, raw)
+    except ValueError:
+        return None
+    parts = urlsplit(target)
+    if parts.scheme not in ("http", "https") or not parts.netloc:
+        return None
+    if parts.username or parts.password:
+        return None
+    segments = [segment for segment in parts.path.split("/") if segment]
+    if any(segment in (".", "..") for segment in segments):
+        return None
+    return target
+
+
+def peer_http_get(
+    base_url: str,
+    path: str,
+    key: str,
+    *,
+    deadline: float,
+    connect: Any = None,
+) -> Optional[Any]:
+    """GET one peer API path and return parsed JSON, or None.
+
+    http.client, deliberately, not urllib:
+      * it never follows a redirect, so the Authorization header can never be
+        re-sent to a host the user never registered (a 3xx is a refusal);
+      * it never consults HTTP_PROXY/HTTPS_PROXY/ALL_PROXY from the session env;
+      * it exposes the socket, so the deadline can be ENFORCED.
+
+    The deadline is a `timeout=` (per socket operation, renewed on every recv —
+    useless alone against a peer that dribbles) PLUS a watchdog that closes the
+    socket when the TOTAL per-peer budget is spent. A blown budget is a refusal,
+    not a warning.
+
+    `connect` is the injection seam for the tests: a stand-in class whose
+    constructor takes (host, port, timeout=..., context=...) and whose connect()
+    hands back a socket.
+    """
+    target = peer_request_target(base_url, path)
+    if not target:
+        return None
+    parts = urlsplit(target)
+    host = parts.hostname or ""
+    port = parts.port
+    body: Optional[bytes] = None
+    conn = None
+    watchdog: Optional[threading.Timer] = None
+    try:
+        if parts.scheme == "https":
+            context = _peer_tls_context()
+            if context is None:
+                return None
+            conn = (
+                connect(host, port, timeout=PEER_REQ_BUDGET, context=context)
+                if connect is not None
+                else http.client.HTTPSConnection(host, port, timeout=PEER_REQ_BUDGET, context=context)
+            )
+        else:
+            conn = (
+                connect(host, port, timeout=PEER_REQ_BUDGET)
+                if connect is not None
+                else http.client.HTTPConnection(host, port, timeout=PEER_REQ_BUDGET)
+            )
+        conn.connect()
+        # ENFORCE the total budget. A dribbling peer blocks inside
+        # HTTPResponse.read() on the BUFFERED file object, and by then the
+        # connection's own socket has already been consumed into the response
+        # (conn.sock is None) — so closing conn does nothing and conn.sock.close()
+        # never even runs. What unblocks it is shutdown(SHUT_RDWR) on the socket
+        # behind response.fp, which makes the pending read raise instead of
+        # waiting for the peer to finish. Measured: 25.1 s blocked -> 0.5 s
+        # aborted with that shutdown, no change with a plain close().
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return None
+        response_holder: List[Any] = []  # filled once getresponse() returns
+        watchdog = threading.Timer(remaining, _abort_response, args=(response_holder, conn))
+        watchdog.daemon = True
+        watchdog.start()
+        conn.request(
+            "GET", parts.path or "/" + (f"?{parts.query}" if parts.query else ""),
+            headers={
+                "Authorization": f"Bearer {key}",
+                "Accept": "application/json",
+                "Connection": "close",
+            },
+        )
+        response = conn.getresponse()
+        response_holder.append(response)
+        # A 3xx is REFUSED, never followed.
+        if not 200 <= response.status < 300:
+            return None
+        body = response.read(PEER_MAX_BYTES + 1)
+        if body is None or len(body) > PEER_MAX_BYTES:
+            return None  # pre-decode ceiling, before json.loads can allocate
+    except Exception:
+        return None  # unreachable, refused, timed out — all degrade to "no card"
+    finally:
+        if watchdog is not None:
+            watchdog.cancel()
+        _close_quietly(conn)
+    if body is None:
+        return None
+    try:
+        return json.loads(body.decode("utf-8", errors="replace"))
+    except Exception:
+        return None
+
+
+def _abort_response(holder: List[Any], conn: Any) -> None:
+    """Interrupt a blocked response read when the total budget is spent.
+
+    The handle that matters is the socket behind `response.fp`, not the
+    connection: once getresponse() has run, the connection's own socket is gone
+    and a plain close() leaves the pending read blocked. shutdown() is what makes
+    it raise. Everything is best-effort — the read's own exception is what the
+    caller sees, and the caller degrades to "no card" either way.
+    """
+    for response in holder:
+        try:
+            raw = getattr(getattr(response, "fp", None), "raw", None)
+            sock = getattr(raw, "_sock", None)
+            if sock is not None:
+                sock.shutdown(socket.SHUT_RDWR)
+        except Exception:
+            pass
+    _close_quietly(conn)
+
+
+def _close_quietly(conn: Any) -> None:
+    """Close a connection without letting teardown raise out of a worker."""
+    if conn is None:
+        return
+    try:
+        sock = getattr(conn, "sock", None)
+        if sock is not None:
+            sock.close()  # unblocks a wedged recv from the watchdog thread
+    except Exception:
+        pass
+    try:
+        conn.close()
+    except Exception:
+        pass
+
+
+def parse_peer_sessions(payload: Any) -> List[Dict[str, Any]]:
+    """Rows from GET /api/sessions; anything not shaped like a list is empty."""
+    if not isinstance(payload, dict):
+        return []
+    rows = payload.get("data")
+    if not isinstance(rows, list):
+        return []
+    return [row for row in rows[:PEER_SESSIONS_QUERY * 4] if isinstance(row, dict)]
+
+
+def parse_peer_message(payload: Any) -> Optional[Dict[str, Any]]:
+    """The newest message row from GET /api/sessions/{id}/messages?order=latest."""
+    if not isinstance(payload, dict):
+        return None
+    rows = payload.get("data")
+    if not isinstance(rows, list) or not rows:
+        return None
+    for row in reversed(rows[:64]):
+        if isinstance(row, dict):
+            return row
+    return None
+
+
+def peer_session_is_active(row: Dict[str, Any], now: float) -> bool:
+    """The dashboard's documented heuristic: not ended, touched recently.
+
+    api_server exposes no turn-lease table, so "active" cannot be proven — the
+    same 300 s heuristic the REST router stamps as `is_active` is the honest
+    approximation, and a stalled turn therefore reads as working.
+    """
+    try:
+        if row.get("ended_at") is not None:
+            return False
+        last = float(row.get("last_active") or 0)
+    except (TypeError, ValueError):
+        return False
+    return last > 0 and (now - last) < PEER_ACTIVE_WINDOW
+
+
+def peer_session_id(row: Dict[str, Any]) -> Optional[str]:
+    """A session id safe to put in a URL path and in a card identity."""
+    raw = str(row.get("id") or "").strip()
+    if not raw or not PEER_SESSION_ID_RE.match(raw):
+        return None
+    if raw in (".", ".."):  # quote(safe="") leaves dots alone
+        return None
+    encoded = quote(raw, safe="")
+    if "/" in encoded or encoded in (".", ".."):
+        return None
+    return raw
+
+
+def peer_target_id(peer: str, session_id: str) -> str:
+    """Collision-proof, peer-qualified card identity."""
+    return f"hermes-peer:{peer}:{session_id}"
+
+
+def annotate_gateways_with_peers(
+    gateways: List[Dict[str, str]],
+    peer_status: List[Dict[str, Any]],
+) -> List[Dict[str, str]]:
+    """Link a Desktop gateway row to the peer that now has cards for it.
+
+    Pure comparison of already-parsed data: a registry entry whose normalised
+    URL equals a peer's base gains `peer` and `session_count`, so the reporter's
+    existing `hermes_gateways` label is visibly the thing that now has cards.
+    No new I/O, and a mismatch simply leaves the row untouched.
+    """
+    if not gateways or not peer_status:
+        return gateways
+    by_url = {
+        str(row.get("url") or ""): row
+        for row in peer_status
+        if isinstance(row, dict) and row.get("url")
+    }
+    annotated: List[Dict[str, str]] = []
+    for gateway in gateways:
+        item = dict(gateway)
+        base = peer_base_url(str(item.get("url") or ""))
+        match = by_url.get(base or "")
+        if match:
+            item["peer"] = str(match.get("name") or "")[:64]
+            item["session_count"] = str(_bounded_number(int(match.get("sessions") or 0)))
+        annotated.append(item)
+    return annotated
+
+
+def peer_secret_env_name(peer: str) -> str:
+    """The env name Hermes stores this peer's key under."""
+    return f"HERMES_PEER_{peer.upper().replace('-', '_')}_KEY"
+
+
+def load_peer_secret(peer: str) -> Optional[str]:
+    """Load one peer's API key from the confined .env.
+
+    split("\\n"), never splitlines(): \\x0b, \\x0c, \\x85, \\u2028 and \\u2029 would
+    otherwise split one physical line into two and smuggle a second assignment
+    past a per-line name check. The value is returned to the caller and NEVER
+    written to os.environ — `launch_agent` spawns with no env= and would hand it
+    to a child.
+    """
+    if not PEER_NAME_RE.match(str(peer or "")):
+        return None
+    want = peer_secret_env_name(peer)
+    text = read_confined_text("env", os.path.join("~", ".hermes", ".env"))
+    if not text:
+        return None
+    for line in text.split("\n"):
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        if stripped.startswith("export "):
+            stripped = stripped[len("export "):].lstrip()
+        if "=" not in stripped:
+            continue
+        name, _, value = stripped.partition("=")
+        if name.strip() != want:
+            continue
+        value = value.strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+            value = value[1:-1]
+        return value or None
+    return None
+
+
+def read_hermes_registry() -> Dict[str, Any]:
+    text = read_confined_text("registry", HERMES_CONNECTIONS_PATH)
+    if text is None:
+        return {}
+    try:
+        value = json.loads(text)
         return value if isinstance(value, dict) else {}
     except Exception:
         return {}
@@ -2785,6 +3749,54 @@ def scan_standalone_agents(herdr_server_pids: List[int], seen_cwds: Set[str], cl
     return standalone
 
 
+def _collect_peer_cards() -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    """Probe registered remote Hermes peers, in parallel, under a hard budget.
+
+    An empty roster is the common case (nobody registered a peer) and costs two
+    confined reads only. Peers are queried concurrently with at most
+    PEER_MAX_PEERS_PROBED of them, in config order; the rest are reported as
+    skipped rather than dropped silently.
+    """
+    try:
+        peers = load_peer_registry()
+    except Exception:
+        return [], []
+    if not peers:
+        return [], []
+    selected = peers[:PEER_MAX_PEERS_PROBED]
+    now = time.time()
+    results: List[Optional[Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]]] = [None] * len(selected)
+    with ThreadPoolExecutor(max_workers=min(PEER_MAX_PEERS_PROBED, len(selected))) as pool:
+        futures = {
+            pool.submit(build_peer_agents, [entry], now): index
+            for index, entry in enumerate(selected)
+        }
+        for future, index in futures.items():
+            try:
+                results[index] = future.result(timeout=PEER_PEER_BUDGET + 1.0)
+            except Exception:
+                results[index] = None
+
+    cards: List[Dict[str, Any]] = []
+    status_rows: List[Dict[str, Any]] = []
+    for index, entry in enumerate(selected):
+        result = results[index]
+        if result is None:
+            status_rows.append({
+                "name": entry["name"][:64], "url": entry["url"][:PEER_URL_MAX],
+                "reachable": False, "sessions": 0, "error": "probe did not finish in budget",
+            })
+            continue
+        cards.extend(result[0])
+        status_rows.extend(result[1])
+    for entry in peers[PEER_MAX_PEERS_PROBED:]:
+        status_rows.append({
+            "name": entry["name"][:64], "url": entry["url"][:PEER_URL_MAX], "reachable": False,
+            "sessions": 0, "error": f"skipped: over the {PEER_MAX_PEERS_PROBED}-peer per-tick budget",
+        })
+    return cards[:PEER_MAX_PEERS_PROBED * PEER_MAX_PEER_CARDS], status_rows
+
+
 def fetch_all_agents() -> Dict[str, Any]:
     """Fetch all agent data, combining Herdr snapshot, session enrichment, and standalone processes."""
     # Grok session reads are budgeted per fetch cycle, so a large or hostile
@@ -3064,6 +4076,12 @@ def fetch_all_agents() -> Dict[str, Any]:
     # whose session was claimed here, which dedupes agents visible to both.
     orca_agents = scan_orca_agents(claimed_sessions)
 
+    # Remote Hermes peers run AFTER the local scans so a loopback peer's sessions
+    # cannot be claimed here first (loopback peers are skipped anyway), and their
+    # ids live in their own "hermes-peer:" namespace, so there is nothing to
+    # dedupe against the local transcript claims.
+    peer_cards, peer_status = _collect_peer_cards()
+
     standalone_agents = scan_standalone_agents(herdr_pids, seen_cwds, claimed_sessions)
     for sa in standalone_agents:
         if sa["status"] == "working":
@@ -3098,6 +4116,23 @@ def fetch_all_agents() -> Dict[str, Any]:
         else:
             idle_count += 1
         agents_list.append(oa)
+
+    for pc in peer_cards:
+        if pc["status"] == "working":
+            working_count += 1
+            active_agent_types.add(pc["agent"])
+            if not top_working_task:
+                top_working_task = f"{pc['origin_label']}: {pc['title']}"
+        elif pc["status"] == "waiting":
+            waiting_count += 1
+            active_agent_types.add(pc["agent"])
+        elif pc["status"] == "completed":
+            completed_count += 1
+            if not top_completed_task:
+                top_completed_task = f"{pc['origin_label']}: ✓ {pc['title']}"
+        else:
+            idle_count += 1
+        agents_list.append(pc)
 
     def agent_sort_key(item: Dict[str, Any]) -> Tuple[int, int, str]:
         status_order = {"working": 0, "waiting": 1, "completed": 2, "error": 3, "unknown": 4, "idle": 5}
@@ -3134,7 +4169,10 @@ def fetch_all_agents() -> Dict[str, Any]:
         "connected": herdr_connected,
         "herdr_sessions": [{"name": n, "socket": s} for n, s in herdr_session_sockets()],
         "herdr_remote_machines": remote_machine_status,
-        "hermes_gateways": sanitize_hermes_registry_connections(read_hermes_registry()),
+        "hermes_gateways": annotate_gateways_with_peers(
+            sanitize_hermes_registry_connections(read_hermes_registry()), peer_status
+        ),
+        "hermes_peers": peer_status,
         "orca_connected": bool(query_orca_terminals()),
         "summary": {
             "total": total,
@@ -3181,6 +4219,9 @@ def focus_pane(target_id: str) -> Dict[str, Any]:
     """Focus a specific pane in Herdr, Hermes Desktop window, or standalone terminal and switch desktops."""
     if not target_id:
         return {"ok": False, "error": "No target_id provided"}
+    if target_id.startswith("hermes-peer:"):
+        # A remote peer's session has no window on this desktop to switch to.
+        return {"ok": False, "error": "Remote Hermes peer sessions are read-only"}
     if target_id.startswith("herdr-remote:"):
         return {"ok": False, "error": "Remote Herdr targets are read-only"}
 
@@ -3340,6 +4381,11 @@ def kill_target(target_id: str) -> Dict[str, Any]:
     """Gracefully terminate an agent process or close a Herdr pane."""
     if not target_id:
         return {"ok": False, "error": "No target_id provided"}
+    if target_id.startswith("hermes-peer:"):
+        # Never signal anything for a remote peer's session: the id is a peer-
+        # qualified string, and a crafted one must not reach os.kill via a
+        # pid-bearing branch. Read-only by contract.
+        return {"ok": False, "error": "Remote Hermes peer sessions are read-only"}
     if target_id.startswith("herdr-remote:"):
         return {"ok": False, "error": "Remote Herdr targets are read-only"}
 
@@ -3522,6 +4568,17 @@ def dump_status_json(data: Dict[str, Any]) -> str:
         "herdr_sessions": [],
         "herdr_remote_machines": [],
         "hermes_gateways": [],
+        "hermes_peers": [
+            {
+                "name": _clip_text(row.get("name"), 64),
+                "url": _clip_text(row.get("url"), 300),
+                "reachable": bool(row.get("reachable")),
+                "sessions": _bounded_number(row.get("sessions") or 0),
+                "error": _clip_text(row.get("error"), 120),
+            }
+            for row in (payload.get("hermes_peers") or [])[:8]
+            if isinstance(row, dict)
+        ],
         "orca_connected": bool(payload.get("orca_connected", False)),
         "summary": counts,
         "agents": [],
