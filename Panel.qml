@@ -94,7 +94,15 @@ Panel {
     var rows = (root.rawData && root.rawData.hermes_peers) || []
     var bad = 0
     for (var i = 0; i < rows.length; i++) {
-      if (rows[i] && rows[i].reachable === false) bad++
+      var row = rows[i]
+      if (!row || row.reachable !== false) continue
+      // A peer the collector never PROBED (over the per-tick budget) is not
+      // unreachable — counting it showed a permanent, wrong "N remote peers
+      // unreachable" for a fleet that was perfectly healthy. The collector
+      // marks those state:"skipped"; the error prefix covers an older payload.
+      if (row.state === "skipped") continue
+      if (String(row.error || "").indexOf("skipped:") === 0) continue
+      bad++
     }
     return bad
   }
@@ -103,9 +111,12 @@ Panel {
     if (root.killError) return "Terminate failed: " + root.killError
     var problems = root.peerProblems()
     if (problems > 0) {
+      // Short enough to fit at the user's base-size 14: the longer wording
+      // measured 356px against a ~347px residual and was silently elided,
+      // losing the actionable half of the message.
       return problems === 1
-        ? "1 remote peer unreachable · check its key or host"
-        : problems + " remote peers unreachable · check their keys or hosts"
+        ? "1 peer unreachable · check its key or host"
+        : problems + " peers unreachable · check their keys"
     }
     var list = root.agents || []
     if (list.length > 0) {

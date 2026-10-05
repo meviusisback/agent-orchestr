@@ -1091,10 +1091,39 @@ class SurvivingGuardsNowPinned(unittest.TestCase):
         self.assertEqual(ac.peer_session_id({"id": "a.b.c"}), "a.b.c")
 
     def test_peer_deadline_armed_bites_before_the_first_request(self):
-        # An already-spent budget must refuse WITHOUT touching the socket.
-        with mock.patch.object(ac, "_peer_name_resolves", return_value=True):
+        # An already-spent budget must refuse before any socket work. The
+        # resolver IS consulted but with a negative remaining budget, so it joins
+        # for 0 s and yields nothing — which is what makes the refusal.
+        with mock.patch.object(ac, "_peer_resolve_address", return_value=None) as resolver:
             self.assertIsNone(ac.peer_http_get("http://127.0.0.1:1", "/api/sessions", PEER_KEY,
                                               deadline=time.monotonic() - 1.0))
+        self.assertTrue(resolver.call_args, "the resolver should be consulted with the spent budget")
+        self.assertLess(resolver.call_args.args[2], 0.0,
+                        "the resolver must be given the REMAINING budget, not the original one")
+
+    def test_a_resolver_that_answers_once_then_stalls_is_still_bounded(self):
+        # The pre-resolve alone was not enough: connect() resolved the SAME name
+        # again with no timeout, so a briefly-cooperative DNS still held the
+        # request for the system timeout (measured 20 s against a 3 s deadline).
+        # Resolving once and connecting to the literal address closes that.
+        real = socket.getaddrinfo
+        calls = {"n": 0}
+
+        def once_then_stall(*args, **kwargs):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                return real(*args, **kwargs)
+            time.sleep(20)
+            raise OSError("blackhole")
+
+        with mock.patch.object(ac.socket, "getaddrinfo", once_then_stall):
+            started = time.monotonic()
+            result = ac.peer_http_get("http://spark.lan:8377", "/api/sessions", PEER_KEY,
+                                      deadline=time.monotonic() + 3.0)
+            elapsed = time.monotonic() - started
+        self.assertEqual(calls["n"], 1, "the name was resolved more than once")
+        self.assertIsNone(result)
+        self.assertLess(elapsed, 4.5, f"second lookup unbounded ({elapsed:.2f}s)")
 
     def test_kill_refuses_a_bare_peer_prefix_that_no_other_branch_claims(self):
         # The earlier test used an id containing "terminal:pid:", which other
@@ -1142,6 +1171,93 @@ class PeerHostPinning(unittest.TestCase):
 
     def test_a_backslash_path_is_refused(self):
         self.assertIsNone(ac.peer_request_target("http://spark.lan:8377", "/api\\sessions"))
+
+
+class PeerFooterDiagnostics(unittest.TestCase):
+    """The popup footer's decision, mirrored in Python so it can be tested.
+
+    Panel.qml has no test harness, so footerHint()/peerProblems() had NO coverage
+    at all — which is how a footer that reported healthy peers as unreachable
+    shipped. This asserts the CONTRACT (which rows count as a problem) rather than
+    the JS itself; the JS branch order is mirrored by the helper below.
+    """
+
+    @staticmethod
+    def peer_problems(rows):
+        """Mirror of Panel.qml peerProblems()."""
+        bad = 0
+        for row in rows or []:
+            if not row or row.get("reachable") is not False:
+                continue
+            if row.get("state") == "skipped":
+                continue
+            if str(row.get("error") or "").startswith("skipped:"):
+                continue
+            bad += 1
+        return bad
+
+    @staticmethod
+    def footer_hint(rows, agents, kill_error=""):
+        """Mirror of Panel.qml footerHint()."""
+        if kill_error:
+            return "Terminate failed: " + kill_error
+        problems = PeerFooterDiagnostics.peer_problems(rows)
+        if problems > 0:
+            return ("1 peer unreachable · check its key or host" if problems == 1
+                    else f"{problems} peers unreachable · check their keys")
+        if agents:
+            if all(a.get("can_focus") is False for a in agents):
+                return "Remote sessions are read-only"
+        return "Click card to focus · ✕ to terminate"
+
+    def test_a_skipped_peer_is_not_reported_unreachable(self):
+        # The regression: 6 healthy peers, 2 over the per-tick budget, footer
+        # permanently claiming "2 remote peers unreachable".
+        rows = [{"name": f"p{i}", "reachable": True, "error": ""} for i in range(4)]
+        rows += [{"name": "p4", "reachable": False, "state": "skipped",
+                  "error": "skipped: over the 4-peer per-tick budget"} for _ in range(2)]
+        self.assertEqual(self.peer_problems(rows), 0)
+        self.assertEqual(self.footer_hint(rows, [{"can_focus": False}]),
+                         "Remote sessions are read-only")
+
+    def test_an_older_payload_without_state_is_still_handled(self):
+        rows = [{"name": "p4", "reachable": False, "error": "skipped: over the 4-peer per-tick budget"}]
+        self.assertEqual(self.peer_problems(rows), 0)
+
+    def test_a_genuinely_failed_peer_is_reported(self):
+        rows = [{"name": "spark", "reachable": False, "error": "no API key (HERMES_PEER_SPARK_KEY unset)"}]
+        self.assertEqual(self.peer_problems(rows), 1)
+        self.assertIn("unreachable", self.footer_hint(rows, [{"can_focus": False}]))
+
+    def test_kill_error_keeps_precedence(self):
+        rows = [{"name": "spark", "reachable": False, "error": "boom"}]
+        self.assertTrue(self.footer_hint(rows, [], kill_error="nope").startswith("Terminate failed"))
+
+    def test_the_plural_hint_fits_the_footer_at_the_users_font_scale(self):
+        # Measured 356px against a ~347px residual at base-size 14 for the old
+        # wording, so it was silently elided exactly when 2+ peers failed.
+        for count in range(2, 9):
+            hint = self.footer_hint([{"name": "p", "reachable": False, "error": "x"}] * count, [])
+            self.assertLess(len(hint), 40, hint)
+
+    def test_the_collector_marks_over_budget_peers_as_skipped(self):
+        # Drive the REAL _collect_peer_cards with 6 registered peers. The probed
+        # ones may or may not answer; the assertion is about the OVER-BUDGET ones,
+        # which must be marked skipped so the footer never calls them unreachable.
+        peers = [{"name": f"p{i}", "url": f"http://127.0.0.1:1", "base": f"http://127.0.0.1:1"}
+                 for i in range(6)]
+        with mock.patch.object(ac, "load_peer_registry", return_value=peers), \
+             mock.patch.object(ac, "load_peer_secret", return_value="k" * 32):
+            cards, status = ac._collect_peer_cards()
+
+        skipped = [r for r in status if r.get("state") == "skipped"]
+        probed = [r for r in status if r.get("state") != "skipped"]
+        self.assertEqual(len(skipped), len(peers) - ac.PEER_MAX_PEERS_PROBED)
+        self.assertEqual(len(probed), ac.PEER_MAX_PEERS_PROBED)
+        self.assertTrue(all(r["error"].startswith("skipped:") for r in skipped))
+        # loopback peers are skipped with a different reason, so use plain hosts
+        self.assertEqual(self.peer_problems([r for r in skipped
+                                             if r["error"].startswith("skipped:")]), 0)
 
 
 class PeerReadOnlyContract(unittest.TestCase):

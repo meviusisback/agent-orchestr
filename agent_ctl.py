@@ -1016,10 +1016,16 @@ def peer_http_get(
         # The response watchdog cannot interrupt getaddrinfo, and conn.connect()
         # resolves the name BEFORE any socket exists — a stalling resolver
         # measured 20 s against a 3 s deadline, with the watchdog already armed.
-        # Pre-resolve in a bounded helper thread (a daemon we abandon on timeout)
-        # so the budget covers DNS as well as I/O.
-        if not _peer_name_resolves(host, port, min(deadline - time.monotonic(), PEER_REQ_BUDGET)):
+        #
+        # A PRE-resolve alone was not enough: connect() then resolved the SAME
+        # name a second time with no timeout, so a resolver that answered once
+        # and then stalled still held the request open (re-measured at 20 s). So
+        # resolve ONCE, under the budget, and hand connect() the literal ADDRESS:
+        # no second lookup, nothing left for a blackholed resolver to do.
+        connect_host = _peer_resolve_address(host, port, min(deadline - time.monotonic(), PEER_REQ_BUDGET))
+        if not connect_host:
             return None
+        conn.host, conn.port = connect_host, port or (443 if parts.scheme == "https" else 80)
         conn.connect()
         # ENFORCE the total budget. A dribbling peer blocks inside
         # HTTPResponse.read() on the BUFFERED file object, and by then the
@@ -1072,28 +1078,41 @@ def peer_http_get(
         return None
 
 
-def _peer_name_resolves(host: str, port: Optional[int], budget: float) -> bool:
-    """True when the peer host resolves inside `budget` seconds.
+def _peer_resolve_address(host: str, port: Optional[int], budget: float) -> Optional[str]:
+    """Resolve the peer host to a literal address inside `budget`, or None.
 
     getaddrinfo is a blocking C call with no timeout, and http.client calls it
-    inside connect() before any socket exists — so the response watchdog cannot
-    cover it. This bounds it: the helper thread is a daemon, so giving up on it
-    leaks at most one parked thread per stalled peer per tick, which is bounded
-    by PEER_MAX_PEERS_PROBED and reaped when the collector exits.
+    inside connect() before any socket exists, so the response watchdog cannot
+    cover it. This bounds it in a daemon thread and RETURNS the address, because
+    a pre-resolve that only answered "does it resolve?" left connect() free to
+    resolve the same name again — unbounded — which is what the round-2 review
+    measured (20 s against a 3 s deadline on a second lookup).
+
+    An IP literal is returned as-is: it needs no resolver at all.
     """
-    outcome: List[bool] = []
+    try:
+        ipaddress.ip_address(host.strip("[]"))
+        return host.strip("[]")
+    except ValueError:
+        pass
+    outcome: List[str] = []
 
     def _resolve() -> None:
         try:
-            socket.getaddrinfo(host, port or 80, proto=socket.IPPROTO_TCP)
-            outcome.append(True)
+            infos = socket.getaddrinfo(host, port or 80, type=socket.SOCK_STREAM)
         except Exception:
-            outcome.append(False)
+            outcome.append("")
+            return
+        for family, _, _, _, sockaddr in infos:
+            if family in (socket.AF_INET, socket.AF_INET6):
+                outcome.append(str(sockaddr[0]))
+                return
+        outcome.append("")
 
     worker = threading.Thread(target=_resolve, daemon=True)
     worker.start()
     worker.join(max(0.0, budget))
-    return bool(outcome) and outcome[0]
+    return outcome[0] if outcome else None
 
 
 def _abort_response(holder: List[Any], conn: Any) -> None:
@@ -3867,18 +3886,27 @@ def _collect_peer_cards() -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
     # NOT a `with` block: __exit__ calls shutdown(wait=True), which joins every
     # worker BEFORE the results are read, making the per-future timeout
     # decorative (a peer ignoring its deadline measured 16 s against a 3 s budget).
-    # shutdown(wait=False, cancel_futures=True) lets the caller's timeout govern;
-    # the abandoned workers are daemon-free but bounded, and the collector's own
-    # exit reaps them.
+    # shutdown(wait=False, cancel_futures=True) lets the caller's timeout govern,
+    # but ThreadPoolExecutor workers are NON-daemon: the interpreter joins them at
+    # exit, so a parked peer used to hold the process (and its stdout pipe, which
+    # Quickshell reads with waitForEnd:true) open long past the payload — measured
+    # 25 s of process wall time AFTER all collector work was finished, which the
+    # 18 s stall timer then killed, discarding the LOCAL cards too. main() now
+    # exits explicitly, so nothing parked can delay or truncate the reply.
+    tick_deadline = time.monotonic() + PEER_PEER_BUDGET + 1.0
     pool = ThreadPoolExecutor(max_workers=min(PEER_MAX_PEERS_PROBED, len(selected)))
     try:
         futures = {
             pool.submit(build_peer_agents, [entry], now): index
             for index, entry in enumerate(selected)
         }
+        # ONE wall-clock deadline for the whole loop. Reading each future with
+        # its own timeout serialised into N x 4 s (measured: 4 uncooperative peers
+        # spent 16 s of the tick, against Panel.qml's 18 s stall timer), so one
+        # slow peer was enough to lose the tick entirely.
         for future, index in futures.items():
             try:
-                results[index] = future.result(timeout=PEER_PEER_BUDGET + 1.0)
+                results[index] = future.result(timeout=max(0.0, tick_deadline - time.monotonic()))
             except Exception:
                 results[index] = None
     finally:
@@ -3899,6 +3927,10 @@ def _collect_peer_cards() -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
     for entry in peers[PEER_MAX_PEERS_PROBED:]:
         status_rows.append({
             "name": entry["name"][:64], "url": entry["url"][:PEER_URL_MAX], "reachable": False,
+            # NOT a failure: this peer was never probed, so the UI must not call it
+            # unreachable. `reachable` alone cannot carry three meanings
+            # (ok / failed / not-probed) without the footer lying about healthy peers.
+            "state": "skipped",
             "sessions": 0, "error": f"skipped: over the {PEER_MAX_PEERS_PROBED}-peer per-tick budget",
         })
     return cards[:PEER_MAX_PEERS_PROBED * PEER_MAX_PEER_CARDS], status_rows
@@ -4709,10 +4741,34 @@ def dump_status_json(data: Dict[str, Any]) -> str:
     return text
 
 
+def _flush_and_exit(code: int = 0) -> None:
+    """Flush stdout/stderr and leave immediately, skipping interpreter teardown.
+
+    A peer probe can leave a ThreadPoolExecutor worker parked in a blocking
+    resolver or socket read, and those workers are NON-daemon: the interpreter
+    joins them at exit, so the process (and its stdout pipe, which Quickshell
+    reads with waitForEnd:true) stays open long after the payload was written.
+    The widget's 18 s stall timer then killed the tick and DISCARDED the reply,
+    so a slow remote peer cost the local agents' cards as well (measured: 25 s of
+    process wall time after all work had finished). Every guard has already run
+    and the payload is on stdout by here, so teardown buys nothing.
+    """
+    try:
+        sys.stdout.flush()
+    except Exception:
+        pass
+    try:
+        sys.stderr.flush()
+    except Exception:
+        pass
+    os._exit(code)
+
+
 def main() -> None:
     if len(sys.argv) < 2 or sys.argv[1] in ("fetch", "status", "--json", "-j"):
         data = fetch_all_agents()
         print(dump_status_json(data))
+        _flush_and_exit(0)
         return
 
     cmd = sys.argv[1]
