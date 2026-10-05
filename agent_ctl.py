@@ -1025,7 +1025,24 @@ def peer_http_get(
         connect_host = _peer_resolve_address(host, port, min(deadline - time.monotonic(), PEER_REQ_BUDGET))
         if not connect_host:
             return None
-        conn.host, conn.port = connect_host, port or (443 if parts.scheme == "https" else 80)
+        # HTTPSConnection.connect() hands self.host to wrap_socket as
+        # server_hostname, so overwriting conn.host with the literal address
+        # would drop SNI and verify the certificate against the IP rather than
+        # the hostname the user configured — breaking every https:// peer.
+        # Instead: keep conn.host as the TLS identity and pin the ADDRESS for
+        # the socket, which is exactly what HTTPSConnection._tunnel_host does
+        # for the same reason.
+        conn.port = port or (443 if parts.scheme == "https" else 80)
+        # Redirect ONLY the TCP connect to the address we already resolved.
+        # conn.host stays the hostname, which is what HTTPSConnection passes to
+        # wrap_socket as server_hostname — so SNI and certificate verification
+        # still check the name the user configured, not the IP. Overwriting
+        # conn.host instead would silently break every https:// peer.
+        pinned_port = conn.port
+        conn._create_connection = (
+            lambda address, timeout=None, source_address=None, _addr=connect_host, _port=pinned_port:
+            socket.create_connection((_addr, _port), timeout, source_address)
+        )
         conn.connect()
         # ENFORCE the total budget. A dribbling peer blocks inside
         # HTTPResponse.read() on the BUFFERED file object, and by then the

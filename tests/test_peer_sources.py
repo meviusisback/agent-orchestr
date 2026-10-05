@@ -21,6 +21,7 @@ import importlib.util
 import json
 import os
 import socket
+import ssl
 import stat
 import sys
 import threading
@@ -870,6 +871,57 @@ class PeerKeyFloor(unittest.TestCase):
         with mock.patch.object(ac, "read_confined_text",
                                return_value=f"HERMES_PEER_SPARK_KEY={PEER_KEY}\n"):
             self.assertEqual(ac.load_peer_secret("spark"), PEER_KEY)
+
+
+class PeerTlsHostnameIdentity(unittest.TestCase):
+    """Resolving the address must not replace the TLS identity.
+
+    peer_http_get resolves the host itself so a stalling resolver cannot hold the
+    request, and pins that ADDRESS for the socket. If it had done that by
+    overwriting conn.host, HTTPSConnection.connect() would pass the IP to
+    wrap_socket as server_hostname — dropping SNI and verifying the certificate
+    against the address instead of the name the user configured, which silently
+    breaks every https:// peer.
+    """
+
+    def test_the_certificate_is_verified_against_the_configured_hostname(self):
+        import http.server
+        import socketserver
+
+        captured = {}
+        real_wrap = ssl.SSLContext.wrap_socket
+
+        def spy(self, sock, *args, **kwargs):  # noqa: A002 - stdlib signature
+            captured["server_hostname"] = kwargs.get("server_hostname")
+            raise ssl.SSLError("stop before the handshake")
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def log_message(self, format, *args):  # noqa: A002
+                pass
+
+            def do_GET(self):  # noqa: N802
+                self.send_response(200)
+                self.send_header("Content-Length", "2")
+                self.end_headers()
+                self.wfile.write(b"{}")
+
+        srv = socketserver.TCPServer(("127.0.0.1", 0), Handler)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        ssl.SSLContext.wrap_socket = spy
+        try:
+            with mock.patch.object(ac, "_peer_resolve_address", return_value="127.0.0.1"):
+                ac.peer_http_get(f"https://spark.lan.test:{srv.server_address[1]}",
+                                 "/api/sessions", PEER_KEY, deadline=time.monotonic() + 3)
+        finally:
+            ssl.SSLContext.wrap_socket = real_wrap
+            srv.shutdown()
+            srv.server_close()
+        self.assertEqual(captured.get("server_hostname"), "spark.lan.test")
+
+    def test_an_ip_literal_peer_needs_no_resolver(self):
+        # 127.0.0.1 is already an address: it must short-circuit the resolver, so
+        # a loopback-ish literal never depends on getaddrinfo at all.
+        self.assertEqual(ac._peer_resolve_address("127.0.0.1", 8377, 1.0), "127.0.0.1")
 
 
 class PeerTlsTrustStore(unittest.TestCase):
