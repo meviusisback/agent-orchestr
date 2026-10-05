@@ -338,32 +338,36 @@ class PeerSessionIdentity(unittest.TestCase):
 
 class PeerStatusTable(unittest.TestCase):
     def test_assistant_with_tool_calls_is_working(self):
-        status, detail, _ = ac.peer_session_status({}, {"role": "assistant", "tool_calls": "[{}]"}, False)
+        status, detail, _ = ac.peer_session_status({"role": "assistant", "tool_calls": "[{}]"}, False)
         self.assertEqual(status, "working")
         self.assertIn("tool", detail.lower())
 
     def test_tool_message_follows_activity(self):
-        active = ac.peer_session_status({}, {"role": "tool", "tool_name": "read_file"}, True)
-        idle = ac.peer_session_status({}, {"role": "tool", "tool_name": "read_file"}, False)
+        active = ac.peer_session_status({"role": "tool", "tool_name": "read_file"}, True)
+        idle = ac.peer_session_status({"role": "tool", "tool_name": "read_file"}, False)
         self.assertEqual(active[0], "working")
         self.assertEqual(idle[0], "completed")
 
     def test_assistant_content_asking_a_question_waits_when_inactive(self):
         status, _, question = ac.peer_session_status(
-            {}, {"role": "assistant", "content": "Should I push it?"}, False)
+            {"role": "assistant", "content": "Should I push it?"}, False)
         self.assertEqual(status, "waiting")
         self.assertTrue(question)
 
     def test_assistant_content_is_working_when_active(self):
-        status, _, _ = ac.peer_session_status({}, {"role": "assistant", "content": "On it"}, True)
+        status, _, _ = ac.peer_session_status({"role": "assistant", "content": "On it"}, True)
         self.assertEqual(status, "working")
 
     def test_user_message_maps_to_idle_when_inactive(self):
-        self.assertEqual(ac.peer_session_status({}, {"role": "user", "content": "hi"}, False)[0], "idle")
+        self.assertEqual(ac.peer_session_status({"role": "user", "content": "hi"}, False)[0], "idle")
 
-    def test_absent_message_follows_activity(self):
-        self.assertEqual(ac.peer_session_status({}, None, True)[0], "working")
-        self.assertEqual(ac.peer_session_status({}, None, False)[0], "idle")
+    def test_unpolled_session_is_unknown_not_working(self):
+        # A card we never read a message for must not claim to be working: the
+        # local scanner uses the same "unknown" status for the same reason.
+        status, detail, question = ac.peer_session_status(None, True)
+        self.assertEqual(status, "unknown")
+        self.assertIn("Not polled", detail)
+        self.assertFalse(question)
 
     def test_active_heuristic_uses_ended_at_and_the_window(self):
         now = time.time()
@@ -373,7 +377,11 @@ class PeerStatusTable(unittest.TestCase):
         self.assertFalse(ac.peer_session_is_active({"ended_at": None, "last_active": "junk"}, now))
 
     def test_wrong_type_rows_do_not_raise(self):
-        self.assertEqual(ac.peer_session_status({"id": None}, {"role": 7, "content": []}, True)[0], "working")
+        # An unrecognised role falls through to the final branch, which reports
+        # activity when the row is active — the point here is that no attribute
+        # error escapes on a row whose fields are the wrong type.
+        self.assertEqual(ac.peer_session_status({"role": 7, "content": []}, True)[0], "working")
+        self.assertEqual(ac.peer_session_status({"role": 7, "content": []}, False)[0], "completed")
         self.assertEqual(ac.parse_peer_sessions({"data": "nope"}), [])
         self.assertEqual(ac.parse_peer_sessions(None), [])
         self.assertIsNone(ac.parse_peer_message({"data": []}))
@@ -549,10 +557,13 @@ class PeerTransportAgainstRealServer(unittest.TestCase):
             {"id": "s1", "title": "t", "message_count": 1, "last_active": now}]}
 
         class Handler(BaseHTTPRequestHandler):
+            seen_paths = []
+
             def log_message(self, format, *args):  # noqa: A002 - stdlib signature
                 pass
 
             def do_GET(self):  # noqa: N802
+                type(self).seen_paths.append(self.path)  # wire-level assertion needs this
                 if self.path.startswith("/redirect"):
                     self.send_response(302)
                     self.send_header("Location", "http://elsewhere.invalid/x")
@@ -584,6 +595,7 @@ class PeerTransportAgainstRealServer(unittest.TestCase):
                 self.end_headers()
                 self.wfile.write(body)
 
+        cls.handler_cls = Handler
         cls.server = HTTPServer(("127.0.0.1", 0), Handler)
         cls.port = cls.server.server_address[1]
         cls.thread = threading.Thread(target=cls.server.serve_forever, daemon=True)
@@ -597,6 +609,43 @@ class PeerTransportAgainstRealServer(unittest.TestCase):
     @property
     def base(self):
         return f"http://127.0.0.1:{self.port}"
+
+    @property
+    def server_paths(self):
+        return self.__class__.handler_cls.seen_paths
+
+    def setUp(self):
+        self.server_paths.clear()
+
+    def test_the_query_string_reaches_the_wire(self):
+        # A precedence bug once sent every request as a bare "/api/sessions",
+        # silently dropping limit / order=latest / include_hidden / title — and
+        # every stub-based test still passed, because a stub matches the string it
+        # was handed and never sees the wire. Assert what the SERVER received.
+        for path in ("/api/sessions?limit=20",
+                     "/api/sessions?title=Bot%20Chat&include_hidden=1&limit=4",
+                     "/api/sessions/s1/messages?limit=1&order=latest"):
+            self.server_paths.clear()
+            ac.peer_http_get(self.base, path, PEER_KEY, deadline=time.monotonic() + 3)
+            self.assertEqual(self.server_paths, [path])
+
+    def test_a_stalling_resolver_is_cut_off_at_the_budget(self):
+        # connect() resolves the name before any socket exists, so the response
+        # watchdog cannot cover it: a 20 s resolve was measured against a 3 s
+        # deadline. The pre-resolve is what bounds it.
+        real = socket.getaddrinfo
+
+        def stall(*args, **kwargs):
+            time.sleep(20)
+            raise OSError("stalled")
+
+        with mock.patch.object(ac.socket, "getaddrinfo", stall):
+            started = time.monotonic()
+            result = ac.peer_http_get("http://blackhole.invalid:8377", "/api/sessions",
+                                      PEER_KEY, deadline=time.monotonic() + 1.0)
+            elapsed = time.monotonic() - started
+        self.assertIsNone(result)
+        self.assertLess(elapsed, 3.0, f"DNS stall not bounded (took {elapsed:.2f}s)")
 
     def test_a_normal_response_parses(self):
         result = ac.peer_http_get(self.base, "/api/sessions?limit=2", PEER_KEY,
@@ -630,6 +679,182 @@ class PeerTransportAgainstRealServer(unittest.TestCase):
         sock.close()
         self.assertIsNone(ac.peer_http_get(f"http://127.0.0.1:{dead_port}", "/api/sessions",
                                            PEER_KEY, deadline=time.monotonic() + 2))
+
+
+class PeerWireRecording(unittest.TestCase):
+    """Asserts the EXACT request line a real socket carried.
+
+    Distinct from the stub-based tests on purpose: those intercept the string
+    handed to an injected fetch and therefore cannot see a bug in how that
+    string becomes an HTTP request. These stand up a server and read
+    self.requestline back.
+    """
+
+    def setUp(self):
+        self.seen = []
+        outer = self
+
+        class Handler(BaseHTTPRequestHandler):
+            def log_message(self, format, *args):  # noqa: A002
+                pass
+
+            def do_GET(self):  # noqa: N802
+                outer.seen.append(self.path)
+                body = json.dumps({"object": "list", "data": []}).encode()
+                self.send_response(200)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+        self.server = HTTPServer(("127.0.0.1", 0), Handler)
+        self.port = self.server.server_address[1]
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread.start()
+        self.addCleanup(self.server.server_close)
+        self.addCleanup(self.server.shutdown)
+
+    def base(self):
+        return f"http://127.0.0.1:{self.port}"
+
+    def test_sessions_query_carries_limit(self):
+        ac.peer_http_get(self.base(), f"/api/sessions?limit={ac.PEER_SESSIONS_QUERY}", PEER_KEY,
+                         deadline=time.monotonic() + 3)
+        self.assertEqual(self.seen, [f"/api/sessions?limit={ac.PEER_SESSIONS_QUERY}"])
+
+    def test_message_read_carries_order_latest(self):
+        ac.peer_http_get(self.base(), "/api/sessions/s1/messages?limit=1&order=latest", PEER_KEY,
+                         deadline=time.monotonic() + 3)
+        self.assertEqual(self.seen, ["/api/sessions/s1/messages?limit=1&order=latest"])
+
+    def test_bot_chat_query_carries_include_hidden(self):
+        ac.peer_http_get(self.base(), f"/api/sessions?title=Bot%20Chat&include_hidden=1&limit=4",
+                         PEER_KEY, deadline=time.monotonic() + 3)
+        self.assertIn("include_hidden=1", self.seen[0])
+        self.assertIn("title=Bot", self.seen[0])
+
+    def test_build_peer_agents_sends_the_hidden_filter_for_real(self):
+        # Drive the REAL transport (not a stub) through the card builder. The test
+        # server is on 127.0.0.1, which the dedup rule skips, so that one guard is
+        # bypassed here on purpose — the rule itself is asserted in
+        # PeerCardBuilding.test_loopback_peer_is_skipped_with_a_reason.
+        with mock.patch.object(ac, "peer_host_is_loopback", return_value=False):
+            cards, status = ac.build_peer_agents(
+                [{"name": "spark", "url": self.base(), "base": self.base()}],
+                time.time(), keys={"spark": PEER_KEY},
+            )
+        self.assertTrue(any("include_hidden=1" in path for path in self.seen), self.seen)
+        self.assertEqual(cards, [])   # the server reports no sessions
+        self.assertTrue(status[0]["reachable"], status)
+
+
+class PeerUnreachableIsNotEmpty(unittest.TestCase):
+    """A peer that cannot be reached must not be reported as a healthy empty one."""
+
+    def test_none_first_response_means_unreachable(self):
+        class Dead:
+            def __call__(self, base, path, key, *, deadline):
+                return None
+        cards, status = ac.build_peer_agents(
+            [{"name": "spark", "url": "http://spark.lan:8377", "base": "http://spark.lan:8377"}],
+            time.time(), keys={"spark": PEER_KEY}, fetch=Dead(),
+        )
+        self.assertEqual(cards, [])
+        self.assertFalse(status[0]["reachable"], status)
+        self.assertIn("unreachable", status[0]["error"])
+
+    def test_empty_but_answered_is_reachable(self):
+        class Empty:
+            def __call__(self, base, path, key, *, deadline):
+                return {"object": "list", "data": []}
+        cards, status = ac.build_peer_agents(
+            [{"name": "spark", "url": "http://spark.lan:8377", "base": "http://spark.lan:8377"}],
+            time.time(), keys={"spark": PEER_KEY}, fetch=Empty(),
+        )
+        self.assertEqual(cards, [])
+        self.assertTrue(status[0]["reachable"], status)
+
+
+class PeerParserAttribution(unittest.TestCase):
+    """A rejected or over-cap entry must not lend its url to the previous peer."""
+
+    def test_rejected_name_does_not_donate_its_url(self):
+        text = ("bot_peers:\n  spark:\n    url: http://good.lan:8377\n"
+                "  ../../etc:\n    url: http://evil.lan:8377\n"
+                "  mini:\n    url: http://mini.lan:8377\n")
+        rows = ac.parse_bot_peers(text)
+        self.assertEqual([r["name"] for r in rows], ["spark", "mini"])
+        self.assertEqual(rows[0]["url"], "http://good.lan:8377")
+
+    def test_entry_past_the_cap_does_not_repoint_a_kept_peer(self):
+        lines = ["bot_peers:"]
+        for index in range(12):
+            lines += [f"  p{index}:", f"    url: http://h{index}.lan:8377"]
+        rows = ac.parse_bot_peers("\n".join(lines))
+        self.assertEqual(len(rows), ac.PEER_MAX_PEERS_PARSED)
+        self.assertEqual(rows[-1]["url"], f"http://h{ac.PEER_MAX_PEERS_PARSED - 1}.lan:8377")
+
+
+class PeerTargetAuthority(unittest.TestCase):
+    def test_scheme_relative_path_cannot_replace_the_host(self):
+        # urljoin treats "//host/x" as absolute, which would send the Bearer key
+        # to a host the user never registered.
+        self.assertIsNone(ac.peer_request_target("http://spark.lan:8377", "//evil.example/steal"))
+
+    def test_normal_path_still_works(self):
+        self.assertEqual(ac.peer_request_target("http://h:1", "/api/sessions?limit=2"),
+                         "http://h:1/api/sessions?limit=2")
+
+
+class PeerNonFiniteActivity(unittest.TestCase):
+    def test_nan_and_inf_last_active_never_become_a_card(self):
+        now = time.time()
+        for bogus in (float("nan"), float("inf"), -float("inf"), "nan", "1e999"):
+            cards = ac._cards_from_rows(
+                "spark", "http://spark.lan:8377", PEER_KEY,
+                [{"id": "s1", "title": "t", "message_count": 2, "last_active": bogus}],
+                now, lambda *a, **k: None, time.monotonic() + 3,
+            )
+            self.assertEqual(cards, [], f"{bogus!r} produced a card")
+
+    def test_ordinary_recent_row_still_becomes_a_card(self):
+        now = time.time()
+        cards = ac._cards_from_rows(
+            "spark", "http://spark.lan:8377", PEER_KEY,
+            [{"id": "s1", "title": "t", "message_count": 2, "last_active": now - 5}],
+            now, lambda *a, **k: None, time.monotonic() + 3,
+        )
+        self.assertEqual(len(cards), 1)
+
+
+class PeerKeyFloor(unittest.TestCase):
+    def test_a_short_key_is_refused_rather_than_leaking_through_the_scrubber(self):
+        # scrub_peer_text only redacts literals of >=8 chars, so a shorter key
+        # would bypass it and could be echoed into the bar by the peer.
+        with mock.patch.object(ac, "read_confined_text",
+                               return_value="HERMES_PEER_SPARK_KEY=abc1234\n"):
+            self.assertIsNone(ac.load_peer_secret("spark"))
+        with mock.patch.object(ac, "read_confined_text",
+                               return_value=f"HERMES_PEER_SPARK_KEY={PEER_KEY}\n"):
+            self.assertEqual(ac.load_peer_secret("spark"), PEER_KEY)
+
+
+class PeerTlsTrustStore(unittest.TestCase):
+    def test_a_missing_bundle_fails_closed_instead_of_using_the_env(self):
+        # The removed fallback called create_default_context() with no cafile,
+        # which honours SSL_CERT_FILE — so a host without the bundle would have
+        # had the peer's trust store decided by the session environment.
+        with mock.patch.object(ac, "PEER_CA_BUNDLE", "/nonexistent/ca-bundle.crt"), \
+             mock.patch.dict(os.environ, {"SSL_CERT_FILE": "/etc/hostname"}):
+            self.assertIsNone(ac._peer_tls_context())
+
+    def test_the_pinned_bundle_is_used_when_present(self):
+        if not os.path.exists(ac.PEER_CA_BUNDLE):
+            self.skipTest(f"{ac.PEER_CA_BUNDLE} absent on this host")
+        with mock.patch.dict(os.environ, {"SSL_CERT_FILE": "/etc/hostname"}):
+            context = ac._peer_tls_context()
+        self.assertIsNotNone(context)
+        # The env var is ignored, so the store is the system bundle, not /etc/hostname.
+        self.assertGreater(len(context.get_ca_certs()), 0)
 
 
 class PeerReadOnlyContract(unittest.TestCase):

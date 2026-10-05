@@ -85,6 +85,39 @@ Panel {
   // NOT done here: dropping the inherited environment entirely. The collector
   // still runs hyprctl / orca / herdr by name, so removing PATH needs the
   // trusted-path resolvers; that residual is documented in the README.
+  // The footer previously promised "Click card to focus · ✕ to terminate"
+  // unconditionally, which is a lie on a peer card (no ✕ is rendered and the
+  // click is a no-op), and the collector's per-peer failure reasons were never
+  // read anywhere — the stderr collector discards stderr, so an unreachable peer
+  // was indistinguishable from "no peer registered".
+  function peerProblems() {
+    var rows = (root.rawData && root.rawData.hermes_peers) || []
+    var bad = 0
+    for (var i = 0; i < rows.length; i++) {
+      if (rows[i] && rows[i].reachable === false) bad++
+    }
+    return bad
+  }
+
+  function footerHint() {
+    if (root.killError) return "Terminate failed: " + root.killError
+    var problems = root.peerProblems()
+    if (problems > 0) {
+      return problems === 1
+        ? "1 remote peer unreachable · check its key or host"
+        : problems + " remote peers unreachable · check their keys or hosts"
+    }
+    var list = root.agents || []
+    if (list.length > 0) {
+      var focusable = false
+      for (var i = 0; i < list.length; i++) {
+        if (!list[i] || list[i].can_focus !== false) { focusable = true; break }
+      }
+      if (!focusable) return "Remote sessions are read-only"
+    }
+    return "Click card to focus · ✕ to terminate"
+  }
+
   function cliArgv(verb, extra) {
     var argv = ["/usr/bin/python3", "-I", root.scriptPath(), verb]
     if (extra) argv.push(extra)
@@ -606,7 +639,11 @@ Panel {
 
                 // Origin Pill (Herdr vs Terminal vs Desktop)
                 Rectangle {
-                  implicitWidth: originRow.implicitWidth + Style.space(8)
+                  // Capped + elided like the model chip below: a peer name is
+                  // user-controlled (up to 64 chars upstream), and an uncapped
+                  // pill pushed the status pill — the whole payload of a
+                  // read-only card — outside the card's right edge.
+                  implicitWidth: Math.min(originRow.implicitWidth + Style.space(8), Style.space(96))
                   implicitHeight: Style.space(16)
                   radius: Style.space(4)
                   color: root.alpha(Model.originColor(modelData.origin), 0.15)
@@ -637,6 +674,8 @@ Panel {
                       // other origin maps through the shared table.
                       text: modelData.origin_badge || Model.originBadgeText(modelData.origin)
                       textFormat: Text.PlainText
+                      elide: Text.ElideRight
+                      Layout.maximumWidth: Style.space(88)
                       font.family: root.fontFamily
                       font.pixelSize: Style.space(8)
                       font.bold: true
@@ -864,7 +903,7 @@ Panel {
 
           // Keyboard hint, or the reason the last terminate did nothing
           Text {
-            text: root.killError ? ("Terminate failed: " + root.killError) : "Click card to focus · ✕ to terminate"
+            text: root.footerHint()
             textFormat: Text.PlainText
             font.family: root.fontFamily
             font.pixelSize: Style.space(9)

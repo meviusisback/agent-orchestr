@@ -31,7 +31,10 @@ function originColor(origin) {
   var o = String(origin || "").toLowerCase()
   if (o === "orca") return "#22D3EE"
   if (o === "herdr_remote") return "#F97316"
-  if (o === "hermes_peer") return "#34D399"
+  // Lime, not the teal #34D399: that sat CIELAB dE 9.1 from the DONE green
+  // #10B981, so a completed peer card was green in four places at once. This is
+  // the widest separation of every candidate (min dE 58.6 across all origins).
+  if (o === "hermes_peer") return "#A3E635"
   if (o.indexOf("desktop") >= 0) return "#F59E0B"
   if (o === "terminal") return "#38BDF8"
   return "#A855F7"
@@ -41,6 +44,7 @@ function originBadgeText(origin) {
   var o = String(origin || "").toLowerCase()
   if (o === "orca") return "ORCA"
   if (o === "herdr_remote") return "HERDR · REMOTE"
+  if (o === "hermes_peer") return "PEER"
   if (o === "herdr_desktop") return "HERDR · GUI"
   if (o === "desktop") return "DESKTOP APP"
   if (o === "process") return "HERMES CLI"
