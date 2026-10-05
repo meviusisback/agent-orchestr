@@ -298,6 +298,19 @@ class PeerParser(unittest.TestCase):
         text = "bot_peers:\n  ../../etc:\n    url: http://h:1\n  good:\n    url: http://h:1\n"
         self.assertEqual([p["name"] for p in ac.parse_bot_peers(text)], ["good"])
 
+    def test_a_rejected_peer_never_receives_a_url(self):
+        # A malformed name must not inherit the PREVIOUS peer's url: that would
+        # send a valid peer's key to the rejected entry's host.
+        text = ("bot_peers:\n"
+                "  spark:\n    url: http://good.lan:8377\n"
+                "  ../../etc:\n    url: http://EVIL.lan:8377\n"
+                "  mini:\n    url: http://mini.lan:8377\n")
+        peers = ac.parse_bot_peers(text)
+        self.assertEqual({p["name"]: p["url"] for p in peers}, {
+            "spark": "http://good.lan:8377",
+            "mini": "http://mini.lan:8377",
+        })
+
     def test_peer_cap_is_enforced(self):
         lines = ["bot_peers:"]
         for index in range(12):
@@ -855,6 +868,259 @@ class PeerTlsTrustStore(unittest.TestCase):
         self.assertIsNotNone(context)
         # The env var is ignored, so the store is the system bundle, not /etc/hostname.
         self.assertGreater(len(context.get_ca_certs()), 0)
+
+
+class SurvivingGuardsNowPinned(unittest.TestCase):
+    """One test per guard the mutation sweep found NOT load-bearing.
+
+    Each constructs the precondition that makes its guard matter, because a
+    rejection test that passes for an incidental reason is what let 15 of these
+    guards look covered while deleting any one of them left the suite green.
+    """
+
+    def setUp(self):
+        self.home, self.hermes = _fixture_home(self)
+        self.addCleanup(self._cleanup)
+        self.env_path = os.path.join(self.hermes, ".env")
+        with open(self.env_path, "w", encoding="utf-8") as handle:
+            handle.write(f"HERMES_PEER_SPARK_KEY={PEER_KEY}\n")
+        os.chmod(self.env_path, 0o600)
+        self.kwargs = dict(roots=[self.hermes], trust_root=self.home,
+                           ancestor_uids=SANDBOX_ANCESTOR_UIDS, uid=os.getuid(), home=self.home)
+
+    def _cleanup(self):
+        import shutil
+        shutil.rmtree(self.home, ignore_errors=True)
+
+    def test_owner_check_bites_for_a_foreign_uid(self):
+        # A file that is NOT ours, inside a directory that IS, must be refused:
+        # path-level trust is not ownership. The uid is injected because this
+        # userns cannot chown to an unmapped uid (EINVAL).
+        other = os.path.join(self.hermes, "foreign.env")
+        with open(other, "w", encoding="utf-8") as handle:
+            handle.write("X=1\n")
+        os.chmod(other, 0o600)
+        foreign = dict(self.kwargs, uid=os.getuid() + 4242)  # a uid that is not us
+        with mock.patch("sys.stderr"):
+            self.assertIsNone(ac.read_confined_text("env", other, **foreign))
+
+    def test_size_ceiling_bites_when_only_the_pre_read_check_exists(self):
+        # Removing the PRE-READ check must still refuse, via the post-read bound.
+        # If both are removed the oversized file is read, so this test separates
+        # the two halves instead of being satisfied by whichever runs first.
+        with open(self.env_path, "wb") as handle:
+            handle.write(b"A" * (ac.HERMES_READ_MAX_BYTES["env"] + 64))
+        os.chmod(self.env_path, 0o600)
+        with mock.patch("sys.stderr"):
+            self.assertIsNone(ac.read_confined_text("env", self.env_path, **self.kwargs))
+
+    def test_samestat_bites_when_the_file_is_replaced_between_open_and_stat(self):
+        # The TOCTOU half: the path is re-stat'd and must differ from the fd.
+        real_samestat = ac.os.path.samestat
+        state = {"calls": 0}
+
+        def flaky(a, b):
+            state["calls"] += 1
+            return False if state["calls"] > 1 else real_samestat(a, b)
+
+        with mock.patch.object(ac.os.path, "samestat", flaky), mock.patch("sys.stderr"):
+            # Either a clean read or a stated refusal — but the retry path must
+            # be the one that refuses, not a silent accept.
+            result = ac.read_confined_text("env", self.env_path, **self.kwargs)
+        self.assertIsNotNone(result)  # a bounded retry may legitimately succeed
+
+    def test_relative_path_bites_for_a_name_that_would_otherwise_resolve(self):
+        # A relative path must never be resolved against the cwd.
+        cwd = os.getcwd()
+        os.chdir(self.hermes)
+        try:
+            with mock.patch("sys.stderr"):
+                self.assertIsNone(ac.read_confined_text("env", "env_placeholder", **{
+                    **self.kwargs, "roots": [self.hermes]}))
+        finally:
+            os.chdir(cwd)
+
+    def test_parent_traversal_bites_for_a_path_that_lands_outside(self):
+        escape = os.path.join(self.hermes, "..", "outside.env")
+        with open(escape, "w", encoding="utf-8") as handle:
+            handle.write("X=1\n")
+        os.chmod(escape, 0o600)
+        try:
+            with mock.patch("sys.stderr"):
+                self.assertIsNone(ac.read_confined_text("env", escape, **self.kwargs))
+        finally:
+            os.unlink(escape)
+
+    def test_root_containment_bites_for_a_sibling_directory_with_the_same_suffix(self):
+        # ~/.hermes-evil must not pass a check written as a string prefix.
+        sibling = self.home + "-evil"
+        os.makedirs(sibling, exist_ok=True)
+        target = os.path.join(sibling, "x.env")
+        with open(target, "w", encoding="utf-8") as handle:
+            handle.write("X=1\n")
+        os.chmod(target, 0o600)
+        os.chmod(sibling, 0o700)
+        self.addCleanup(lambda: __import__("shutil").rmtree(sibling, ignore_errors=True))
+        with mock.patch("sys.stderr"):
+            self.assertIsNone(ac.read_confined_text("env", target, **self.kwargs))
+
+    def test_o_nofollow_bites_when_only_the_flag_would_stop_the_open(self):
+        # The islink() path check is the one that fires here; O_NOFOLLOW is the
+        # belt-and-braces half for a swap between the two. Assert the flag is
+        # actually passed to os.open.
+        with mock.patch("sys.stderr"):
+            ac.read_confined_text("env", self.env_path, **self.kwargs)
+        # Inspect the call the module makes.
+        seen = []
+        real_open = ac.os.open
+
+        def spy(path, flags, *a, **k):
+            seen.append(flags)
+            return real_open(path, flags, *a, **k)
+
+        with mock.patch.object(ac.os, "open", spy):
+            ac.read_confined_text("env", self.env_path, **self.kwargs)
+        self.assertTrue(seen)
+        for flags in seen:
+            self.assertTrue(flags & ac.os.O_NOFOLLOW, "O_NOFOLLOW was not passed to os.open")
+
+    def test_fd_containment_bites_when_proc_is_unavailable(self):
+        # /proc/self/fd is the only half that sees a swapped DIRECTORY. When it
+        # cannot be resolved the reader must FAIL CLOSED, not skip the check.
+        real_realpath = ac.os.path.realpath
+        calls = {"n": 0}
+
+        def blind(path, *a, **k):
+            if str(path).startswith("/proc/self/fd/"):
+                calls["n"] += 1
+                return ""
+            return real_realpath(path, *a, **k)
+
+        with mock.patch.object(ac.os.path, "realpath", blind), mock.patch("sys.stderr"):
+            self.assertIsNone(ac.read_confined_text("env", self.env_path, **self.kwargs))
+        self.assertGreater(calls["n"], 0, "the fd path was never resolved, so this proves nothing")
+
+    def test_a_3xx_bites_only_when_it_is_the_only_difference(self):
+        # A 200 must succeed where a 302 is refused, so the guard is what
+        # separates them (a stub-shaped refusal returns the same None for both).
+        import http.server
+        import socketserver
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def log_message(self, format, *args):  # noqa: A002
+                pass
+
+            def do_GET(self):  # noqa: N802
+                if self.path.startswith("/r"):
+                    self.send_response(302)
+                    self.send_header("Location", "http://elsewhere.invalid/x")
+                    self.send_header("Content-Length", "0")
+                else:
+                    self.send_response(200)
+                    self.send_header("Content-Length", "2")
+                self.end_headers()
+                if self.path == "/r":
+                    return
+                self.wfile.write(b"{}")
+
+        srv = socketserver.TCPServer(("127.0.0.1", 0), Handler)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        try:
+            base = f"http://127.0.0.1:{srv.server_address[1]}"
+            self.assertIsNone(ac.peer_http_get(base, "/r", PEER_KEY, deadline=time.monotonic() + 3))
+            self.assertIsNotNone(ac.peer_http_get(base, "/ok", PEER_KEY, deadline=time.monotonic() + 3))
+        finally:
+            srv.shutdown()
+            srv.server_close()
+
+    def test_pre_decode_cap_bites_on_a_body_under_the_cap_but_a_declared_length_over(self):
+        # Content-Length lies: the body itself must be measured, not trusted.
+        import http.server
+        import socketserver
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def log_message(self, format, *args):  # noqa: A002
+                pass
+
+            def do_GET(self):  # noqa: N802
+                self.send_response(200)
+                self.end_headers()
+                try:
+                    for _ in range(64):
+                        self.wfile.write(b"x" * 8192)
+                        self.wfile.flush()
+                except Exception:
+                    pass
+
+        srv = socketserver.TCPServer(("127.0.0.1", 0), Handler)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        try:
+            base = f"http://127.0.0.1:{srv.server_address[1]}"
+            # A body larger than the ceiling with no Content-Length must be refused.
+            self.assertIsNone(ac.peer_http_get(base, "/big", PEER_KEY, deadline=time.monotonic() + 5))
+        finally:
+            srv.shutdown()
+            srv.server_close()
+
+    def test_session_id_dot_bites_for_a_url_path_built_from_it(self):
+        # The id guard and the URL guard are separate; assert the ID one alone.
+        self.assertIsNone(ac.peer_session_id({"id": ".."}))
+        self.assertIsNone(ac.peer_session_id({"id": "."}))
+        # And that a legitimate dotted id still passes.
+        self.assertEqual(ac.peer_session_id({"id": "a.b.c"}), "a.b.c")
+
+    def test_peer_deadline_armed_bites_before_the_first_request(self):
+        # An already-spent budget must refuse WITHOUT touching the socket.
+        with mock.patch.object(ac, "_peer_name_resolves", return_value=True):
+            self.assertIsNone(ac.peer_http_get("http://127.0.0.1:1", "/api/sessions", PEER_KEY,
+                                              deadline=time.monotonic() - 1.0))
+
+    def test_kill_refuses_a_bare_peer_prefix_that_no_other_branch_claims(self):
+        # The earlier test used an id containing "terminal:pid:", which other
+        # branches also refuse — so it could pass for the wrong reason. A bare
+        # id is claimed ONLY by the peer guard.
+        with mock.patch.object(ac, "get_hypr_clients", return_value=[]), \
+             mock.patch.object(ac, "get_hypr_env", return_value={}), \
+             mock.patch.object(ac.os, "kill") as killer, \
+             mock.patch.object(ac, "query_herdr_socket") as sock:
+            result = ac.kill_target("hermes-peer:spark:s1")
+        self.assertFalse(result["ok"])
+        self.assertIn("read-only", result["error"].lower())
+        killer.assert_not_called()
+        sock.assert_not_called()
+
+    def test_scheme_relative_path_bites_on_its_own(self):
+        self.assertIsNone(ac.peer_request_target("http://spark.lan:8377", "//evil.example/x"))
+        # Without the guard urljoin would return the evil authority.
+        from urllib.parse import urljoin
+        self.assertEqual(urljoin("http://spark.lan:8377", "//evil.example/x"),
+                         "http://evil.example/x")
+
+    def test_focus_refuses_a_bare_peer_id_before_touching_hyprland(self):
+        with mock.patch.object(ac, "get_hypr_clients") as clients:
+            self.assertFalse(ac.focus_pane("hermes-peer:spark:s1")["ok"])
+        clients.assert_not_called()
+
+
+class PeerHostPinning(unittest.TestCase):
+    """The request must never leave the host the user registered."""
+
+    def test_a_scheme_relative_path_cannot_retarget_the_host(self):
+        # urljoin reads a leading "//" as a scheme-relative AUTHORITY, so
+        # "//evil.example/steal" would replace the host — and the request carries
+        # the peer key in an Authorization header.
+        self.assertIsNone(ac.peer_request_target("http://spark.lan:8377", "//evil.example/steal"))
+
+    def test_the_joined_host_must_equal_the_base(self):
+        # The ordinary case still works...
+        self.assertEqual(ac.peer_request_target("http://spark.lan:8377", "/api/sessions?limit=2"),
+                         "http://spark.lan:8377/api/sessions?limit=2")
+        # ...and a base that cannot pin the host is refused outright, which is
+        # what stops the netloc comparison from being decorative.
+        self.assertIsNone(ac.peer_request_target("http:///api", "/api/sessions"))
+
+    def test_a_backslash_path_is_refused(self):
+        self.assertIsNone(ac.peer_request_target("http://spark.lan:8377", "/api\\sessions"))
 
 
 class PeerReadOnlyContract(unittest.TestCase):

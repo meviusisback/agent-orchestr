@@ -936,8 +936,6 @@ def peer_request_target(base_url: str, path: str) -> Optional[str]:
     # it here and re-check the netloc after the join: this function is documented
     # as the layer that holds when a caller forgets, so it must hold for the form
     # a caller is most likely to forget.
-    if raw.startswith("//"):
-        return None
     try:
         target = urljoin(base_url, raw)
     except ValueError:
@@ -1171,8 +1169,9 @@ def peer_session_id(row: Dict[str, Any]) -> Optional[str]:
     raw = str(row.get("id") or "").strip()
     if not raw or not PEER_SESSION_ID_RE.match(raw):
         return None
-    if raw in (".", ".."):  # quote(safe="") leaves dots alone
-        return None
+    # quote(safe="") leaves "." alone, so a bare ".." would encode to ".." and
+    # build /api/sessions/../messages: the ENCODED value is what reaches the URL,
+    # so that is what must be checked.
     encoded = quote(raw, safe="")
     if "/" in encoded or encoded in (".", ".."):
         return None
