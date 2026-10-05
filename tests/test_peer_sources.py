@@ -298,6 +298,27 @@ class PeerParser(unittest.TestCase):
         text = "bot_peers:\n  ../../etc:\n    url: http://h:1\n  good:\n    url: http://h:1\n"
         self.assertEqual([p["name"] for p in ac.parse_bot_peers(text)], ["good"])
 
+    def test_a_nested_or_repeated_url_never_overwrites_the_accepted_one(self):
+        # `indent > block_indent` let ANY deeper "url:" win, so a nested one (or
+        # one under a later sibling) silently repointed a valid peer — the shape
+        # by which a peer's key reaches a host the user never typed.
+        shapes = (
+            "bot_peers:\n  spark:\n    url: http://good.lan:8377\n      url: http://evil.lan:8377\n",
+            "bot_peers:\n  spark:\n    url: http://good.lan:8377\n  extra: x\n    url: http://evil.lan:8377\n",
+            "bot_peers:\n  spark:\n    url: http://good.lan:8377\n    url: http://evil.lan:8377\n",
+        )
+        for text in shapes:
+            rows = ac.parse_bot_peers(text)
+            self.assertEqual([r["url"] for r in rows], ["http://good.lan:8377"], text)
+
+    def test_ordinary_shapes_still_parse(self):
+        for text, expected in (
+            ("bot_peers:\n  spark:\n    url: \"http://good.lan:8377\"\n", "http://good.lan:8377"),
+            ("bot_peers:\n  spark:\n    note: hi\n    url: http://good.lan:8377\n", "http://good.lan:8377"),
+            ("bot_peers:\n  spark:\n    url: http://good.lan:8377\n    note: hi\n", "http://good.lan:8377"),
+        ):
+            self.assertEqual([r["url"] for r in ac.parse_bot_peers(text)], [expected], text)
+
     def test_a_rejected_peer_never_receives_a_url(self):
         # A malformed name must not inherit the PREVIOUS peer's url: that would
         # send a valid peer's key to the rejected entry's host.

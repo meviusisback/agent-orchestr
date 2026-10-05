@@ -553,11 +553,18 @@ def parse_bot_peers(text: Optional[str]) -> List[Dict[str, str]]:
             else:
                 current = None
             continue
-        if current is not None and indent > block_indent and stripped.startswith("url:"):
+        # The url: must be a DIRECT child of the accepted name (indent == name
+        # indent + 2). `indent > block_indent` was too loose: a nested url:, or
+        # one under any later sibling, overwrote the accepted peer — which is how
+        # a peer's key reaches a host the user never typed (found by the round-2
+        # security reviewer: spark's url became http://evil.lan:8377).
+        if current is not None and indent == block_indent + 2 and stripped.startswith("url:"):
             value = stripped[len("url:"):].strip()
             if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
                 value = value[1:-1]  # a quoted scalar is still a plain scalar here
-            peers[current]["url"] = value
+            if not peers[current]["url"]:  # first url wins; never overwrite
+                peers[current]["url"] = value
+            current = None
     return [p for p in peers if p["name"] and p["url"]][:PEER_MAX_PEERS_PARSED]
 
 
