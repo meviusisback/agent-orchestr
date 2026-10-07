@@ -76,6 +76,65 @@ Panel {
     return Qt.resolvedUrl("agent_ctl.py").toString().replace(/^file:\/\//, "")
   }
 
+  // Every collector launch goes through here. Two reasons, both security:
+  //  - an ABSOLUTE interpreter, so the binary is not a PATH lookup (this
+  //    collector now reads a credential);
+  //  - `-I` (isolated), so PYTHONPATH / PYTHONSTARTUP / user-site cannot
+  //    shadow json, ssl, http.client or urllib while the key is in memory.
+  // agent_ctl.py imports stdlib only, so isolation costs it nothing.
+  // NOT done here: dropping the inherited environment entirely. The collector
+  // still runs hyprctl / orca / herdr by name, so removing PATH needs the
+  // trusted-path resolvers; that residual is documented in the README.
+  // The footer previously promised "Click card to focus · ✕ to terminate"
+  // unconditionally, which is a lie on a peer card (no ✕ is rendered and the
+  // click is a no-op), and the collector's per-peer failure reasons were never
+  // read anywhere — the stderr collector discards stderr, so an unreachable peer
+  // was indistinguishable from "no peer registered".
+  function peerProblems() {
+    var rows = (root.rawData && root.rawData.hermes_peers) || []
+    var bad = 0
+    for (var i = 0; i < rows.length; i++) {
+      var row = rows[i]
+      if (!row || row.reachable !== false) continue
+      // A peer the collector never PROBED (over the per-tick budget) is not
+      // unreachable — counting it showed a permanent, wrong "N remote peers
+      // unreachable" for a fleet that was perfectly healthy. The collector
+      // marks those state:"skipped"; the error prefix covers an older payload.
+      if (row.state === "skipped") continue
+      if (String(row.error || "").indexOf("skipped:") === 0) continue
+      bad++
+    }
+    return bad
+  }
+
+  function footerHint() {
+    if (root.killError) return "Terminate failed: " + root.killError
+    var problems = root.peerProblems()
+    if (problems > 0) {
+      // Short enough to fit at the user's base-size 14: the longer wording
+      // measured 356px against a ~347px residual and was silently elided,
+      // losing the actionable half of the message.
+      return problems === 1
+        ? "1 peer unreachable · check its key or host"
+        : problems + " peers unreachable · check their keys"
+    }
+    var list = root.agents || []
+    if (list.length > 0) {
+      var focusable = false
+      for (var i = 0; i < list.length; i++) {
+        if (!list[i] || list[i].can_focus !== false) { focusable = true; break }
+      }
+      if (!focusable) return "Remote sessions are read-only"
+    }
+    return "Click card to focus · ✕ to terminate"
+  }
+
+  function cliArgv(verb, extra) {
+    var argv = ["/usr/bin/python3", "-I", root.scriptPath(), verb]
+    if (extra) argv.push(extra)
+    return argv
+  }
+
   function fetchStatus() {
     if (!fetchProc.running) {
       root.loading = true
@@ -88,7 +147,7 @@ Panel {
     var agent = root.agents.find(function(a) { return a.pane_id === paneId })
     if (agent && agent.can_focus === false) return
     root.lastFocusedPane = paneId
-    focusProc.command = ["python3", root.scriptPath(), "focus", paneId]
+    focusProc.command = root.cliArgv("focus", paneId)
     focusProc.running = true
     root.close()
   }
@@ -96,12 +155,12 @@ Panel {
   function killTarget(paneId) {
     if (!paneId) return
     root.killError = ""
-    killProc.command = ["python3", root.scriptPath(), "kill", paneId]
+    killProc.command = root.cliArgv("kill", paneId)
     killProc.running = true
   }
 
   function launchAgent(agentName) {
-    launchProc.command = ["python3", root.scriptPath(), "launch", agentName || ""]
+    launchProc.command = root.cliArgv("launch", agentName || "")
     launchProc.running = true
     root.close()
   }
@@ -135,7 +194,7 @@ Panel {
     // collector itself is Quickshell's direct child. That matters for the stall
     // timer below: terminating the process only signals the direct child, and a
     // shell wrapper would leave the real collector running and leaked.
-    command: ["python3", root.scriptPath(), "status"]
+    command: root.cliArgv("status")
     stdout: StdioCollector {
       waitForEnd: true
       onStreamFinished: {
@@ -591,7 +650,11 @@ Panel {
 
                 // Origin Pill (Herdr vs Terminal vs Desktop)
                 Rectangle {
-                  implicitWidth: originRow.implicitWidth + Style.space(8)
+                  // Capped + elided like the model chip below: a peer name is
+                  // user-controlled (up to 64 chars upstream), and an uncapped
+                  // pill pushed the status pill — the whole payload of a
+                  // read-only card — outside the card's right edge.
+                  implicitWidth: Math.min(originRow.implicitWidth + Style.space(8), Style.space(96))
                   implicitHeight: Style.space(16)
                   radius: Style.space(4)
                   color: root.alpha(Model.originColor(modelData.origin), 0.15)
@@ -618,8 +681,12 @@ Panel {
                       color: Model.originColor(modelData.origin)
                     }
                     Text {
-                      text: Model.originBadgeText(modelData.origin)
+                      // A peer card carries its own badge ("PEER · <name>"); every
+                      // other origin maps through the shared table.
+                      text: modelData.origin_badge || Model.originBadgeText(modelData.origin)
                       textFormat: Text.PlainText
+                      elide: Text.ElideRight
+                      Layout.maximumWidth: Style.space(88)
                       font.family: root.fontFamily
                       font.pixelSize: Style.space(8)
                       font.bold: true
@@ -686,6 +753,8 @@ Panel {
                 }
 
                 // Terminate / Close Button (Replaces Focus button)
+                // Hidden for read-only origins: remote Herdr panes and remote
+                // Hermes peers (can_control === false, set by the collector).
                 Rectangle {
                   implicitWidth: Style.space(22)
                   implicitHeight: Style.space(22)
@@ -845,7 +914,7 @@ Panel {
 
           // Keyboard hint, or the reason the last terminate did nothing
           Text {
-            text: root.killError ? ("Terminate failed: " + root.killError) : "Click card to focus · ✕ to terminate"
+            text: root.footerHint()
             textFormat: Text.PlainText
             font.family: root.fontFamily
             font.pixelSize: Style.space(9)

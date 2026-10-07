@@ -6,7 +6,7 @@ Real-time status, active tasks, and one-click workspace switching for AI coding 
 
 ## Features
 
-- **Live Multi-Source Agent Tracking**: Seamlessly tracks AI coding agents across **Herdr** daemon panes (`~/.config/herdr/herdr.sock`), standalone terminal windows (Ghostty, Foot, Kitty, Alacritty, WezTerm), **OMP** sessions (`~/.omp/agent/sessions/`), **Hermes** CLI & Desktop app databases (`~/.hermes/state.db`), and **Grok** Build TUI sessions (`$GROK_HOME/active_sessions.json` + `events.jsonl`).
+- **Live Multi-Source Agent Tracking**: Seamlessly tracks AI coding agents across **Herdr** daemon panes, **remote Hermes peers** (gateways registered with `hermes peer add`, read-only), (`~/.config/herdr/herdr.sock`), standalone terminal windows (Ghostty, Foot, Kitty, Alacritty, WezTerm), **OMP** sessions (`~/.omp/agent/sessions/`), **Hermes** CLI & Desktop app databases (`~/.hermes/state.db`), and **Grok** Build TUI sessions (`$GROK_HOME/active_sessions.json` + `events.jsonl`).
 - **One-Click Workspace & Window Switching**: Click any agent card to switch Hyprland workspaces and focus the exact terminal window, Herdr pane, or Hermes Desktop window.
 - **Visual Status Bar Display**:
   - **`Icon` Mode**: Agent orchestrator glyph with dynamic activity badge and spinner animation when agents are actively working.
@@ -22,7 +22,41 @@ Real-time status, active tasks, and one-click workspace switching for AI coding 
 ### Remote source setup
 
 - **Herdr**: save a machine with `herdr machine add`, verify SSH access and matching remote Herdr installation. The plugin reads enabled rows from `herdr machine list --json` and queries each machine through the read-only `herdr --session <name> api snapshot` command. Remote cards are read-only: focus and terminate stay disabled because their windows are not on this desktop.
-- **Hermes Desktop gateways**: the plugin reads only non-secret labels and URLs from `~/.config/Hermes/connections.json`. OAuth tokens remain owned by Hermes Desktop. Full remote Hermes session cards require a future supported Desktop-to-bar roster bridge; this plugin does not scrape cookies, safeStorage, or token files.
+- **Hermes peers** (remote Hermes gateways): register the gateway once with Hermes itself —
+  `hermes peer add <name> --url http://host:8377 --key <API_SERVER_KEY>`. The plugin reads the
+  `bot_peers` block of `~/.hermes/config.yaml` and asks each peer for its sessions
+  (`GET /api/sessions`, `GET /api/sessions/<id>/messages` on the peer's `api_server` platform), so the
+  agents actually running on that machine get the same cards as local ones. The credential stays
+  owned by Hermes: the plugin reads that one key from `~/.hermes/.env` and puts it nowhere but an
+  `Authorization` header. Clean up with `hermes peer remove <name>`.
+  - **Read-only**: no focus, no terminate — those sessions are not on this desktop.
+  - **No OAuth token is ever read.** A Desktop connection using `authMode: oauth` does not need a
+    peer; the plugin still reads only non-secret labels and URLs from
+    `~/.config/Hermes/connections.json` and never scrapes cookies, safeStorage or token files.
+  - **Scope**: a peer's default profile and its `Bot Chat`. A multiplexed peer's *named* profiles
+    (`/p/<profile>/…`) are not read yet, and an SSH-kind Desktop connection is a different transport
+    (SSH + a remote `state.db`) and stays out of scope.
+  - **Cost per tick**: the bar refreshes every 2-3 s and each refresh is a fresh process, so there is
+    no cache between ticks. Each tick probes at most 4 peers (config order; the rest are reported as
+    skipped) with at most 5 HTTP calls and a 3 s total budget per peer, so a slow or unreachable peer
+    costs about 3 s of bar freshness — the widget's stall timer is 18 s.
+  - **`http://` is allowed** (the documented peer example is a LAN address), which means the key
+    crosses that LAN in the clear; prefer `https://` wherever the path is untrusted. The plugin never
+    follows a redirect, never honours `HTTP_PROXY`/`HTTPS_PROXY`, and never sends the key anywhere but
+    the configured host.
+  - **A peer on this machine is skipped** (any `127.x`, `::1`, `localhost` spelling), because local
+    discovery already covers it and both would render the same sessions twice.
+  - **Status is a heuristic**: the peer's API exposes no turn-lease table, so *working* means "not
+    ended and touched within 300 s", plus the last message. A remote turn that stalls with no new
+    message therefore reads as working. A session outside the per-tick message-read budget is shown as
+    `UNKNOWN` / "Not polled" rather than being assumed busy.
+  - **Unreachable is not empty**: a peer that cannot be reached, or has no key, is reported in the
+    panel footer ("1 remote peer unreachable · check its key or host") instead of silently showing
+    no cards — the collector's stderr is not visible to the widget, so the footer is the only place
+    that state can surface.
+- **Hermes Desktop gateways**: the plugin reads only non-secret labels and URLs from
+  `~/.config/Hermes/connections.json`. OAuth tokens remain owned by Hermes Desktop. A gateway that is
+  also registered as a peer gets its label annotated with the peer's session count.
 ## Installation
 
 ### Via Omarchy Marketplace / Plugin Manager
@@ -252,11 +286,26 @@ safe to run on a live desktop with real agents on screen:
 python3 tests/test_kill_target.py
 ```
 
+The remote-Hermes-peer source has `tests/test_peer_sources.py`: parser, the
+confined-file reader (symlink, hard link, `0644`, oversized, FIFO, `NUL`, `..`,
+foreign root), the `.env` key loader, the status table, the card builder, the
+read-only refusals, and — against a real loopback `http.server` on an ephemeral
+port — a redirect that must not be followed, an oversized body, and a dribbling
+peer that must be cut off at the total budget. It reads no real `~/.hermes`, and
+it opens a loopback listener (documented, cleaned up in `tearDown`):
+
+```bash
+python3 tests/test_peer_sources.py
+```
+
 ## Security & Privacy
 
 - **Zero Network Transmission**: All agent tracking and process inspection runs 100% locally on your machine.
 - **Automatic Secret Redaction**: Prompts and status lines automatically redact API keys (OpenAI, Anthropic, OpenRouter, Groq), GitHub tokens, AWS keys, and Bearer tokens before UI rendering or IPC output.
 - **Read-Only SQLite & Session Parsing**: Hermes databases are queried strictly with `?mode=ro`, and OMP transcripts are parsed in read-only mode.
+- **Confined Credential Read**: the peer's API key is read from `~/.hermes/.env` through one confined reader: the root directory and every ancestor must be ours (or root) and not group/world-writable, the file must be a regular file, ours, `nlink == 1` and mode `0600`, not a symlink, under a size cap, and it is read through a verified descriptor (`O_NOFOLLOW | O_NONBLOCK`, `fstat`, `samestat`, `/proc/self/fd` containment) rather than by path. The key is used only as an `Authorization` header — never in argv, never in the JSON payload, never in a log or exception, and never written into the process environment. `~/.hermes/config.yaml` and `~/.config/Hermes/connections.json` go through the same reader with a bounded (non-secret) profile, which replaced a bare `open()` on the latter.
+- **Peer Transport Hardening**: peer reads use `http.client` rather than `urllib`, so redirects are never followed (the `Authorization` header cannot be re-sent to a host the user did not register) and proxy environment variables are ignored; TLS uses the system bundle explicitly instead of inheriting `SSL_CERT_FILE`/`SSL_CERT_DIR`. Every response is bounded before decoding, and a watchdog shuts the response socket down at a total per-peer deadline — a peer that dribbles bytes cannot hold the widget. Peer URLs carrying userinfo, a query, a fragment or a path prefix are refused, and every peer-supplied string (title, preview, detail, tool name, model, source, peer name, error text) is scrubbed of ANSI, control bytes, known secret shapes and the loaded key itself before it can reach the bar.
+- **Isolated Collector Launch**: the widget starts the collector with an absolute interpreter and `python3 -I`, so `PYTHONPATH`, `PYTHONSTARTUP` and user site-packages cannot shadow a module the collector imports while it holds a credential. (The collector still inherits the rest of the session environment and still runs `hyprctl`/`orca`/`herdr` by name; removing `PATH` entirely would need trusted-path resolvers for each and is future work.)
 - **Validated Hook Input**: Claude Code status files are trusted only when they carry a known status value and a fresh timestamp, and their detail line passes through the same redaction as every other agent detail.
 - **Guarded Grok Session Reads**: Everything read under `$GROK_HOME` is refused unless the whole path chain is user-owned, not a symlink and not group/world-writable; files are opened with `O_NOFOLLOW | O_NONBLOCK` (so a planted FIFO cannot block the collector) and the opened descriptor is re-verified — owner, regular file, single hard link, size, containment — before any bytes are read. Session ids from `active_sessions.json` are validated as UUIDs before they are used in a path, event-supplied detail text passes through the same redaction as every other detail, per-file sizes and total work per refresh cycle are capped, and anything that fails degrades to *no card* rather than a wrong one.
 - **Prompt Hiding Option**: `privacyHidePrompts` keeps agent-supplied prompt and task text out of the bar ticker and the cards entirely — including tab/pane labels, which can carry task text — leaving counts, status, repo path and workspace name. Secret redaction stays on regardless.
