@@ -37,7 +37,7 @@ OMP_SESSIONS_DIR = os.path.expanduser("~/.omp/agent/sessions")
 HERMES_STATE_DB = os.path.expanduser("~/.hermes/state.db")
 HERMES_CONNECTIONS_PATH = os.path.expanduser("~/.config/Hermes/connections.json")
 HERDR_MACHINE_TIMEOUT = 0.75
-HERDR_REMOTE_TIMEOUT = 2.5
+HERDR_REMOTE_TIMEOUT = 8.0  # cold SSH handshakes over a real-world WAN link can run 3-4s; leave headroom
 HERDR_REMOTE_MAX_BYTES = 262144
 
 # --- Confirmed-file reads (task 2) ---------------------------------------------
@@ -353,8 +353,21 @@ def remote_herdr_command(machine: Dict[str, str], operation: str = "api snapshot
         raise ValueError("invalid saved Herdr SSH target")
     if operation not in {"api snapshot"} and not re.fullmatch(r"agent read [A-Za-z0-9_.:-]+ --source detection", operation):
         raise ValueError("invalid saved Herdr operation")
-    remote = f'exec "$(command -v herdr || for p in "$HOME/.local/bin/herdr" "$HOME/bin/herdr" /usr/local/bin/herdr /usr/bin/herdr; do [ -x "$p" ] && printf %s "$p" && break; done)" --session {session} {operation}'
+    # Prefer user-local installs (what `herdr --remote` launches) over a possibly older system binary on PATH.
+    remote = f'h=$(for p in "$HOME/.local/bin/herdr" "$HOME/bin/herdr"; do [ -x "$p" ] && printf %s "$p" && break; done); [ -n "$h" ] || h=$(command -v herdr || for p in /usr/local/bin/herdr /usr/bin/herdr; do [ -x "$p" ] && printf %s "$p" && break; done); exec "$h" --session {session} {operation}'
+    # Multiplex repeat polls over one authenticated connection: a fresh SSH handshake
+    # can cost several seconds on a high-latency link, which otherwise gets paid on
+    # every poll tick. ControlPersist keeps the master open briefly after each use.
+    # The control socket lives only in the per-user XDG_RUNTIME_DIR; without one
+    # (no private runtime dir) multiplexing is skipped rather than using shared /tmp.
     ssh_options = ["-o", "BatchMode=yes", "-o", "ConnectTimeout=2"]
+    mux_dir = os.environ.get("XDG_RUNTIME_DIR") or ""
+    if mux_dir and os.path.isabs(mux_dir) and os.path.isdir(mux_dir):
+        ssh_options += [
+            "-o", "ControlMaster=auto",
+            "-o", f"ControlPath={os.path.join(mux_dir, 'herdr-plugin-ssh-%C')}",
+            "-o", "ControlPersist=60s",
+        ]
     if ssh_target[:1] == ["-p"]:
         ssh_options += ssh_target[:2]
         ssh_target = ssh_target[2:]
@@ -4215,7 +4228,7 @@ def fetch_all_agents() -> Dict[str, Any]:
                     "model": model_name or (get_omp_default_model() if agent_type == "omp" else ""),
                     "session_path": session_path or "",
                     "has_question": has_question,
-                    "can_focus": not bool(remote_machine),
+                    "can_focus": True,
                     "can_control": not bool(remote_machine),
                 }
             )
@@ -4397,6 +4410,42 @@ def find_herdr_window_for_session(clients: List[Dict[str, Any]], session_name: s
     return None
 
 
+def find_herdr_remote_window(target: str, session_name: str) -> Optional[Dict[str, Any]]:
+    """Find the Hyprland window whose terminal has a `herdr --remote <target>` client
+    running underneath it, attached to the given session.
+
+    The client may sit directly under the terminal (launched via the Omarchy
+    launcher) or a few levels down (launched by hand from an interactive shell),
+    so this walks each matching process's ancestors rather than checking only
+    the terminal's direct child.
+    """
+    if not re.fullmatch(r"[A-Za-z0-9_.:@%+,-]+", target):
+        return None
+    needle = f"herdr --remote {target}"
+    clients = get_hypr_clients()
+    client_pids = {c.get("pid"): c for c in clients if c.get("pid")}
+    if not client_pids:
+        return None
+    for p in glob.glob("/proc/[0-9]*"):
+        try:
+            pid = int(os.path.basename(p))
+        except ValueError:
+            continue
+        info = get_process_info(pid)
+        if not info:
+            continue
+        cmd = info["cmd"]
+        if needle not in cmd:
+            continue
+        if session_name != "default" and f"--session {session_name}" not in cmd:
+            continue
+        for ancestor in [info] + get_process_ancestors(pid):
+            win = client_pids.get(ancestor["pid"])
+            if win:
+                return win
+    return None
+
+
 def focus_pane(target_id: str) -> Dict[str, Any]:
     """Focus a specific pane in Herdr, Hermes Desktop window, or standalone terminal and switch desktops."""
     if not target_id:
@@ -4405,7 +4454,54 @@ def focus_pane(target_id: str) -> Dict[str, Any]:
         # A remote peer's session has no window on this desktop to switch to.
         return {"ok": False, "error": "Remote Hermes peer sessions are read-only"}
     if target_id.startswith("herdr-remote:"):
-        return {"ok": False, "error": "Remote Herdr targets are read-only"}
+        rest = target_id[len("herdr-remote:"):]
+        try:
+            machine_id, tail = rest.split(":", 1)
+            session_name, pane_target = tail.split("|", 1)
+        except ValueError:
+            return {"ok": False, "error": "Malformed remote target id"}
+        if not re.fullmatch(r"[A-Za-z0-9_.-]+", session_name) or not re.fullmatch(r"[A-Za-z0-9_.:][A-Za-z0-9_.:-]*", pane_target):
+            return {"ok": False, "error": "Malformed remote target id"}
+
+        machine = next((m for m in herdr_machine_list() if m["id"] == machine_id), None)
+        if not machine:
+            return {"ok": False, "error": "Saved Herdr machine not found or disabled"}
+        try:
+            # Reuse the snapshot path's target/session validation before passing them to any argv.
+            remote_herdr_command({"target": machine["target"], "session": session_name})
+        except ValueError as e:
+            return {"ok": False, "error": str(e)}
+
+        # Best-effort: mark this pane focused server-side so an attached client follows it.
+        # Fired without waiting: the SSH round-trip for this can run ~2s on a slow link,
+        # and nothing below depends on it, so blocking here would stall the window switch
+        # the user is actually watching for.
+        try:
+            subprocess.Popen(
+                ["herdr", "--machine", machine_id, "agent", "focus", pane_target],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+        except Exception:
+            pass
+
+        win = find_herdr_remote_window(machine["target"], session_name)
+        if win:
+            focus_hypr_window(win)
+            return {
+                "ok": True,
+                "target": target_id,
+                "focused_window": win.get("title", ""),
+                "workspace": win.get("workspace", {}).get("id"),
+            }
+
+        # No local attach window yet: open one.
+        launch_cmd = ["omarchy-launch-terminal", "herdr", "--remote", machine["target"], "--session", session_name]
+        try:
+            subprocess.Popen(launch_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            return {"ok": True, "target": target_id, "launched": launch_cmd}
+        except Exception as e:
+            return {"ok": False, "error": f"Could not launch remote attach: {e}"}
 
     clients = get_hypr_clients()
 

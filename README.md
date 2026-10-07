@@ -21,7 +21,7 @@ Real-time status, active tasks, and one-click workspace switching for AI coding 
 
 ### Remote source setup
 
-- **Herdr**: save a machine with `herdr machine add`, verify SSH access and matching remote Herdr installation. The plugin reads enabled rows from `herdr machine list --json` and queries each machine through the read-only `herdr --session <name> api snapshot` command. Remote cards are read-only: focus and terminate stay disabled because their windows are not on this desktop.
+- **Herdr**: save a machine with `herdr machine add`, verify SSH access and matching remote Herdr installation. The plugin reads enabled rows from `herdr machine list --json` and queries each machine through the read-only `herdr --session <name> api snapshot` command. Clicking a remote card runs `herdr --machine <id> agent focus <pane>` (forwarded over SSH, no open TUI needed) and then focuses an existing local `herdr --remote <target>` attach window if one is open, or launches one via `omarchy-launch-terminal` if not. Terminate stays disabled for remote cards — killing a process over SSH is out of scope.
 - **Hermes peers** (remote Hermes gateways): register the gateway once with Hermes itself —
   `hermes peer add <name> --url http://host:8377 --key <API_SERVER_KEY>`. The plugin reads the
   `bot_peers` block of `~/.hermes/config.yaml` and asks each peer for its sessions
