@@ -135,12 +135,17 @@ esac
 if [ -L "$status_file" ]; then
   rm -f "$status_file"
 fi
+# Secret values (notification message, cwd) travel via stdin-backed fd files,
+# never argv: /proc/<pid>/cmdline is world-readable (no hidepid), so --arg
+# would expose them to other local users. Only the epoch (non-sensitive)
+# stays in argv via --argjson.
 tmp_file="$(mktemp "${status_file}.XXXXXX")" || exit 0
+epoch="$(date +%s)"
 jq -n \
-  --arg status "$status" \
-  --arg detail "$detail" \
-  --arg cwd "$cwd" \
-  --argjson updated "$(date +%s)" \
+  --rawfile status <(printf '%s' "$status") \
+  --rawfile detail <(printf '%s' "$detail") \
+  --rawfile cwd <(printf '%s' "$cwd") \
+  --argjson updated "$epoch" \
   '{status: $status, detail: $detail, cwd: $cwd, updated: $updated}' \
   > "$tmp_file" && mv "$tmp_file" "$status_file" || rm -f "$tmp_file"
 
