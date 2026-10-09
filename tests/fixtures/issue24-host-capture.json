@@ -1,0 +1,42 @@
+[
+  {
+    "pid": 2878777,
+    "ppid": 1066,
+    "exe": "/home/alberto/.hermes/hermes-agent/apps/desktop/release/linux-unpacked/Hermes",
+    "argv": ["/home/alberto/.hermes/hermes-agent/apps/desktop/release/linux-unpacked/Hermes"],
+    "cmd": "/home/alberto/.hermes/hermes-agent/apps/desktop/release/linux-unpacked/Hermes",
+    "note": "wayland launcher parent: no args, stays alive above the app"
+  },
+  {
+    "pid": 2878805,
+    "ppid": 2878777,
+    "exe": "/home/alberto/.hermes/hermes-agent/apps/desktop/release/linux-unpacked/Hermes",
+    "argv": ["/home/alberto/.hermes/hermes-agent/apps/desktop/release/linux-unpacked/Hermes", "--ozone-platform=wayland"],
+    "cmd": "/home/alberto/.hermes/hermes-agent/apps/desktop/release/linux-unpacked/Hermes --ozone-platform=wayland",
+    "note": "real app: owns the single Hyprland window (class com.nousresearch.hermes)"
+  },
+  {
+    "pid": 2878898,
+    "ppid": 1066,
+    "exe": "/home/alberto/.hermes/hermes-agent/apps/desktop/release/linux-unpacked/chrome_crashpad_handler",
+    "argv": ["/home/alberto/.hermes/hermes-agent/apps/desktop/release/linux-unpacked/chrome_crashpad_handler", "--monitor-self-annotation=ptype=crashpad-handler", "--database=/home/alberto/.config/Hermes/Crashpad"],
+    "cmd": "/home/alberto/.hermes/hermes-agent/apps/desktop/release/linux-unpacked/chrome_crashpad_handler --monitor-self-annotation=ptype=crashpad-handler --no-rate-limit --no-upload-gzip --database=/home/alberto/.config/Hermes/Crashpad --annotation=_productName=Hermes --annotation=prod=Electron --initial-client-fd=56 --shared-client-connection",
+    "note": "crash reporter: matches bare /Hermes substring via --database arg, must never be a card"
+  },
+  {
+    "pid": 2878784,
+    "ppid": 2878777,
+    "exe": "/home/alberto/.hermes/hermes-agent/apps/desktop/release/linux-unpacked/Hermes",
+    "argv": ["/home/alberto/.hermes/hermes-agent/apps/desktop/release/linux-unpacked/Hermes", "--type=zygote", "--no-zygote-sandbox"],
+    "cmd": "/home/alberto/.hermes/hermes-agent/apps/desktop/release/linux-unpacked/Hermes --type=zygote --no-zygote-sandbox",
+    "note": "renderer helper: excluded by the --type= rule"
+  },
+  {
+    "pid": 2878845,
+    "ppid": 2878777,
+    "exe": "/home/alberto/.hermes/hermes-agent/apps/desktop/release/linux-unpacked/Hermes",
+    "argv": ["/proc/self/exe", "--type=utility", "--utility-sub-type=network.mojom.NetworkService", "--user-data-dir=/home/alberto/.config/Hermes"],
+    "cmd": "/proc/self/exe --type=utility --utility-sub-type=network.mojom.NetworkService --lang=en-US --user-data-dir=/home/alberto/.config/Hermes --shared-files=v8_context_snapshot_data:100",
+    "note": "utility helper via /proc/self/exe argv[0]: has /Hermes in args AND --type=, excluded by --type="
+  }
+]

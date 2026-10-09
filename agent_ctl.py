@@ -3676,6 +3676,64 @@ def scan_orca_agents(claimed_sessions: Set[str]) -> List[Dict[str, Any]]:
     return orca_agents
 
 
+def _hermes_executable_token(cmd: str, argv: Optional[List[str]]) -> str:
+    """Executable identity for one process: argv[0] wins, else first cmd token."""
+    if argv:
+        first_arg = (argv[0] or "").strip()
+        if first_arg:
+            return first_arg
+    tokens = (cmd or "").split()
+    return tokens[0] if tokens else ""
+
+
+def is_hermes_desktop_gui_process(cmd: str, argv: Optional[List[str]] = None) -> bool:
+    """True for Hermes Desktop Electron app/launcher processes (issue #24).
+
+    Crashpad matches a bare "/Hermes" substring via its
+    --database=.../Hermes/Crashpad argument but is a crash reporter, never a
+    window or session — so the check is on the executable token, not the whole
+    argument line. A missing/empty executable identity fails OPEN (not excluded).
+    """
+    text = cmd or ""
+    if "--type=" in text:
+        return False
+    if "/Hermes" not in text:
+        return False
+    exe_name = os.path.basename(_hermes_executable_token(text, argv)).lower()
+    if exe_name and "crashpad" in exe_name:
+        return False
+    return True
+
+
+def hermes_desktop_gui_child_pids(pid: int) -> List[int]:
+    """Direct children of one PID via a ppid-only /proc walk.
+
+    Fail-OPEN by design: any error returns [] and the caller keeps the process
+    instead of dropping it. Never raises.
+    """
+    try:
+        entries = glob.glob("/proc/[0-9]*")
+    except Exception:
+        return []
+    kids: List[int] = []
+    for entry in entries:
+        try:
+            child = int(os.path.basename(entry))
+            if child <= 0 or child == pid:
+                continue
+            with open(os.path.join(entry, "stat"), "r") as sf:
+                content = sf.read()
+            # comm may itself contain spaces/parens: ppid follows the last ")".
+            tail = content[content.rfind(")") + 1:].split()
+            if len(tail) < 2:
+                continue
+            if int(tail[1]) == pid:
+                kids.append(child)
+        except Exception:
+            continue
+    return kids
+
+
 def scan_standalone_agents(herdr_server_pids: List[int], seen_cwds: Set[str], claimed_sessions: Set[str]) -> List[Dict[str, Any]]:
     """Discover AI agents running in normal terminal windows outside of Herdr."""
     standalone = []
@@ -3704,13 +3762,31 @@ def scan_standalone_agents(herdr_server_pids: List[int], seen_cwds: Set[str], cl
             # Hermes CLI servers are local instance roots. They have no Hyprland
             # window, so keep them as process cards instead of dropping them.
             is_hermes_desktop_child = any(
-                "/Hermes" in a["cmd"] and "--type=" not in a["cmd"]
+                is_hermes_desktop_gui_process(a["cmd"], a.get("argv"))
                 for a in ancestors
             )
 
             # Check if this is a Hermes Desktop GUI process
-            if "/Hermes" in cmd and "--type=" not in cmd:
+            if is_hermes_desktop_gui_process(cmd, info.get("argv")):
                 if "hermes_desktop" in seen_cwds or is_in_herdr:
+                    continue
+
+                # Wayland launchers stay alive above the real app (issue #24):
+                # a match with a matching child is the launcher, not a session.
+                is_launcher = False
+                try:
+                    gui_kids = hermes_desktop_gui_child_pids(pid)
+                except Exception:
+                    gui_kids = []
+                for kid in gui_kids:
+                    try:
+                        kinfo = get_process_info(kid)
+                    except Exception:
+                        continue
+                    if kinfo and is_hermes_desktop_gui_process(kinfo["cmd"], kinfo.get("argv")):
+                        is_launcher = True
+                        break
+                if is_launcher:
                     continue
 
                 hermes_title, hermes_model, hermes_provider, hermes_profile, hermes_detail, hermes_status, hermes_has_q = extract_hermes_session_info(
@@ -4109,7 +4185,7 @@ def fetch_all_agents() -> Dict[str, Any]:
                         hpid = int(os.path.basename(hp))
                         hinfo = get_process_info(hpid)
                         if hinfo and "hermes" in hinfo["cmd"].lower() and "gateway" not in hinfo["cmd"] and "zygote" not in hinfo["cmd"]:
-                            if is_hermes_desktop and ("/Hermes" in hinfo["cmd"] or "hermes desktop" in hinfo["cmd"]):
+                            if is_hermes_desktop and (is_hermes_desktop_gui_process(hinfo["cmd"], hinfo.get("argv")) or "hermes desktop" in hinfo["cmd"]):
                                 hermes_p_start = get_process_start_time(hpid)
                                 hermes_profile = hermes_profile_from_argv(hinfo.get("argv"))
                                 break
