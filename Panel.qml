@@ -290,16 +290,7 @@ Panel {
     anchors.fill: parent
     visible: !root.barShowsText
     bar: root.bar
-    text: "" // glyph disabled; using iconComponent SVG for reliable rendering
-    iconComponent: Component {
-      Image {
-        anchors.fill: parent
-        source: Qt.resolvedUrl("assets/icons/agent.svg")
-        sourceSize.width: Style.bar.iconCanvas * 2
-        sourceSize.height: Style.bar.iconCanvas * 2
-        fillMode: Image.PreserveAspectFit
-      }
-    }
+    text: "󰚩" // nf-md-robot: glyph path follows theme + activeColor on shell 4.5
     tooltipText: Model.getTooltipText(root.summary)
     active: root.summary.working > 0 || root.summary.waiting > 0
     activeColor: root.summary.waiting > 0 ? "#F59E0B" : root.accent
