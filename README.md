@@ -18,7 +18,7 @@ When several AI coding agents work at once — across terminals, Herdr panes and
 
 ## Features
 
-- **Live multi-source tracking** — Herdr daemon panes (local socket plus remote machines), **remote Hermes peers** (gateways registered with `hermes peer add`, read-only), standalone terminal windows (Ghostty, Foot, Kitty, Alacritty, WezTerm), **OMP** sessions (`~/.omp/agent/sessions/`), **Hermes** CLI and Desktop app databases (`~/.hermes/state.db`), and **Grok** Build TUI sessions (`$GROK_HOME/active_sessions.json` + `events.jsonl`).
+- **Live multi-source tracking** — Herdr daemon panes (local socket plus remote machines), **Herdr app** (GUI) terminals via `hc`, **remote Hermes peers** (gateways registered with `hermes peer add`, read-only), standalone terminal windows (Ghostty, Foot, Kitty, Alacritty, WezTerm), **OMP** sessions (`~/.omp/agent/sessions/`), **Hermes** CLI and Desktop app databases (`~/.hermes/state.db`), and **Grok** Build TUI sessions (`$GROK_HOME/active_sessions.json` + `events.jsonl`).
 - **One-click workspace & window switching** — click any agent card to switch Hyprland workspaces and focus the exact terminal window, Herdr pane or Hermes Desktop window.
 - **Visual status bar display** — `Icon` mode (orchestrator glyph with activity badge and spinner while agents work), `Status` mode (real-time ticker of active tasks), `Compact` mode (live counts like `4 ag · 1 busy`, `3 done`).
 - **Interactive popup panel** — smart filter tabs (`All`, `Working`, `Waiting`, `Done`, `Idle`); rich cards with model tags, latest human prompt, real-time tool execution, repo/working-directory breadcrumbs and session indicators; terminate agent processes or close Herdr panes from card buttons.
@@ -90,6 +90,8 @@ omarchy shell meviusisback.agent-orchestr refresh  # force live refresh
 | `maxTaskLength` | `45` | Max characters of the bar status ticker |
 | `privacyHidePrompts` | `false` | Hide agent task/prompt text in bar and cards (counts, status, repo, workspace only) |
 
+**Herdr app (GUI):** agents are terminals run by herdr-core, found with `hc ls` / `hc get` (any live terminal whose program reports a status, or a known agent). Clicking a card runs `herdr-app do agent.focus` and raises the `herdr-app` window; ✕ runs `hc kill`. Terminals on machines added with `hc machine add` show as `HERDR APP · REMOTE` and are read-only for terminate. Needs `hc` and `herdr-app` on `PATH`; with neither installed the source is silently skipped.
+
 **Remote sources (read-only — no focus, no terminate; those windows aren't on this desktop):**
 
 - **Herdr** — save a machine with `herdr machine add`, verify SSH access and a matching remote Herdr install. The plugin reads enabled rows from `herdr machine list --json` and queries each machine through the read-only `herdr --session <name> api snapshot`.
@@ -120,6 +122,7 @@ python3 tests/test_claude_hook_argv.py
 python3 tests/test_discovery_regression.py
 python3 tests/test_hermes_activity.py
 python3 tests/test_remote_sources.py
+python3 tests/test_herdr_app.py           # Herdr app (hc) discovery, focus, kill
 ```
 
 ## Removal
