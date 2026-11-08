@@ -83,6 +83,7 @@ class TestHermesActivity(unittest.TestCase):
              mock.patch.object(ac, "query_remote_herdr_snapshot", return_value=response), \
              mock.patch.object(ac, "query_remote_herdr_agent_read", return_value="⏳ Running tool"), \
              mock.patch.object(ac, "scan_orca_agents", return_value=[]), \
+             mock.patch.object(ac, "collect_herdr_app_cards", return_value=[]), \
              mock.patch.object(ac, "scan_standalone_agents", return_value=[]), \
              mock.patch.object(ac, "query_orca_terminals", return_value=[]):
             data = ac.fetch_all_agents()

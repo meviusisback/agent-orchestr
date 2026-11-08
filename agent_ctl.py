@@ -7,6 +7,7 @@ Discovers and manages AI agents across:
 3. Hermes Desktop GUI instances (Electron app)
 4. Grok Build TUI sessions ($GROK_HOME/active_sessions.json + events.jsonl)
 5. Remote Hermes peers (gateways registered with `hermes peer add`, read-only)
+6. Herdr app (GUI) terminals via herdr-core's `hc` CLI and `herdr-app do agent.focus`
 """
 
 import glob
@@ -4051,6 +4052,166 @@ def _collect_peer_cards() -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
     return cards[:PEER_MAX_PEERS_PROBED * PEER_MAX_PEER_CARDS], status_rows
 
 
+# ---------------------------------------------------------------------------
+# Herdr app (GUI) — terminals live in herdr-core and are driven through `hc`
+# ---------------------------------------------------------------------------
+HC_TIMEOUT = 2.0
+HC_MAX_AGENTS = 64
+HC_ADDRESS_RE = re.compile(r"^(?:[A-Za-z0-9._-]{1,64}/)?t[0-9]{1,9}[a-z]{0,3}$")
+HERDR_APP_CLASS = "herdr-app"
+HC_AGENT_ALIASES = {"claude-code": "claude", "claude_code": "claude", "open-code": "opencode", "pi": "omp"}
+HC_KNOWN_AGENTS = {"claude", "codex", "opencode", "omp", "hermes", "grok", "gemini", "amp", "droid", "cursor", "copilot", "pi"}
+
+
+def hc_run_json(args: List[str], timeout: float = HC_TIMEOUT) -> Optional[Any]:
+    """Run a read-only `hc` command and parse its JSON; None on any failure."""
+    try:
+        proc = subprocess.run(
+            ["hc", *args, "--json"],
+            capture_output=True, text=True, timeout=timeout, check=False,
+        )
+        if proc.returncode != 0:
+            return None
+        return json.loads(proc.stdout)
+    except Exception:
+        return None
+
+
+def hc_status_state(term: Dict[str, Any]) -> str:
+    """Terminal status as a string: `ls` carries it flat, `get` as {state, msg, app}."""
+    st = term.get("status")
+    if isinstance(st, dict):
+        st = st.get("state")
+    return st if isinstance(st, str) else ""
+
+
+def hc_agent_name(term: Dict[str, Any]) -> str:
+    """Agent identity: reported app, else the foreground program, else the `ls` agent label."""
+    st = term.get("status") if isinstance(term.get("status"), dict) else {}
+    fg = term.get("foreground") if isinstance(term.get("foreground"), dict) else {}
+    for raw in (st.get("app"), fg.get("name"), term.get("agent")):
+        name = os.path.basename(str(raw or "")).lower()
+        name = HC_AGENT_ALIASES.get(name, name)
+        if name in HC_KNOWN_AGENTS or (raw is st.get("app") and name):
+            return name
+    return ""
+
+
+def is_herdr_app_agent(term: Dict[str, Any]) -> bool:
+    """A live terminal is an agent if its program reports a status or runs a known agent."""
+    if term.get("state") != "live":
+        return False
+    return bool(hc_status_state(term)) or bool(hc_agent_name(term))
+
+
+def collect_herdr_app_cards() -> List[Dict[str, Any]]:
+    """Agent cards for terminals run by the Herdr app (herdr-core), local and remote."""
+    listing = hc_run_json(["ls"])
+    if not isinstance(listing, dict):
+        return []
+    live = [
+        t for t in listing.get("terminals", [])
+        if isinstance(t, dict) and t.get("state") == "live" and HC_ADDRESS_RE.match(str(t.get("address") or ""))
+    ][:HC_MAX_AGENTS]
+    if not live:
+        return []
+
+    # `ls` reports the shell for an agent that never sets a status (Grok), so the
+    # foreground program only shows up in `get`.
+    with ThreadPoolExecutor(max_workers=min(6, len(live))) as pool:
+        all_details = list(pool.map(lambda t: hc_run_json(["get", t["address"]], timeout=1.5), live))
+    pairs = [
+        (row, det if isinstance(det, dict) else row)
+        for row, det in zip(live, all_details)
+    ]
+    pairs = [(row, det) for row, det in pairs if is_herdr_app_agent(det) or is_herdr_app_agent(row)]
+    terms = [row for row, _ in pairs]
+    details = [det for _, det in pairs]
+
+    cards: List[Dict[str, Any]] = []
+    for ls_row, detail in zip(terms, details):
+        term = detail if isinstance(detail, dict) else ls_row
+        address = str(ls_row["address"])
+        remote_machine = address.split("/", 1)[0] if "/" in address else ""
+        st = term.get("status") if isinstance(term.get("status"), dict) else {}
+
+        agent_type = hc_agent_name(term) or hc_agent_name(ls_row) or "agent"
+        status = normalize_herdr_status(hc_status_state(term) or hc_status_state(ls_row) or "idle")
+        if status == "unknown":
+            status = "idle"
+
+        fg = term.get("foreground") if isinstance(term.get("foreground"), dict) else {}
+        cwd = str(fg.get("cwd") or term.get("cwd") or ls_row.get("cwd") or "")
+        repo_name = os.path.basename(cwd.rstrip("/")) if cwd else ""
+        labels = term.get("labels") if isinstance(term.get("labels"), dict) else {}
+        where = str(labels.get("where") or ls_row.get("where") or "")
+        space_name, _, tab_name = where.partition(" / ")
+        if remote_machine and space_name:
+            space_name = f"{remote_machine}: {space_name}"
+
+        title = redact_secrets(clean_title(str(term.get("title") or "")))
+        msg = redact_secrets(clean_title(str(st.get("msg") or "")))
+        name = str(term.get("name") or "")
+        model_name = ""
+        has_question = status == "waiting"
+        if not remote_machine and agent_type in ("grok", "omp"):
+            try:
+                session_path = find_latest_session_for_cwd(agent_type, cwd, set())
+                if session_path:
+                    extract = extract_grok_task_from_session if agent_type == "grok" else extract_omp_task_from_session
+                    goal, sess_detail, model_name, override, has_q = extract(session_path)
+                    model_name = model_name or ""
+                    if goal:
+                        title = redact_secrets(goal)
+                    if sess_detail and not msg:
+                        msg = redact_secrets(sess_detail)
+                    if override == "waiting":
+                        status = "waiting"
+                    elif override == "working" and status != "waiting":
+                        status = "working"
+                    elif not hc_status_state(term) and override in ("completed", "idle"):
+                        status = override
+                    has_question = bool(has_q) or status == "waiting"
+            except Exception:
+                pass
+        if title and title not in (repo_name, "~"):
+            effective_title = title
+        elif name:
+            effective_title = name
+        elif repo_name and repo_name not in ("tmp", "~"):
+            effective_title = f"Working in {repo_name}"
+        else:
+            effective_title = f"{agent_type.upper()} session"
+        clean_cwd = shorten_path(cwd)
+        detail_display = msg or clean_cwd
+        display_name = agent_type.upper() if agent_type in ("omp", "pi") else agent_type.capitalize()
+        origin = "herdr_app_remote" if remote_machine else "herdr_app"
+        cards.append({
+            "pane_id": f"herdr-app:{address}",
+            "raw_pane_id": address,
+            "herdr_session": "app",
+            "origin": origin,
+            "origin_label": f"Herdr App · {remote_machine}" if remote_machine else "Herdr App",
+            "agent": agent_type,
+            "agent_display": display_name,
+            "status": status,
+            "title": effective_title,
+            "detail": detail_display,
+            "cwd": clean_cwd,
+            "repo": repo_name,
+            "workspace": space_name,
+            "tab": tab_name,
+            "pane_label": name,
+            "focused": False,
+            "model": model_name,
+            "session_path": "",
+            "has_question": has_question,
+            "can_focus": True,
+            "can_control": not remote_machine,
+        })
+    return cards
+
+
 def fetch_all_agents() -> Dict[str, Any]:
     """Fetch all agent data, combining Herdr snapshot, session enrichment, and standalone processes."""
     # Grok session reads are budgeted per fetch cycle, so a large or hostile
@@ -4371,6 +4532,27 @@ def fetch_all_agents() -> Dict[str, Any]:
             idle_count += 1
         agents_list.append(oa)
 
+    app_cards = collect_herdr_app_cards()
+    for ac in app_cards:
+        if ac["status"] == "working":
+            working_count += 1
+            active_agent_types.add(ac["agent"])
+            if not top_working_task:
+                top_working_task = f"{ac['agent_display']}: {ac['title']}"
+        elif ac["status"] == "waiting":
+            waiting_count += 1
+            active_agent_types.add(ac["agent"])
+        elif ac["status"] == "completed":
+            completed_count += 1
+            if not top_completed_task:
+                top_completed_task = f"{ac['agent_display']}: ✓ {ac['title']}"
+        else:
+            idle_count += 1
+        agents_list.append(ac)
+        if ac.get("workspace") and ac["workspace"] not in all_workspaces:
+            all_workspaces.append(ac["workspace"])
+        herdr_connected = True
+
     for pc in peer_cards:
         if pc["status"] == "working":
             working_count += 1
@@ -4473,6 +4655,29 @@ def find_herdr_window_for_session(clients: List[Dict[str, Any]], session_name: s
     return None
 
 
+def focus_herdr_app_terminal(address: str) -> Dict[str, Any]:
+    """Show a terminal in the Herdr app and bring its window forward."""
+    if not HC_ADDRESS_RE.match(address):
+        return {"ok": False, "error": "Invalid Herdr app terminal address"}
+    try:
+        proc = subprocess.run(
+            ["herdr-app", "do", "agent.focus", json.dumps({"terminal": address})],
+            capture_output=True, text=True, timeout=3.0, check=False,
+        )
+    except Exception as e:
+        return {"ok": False, "error": f"herdr-app unavailable: {e}"}
+    if proc.returncode != 0:
+        return {"ok": False, "error": (proc.stderr or proc.stdout or "herdr-app refused the focus").strip()[:200]}
+    win = next(
+        (c for c in get_hypr_clients() if c.get("class") == HERDR_APP_CLASS or c.get("initialClass") == HERDR_APP_CLASS),
+        None,
+    )
+    if win:
+        focus_hypr_window(win)
+        return {"ok": True, "target": address, "focused_window": win.get("title", ""), "workspace": win.get("workspace", {}).get("id")}
+    return {"ok": True, "target": address}
+
+
 def focus_pane(target_id: str) -> Dict[str, Any]:
     """Focus a specific pane in Herdr, Hermes Desktop window, or standalone terminal and switch desktops."""
     if not target_id:
@@ -4482,6 +4687,8 @@ def focus_pane(target_id: str) -> Dict[str, Any]:
         return {"ok": False, "error": "Remote Hermes peer sessions are read-only"}
     if target_id.startswith("herdr-remote:"):
         return {"ok": False, "error": "Remote Herdr targets are read-only"}
+    if target_id.startswith("herdr-app:"):
+        return focus_herdr_app_terminal(target_id[len("herdr-app:"):])
 
     clients = get_hypr_clients()
 
@@ -4646,6 +4853,19 @@ def kill_target(target_id: str) -> Dict[str, Any]:
         return {"ok": False, "error": "Remote Hermes peer sessions are read-only"}
     if target_id.startswith("herdr-remote:"):
         return {"ok": False, "error": "Remote Herdr targets are read-only"}
+    if target_id.startswith("herdr-app:"):
+        address = target_id[len("herdr-app:"):]
+        if not HC_ADDRESS_RE.match(address):
+            return {"ok": False, "error": "Invalid Herdr app terminal address"}
+        if "/" in address:
+            return {"ok": False, "error": "Remote Herdr app terminals are read-only"}
+        try:
+            proc = subprocess.run(["hc", "kill", address], capture_output=True, text=True, timeout=3.0, check=False)
+        except Exception as e:
+            return {"ok": False, "error": f"hc unavailable: {e}"}
+        if proc.returncode != 0:
+            return {"ok": False, "error": (proc.stderr or proc.stdout or "hc kill failed").strip()[:200]}
+        return {"ok": True, "pane_id": target_id}
 
     env = get_hypr_env()
 

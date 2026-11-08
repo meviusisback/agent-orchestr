@@ -30,7 +30,8 @@ function statusBadgeText(status) {
 function originColor(origin) {
   var o = String(origin || "").toLowerCase()
   if (o === "orca") return "#22D3EE"
-  if (o === "herdr_remote") return "#F97316"
+  if (o === "herdr_remote" || o === "herdr_app_remote") return "#F97316"
+  if (o === "herdr_app") return "#C084FC"
   // Lime, not the teal #34D399: that sat CIELAB dE 9.1 from the DONE green
   // #10B981, so a completed peer card was green in four places at once. This is
   // the widest separation of every candidate (min dE 58.6 across all origins).
@@ -44,6 +45,8 @@ function originBadgeText(origin) {
   var o = String(origin || "").toLowerCase()
   if (o === "orca") return "ORCA"
   if (o === "herdr_remote") return "HERDR · REMOTE"
+  if (o === "herdr_app_remote") return "HERDR APP · REMOTE"
+  if (o === "herdr_app") return "HERDR APP"
   if (o === "hermes_peer") return "PEER"
   if (o === "herdr_desktop") return "HERDR · GUI"
   if (o === "desktop") return "DESKTOP APP"
@@ -93,11 +96,11 @@ function originSummaryText(agents) {
       terminalCount++
     } else if (o === "hermes_peer") {
       peerCount++
-    } else if (o === "herdr_remote") {
+    } else if (o === "herdr_remote" || o === "herdr_app_remote") {
       herdrCount++
     } else if (o === "process") {
       cliCount++
-    } else if (o === "herdr" || o === "herdr_desktop") {
+    } else if (o === "herdr" || o === "herdr_desktop" || o === "herdr_app") {
       herdrCount++
     } else {
       unknownCount++
