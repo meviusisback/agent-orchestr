@@ -1470,6 +1470,69 @@ def herdr_socket_for_session(session_name: str) -> str:
     return HERDR_SOCK_PATH
 
 
+def herdr_core_sockets() -> List[str]:
+    """Return the live herdr-core (0.1.x generation) API sockets.
+
+    The 0.1 generation keeps a JSON-RPC 2.0 socket per core under
+    $XDG_RUNTIME_DIR/herdr-core/<session>.sock (the default core:
+    default.sock). Holder sockets (*.holder.<id>.sock) only keep a previous
+    core's terminals alive and do not answer terminal.list. HC_SOCKET names
+    another local core instead of the runtime-dir default.
+    """
+    explicit = os.environ.get("HC_SOCKET", "").strip()
+    if explicit:
+        return [explicit] if os.path.exists(explicit) else []
+    runtime_dir = os.environ.get("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}"
+    found = sorted(glob.glob(os.path.join(runtime_dir, "herdr-core", "*.sock")))
+    return [p for p in found if ".holder." not in os.path.basename(p)]
+
+
+# herdr-core names the program owning a terminal in its roster, so this is a
+# closed vocabulary (an unknown name is a shell or a tool, not an agent).
+HERDR_CORE_AGENT_NAMES = {
+    "omp": "omp",
+    "pi": "omp",
+    "hermes": "hermes",
+    "grok": "grok",
+    "agy": "agy",
+    "claude": "claude",
+    "codex": "codex",
+    "opencode": "opencode",
+    "cline": "cline",
+    "cursor": "cursor",
+}
+
+
+def herdr_core_agent_type(terminal: Dict[str, Any]) -> Optional[str]:
+    """Agent type of a herdr-core terminal, or None when it hosts no agent.
+
+    The foreground program name is the live answer; the OSC 7501 report's
+    `app` is the fallback for an agent whose process was misdetected.
+    """
+    foreground = terminal.get("foreground") or {}
+    status = terminal.get("status") or {}
+    for name in (foreground.get("name"), status.get("app")):
+        key = str(name or "").strip().lower()
+        if key in HERDR_CORE_AGENT_NAMES:
+            return HERDR_CORE_AGENT_NAMES[key]
+    return None
+
+
+def query_herdr_core_terminals(sock_path: str) -> Optional[List[Dict[str, Any]]]:
+    """Read one herdr-core roster through `terminal.list`.
+
+    The 0.1 generation answers a bare JSON-RPC line without a handshake, the
+    same framing the 0.9 socket uses. None means the call failed; an empty
+    list means the core is up but has no terminals.
+    """
+    res = query_herdr_socket("terminal.list", sock_path=sock_path)
+    result = res.get("result") if isinstance(res, dict) else None
+    terminals = result.get("terminals") if isinstance(result, dict) else None
+    if not isinstance(terminals, list):
+        return None
+    return [t for t in terminals if isinstance(t, dict)]
+
+
 def query_herdr_socket(method: str, params: Optional[Dict[str, Any]] = None, timeout: float = 1.0, sock_path: Optional[str] = None) -> Optional[Dict[str, Any]]:
     """Send JSON-RPC request to a Herdr socket and return parsed response."""
     sock = sock_path or HERDR_SOCK_PATH
@@ -1628,6 +1691,33 @@ def normalize_herdr_status(value: Any) -> str:
     if status not in {"idle", "working", "waiting", "completed", "done", "finished", "error", "failed", "unknown"}:
         return "unknown"
     return {"done": "completed", "finished": "completed", "failed": "error"}.get(status, status)
+
+
+def resolve_agent_status(raw_status: str, status_override: Optional[str], title_hint: str = "") -> str:
+    """Pick the plugin status from a live source report plus session inference.
+
+    The live report (Herdr's agent_status, herdr-core's OSC 7501 state) is
+    authoritative; session-file inference only fills gaps and must NEVER
+    downgrade a live "working" report — a finished previous turn in the
+    transcript tail does not mean the current turn is done.
+    """
+    if status_override == "waiting":
+        return "waiting"
+    if raw_status in ("waiting", "prompt", "input"):
+        return "waiting"
+    if raw_status in ("working", "busy", "running", "thinking", "generating"):
+        return "working"
+    if status_override == "working":
+        return "working"
+    if raw_status in ("completed", "done", "finished") or "✓" in title_hint:
+        return "completed"
+    if raw_status in ("blocked",):
+        return "waiting"
+    if raw_status in ("unknown",):
+        return "unknown"
+    if raw_status in ("error", "failed"):
+        return "error"
+    return status_override or "idle"
 
 
 # Claude Code runs internal helpers under the same `claude` binary (argv[0]).
@@ -2572,13 +2662,24 @@ def get_process_info(pid: int) -> Optional[Dict[str, Any]]:
 
 
 def get_herdr_server_pids() -> List[int]:
-    """Find PID(s) of running Herdr server and client instances."""
+    """Find PID(s) of running Herdr server and client instances.
+
+    Both generations count: a 0.9 `herdr server` and a 0.1 `herdr-core
+    serve`/`hold` own the terminals whose agents must not also surface as
+    standalone terminal cards.
+    """
     pids = []
     for p in glob.glob("/proc/[0-9]*"):
         try:
             pid = int(os.path.basename(p))
             info = get_process_info(pid)
-            if info and ("herdr server" in info["cmd"] or info["cmd"] == "herdr" or "herdr --session" in info["cmd"]):
+            if info and (
+                "herdr server" in info["cmd"]
+                or info["cmd"] == "herdr"
+                or "herdr --session" in info["cmd"]
+                or "herdr-core serve" in info["cmd"]
+                or "herdr-core hold" in info["cmd"]
+            ):
                 pids.append(pid)
         except Exception:
             continue
@@ -4217,28 +4318,8 @@ def fetch_all_agents() -> Dict[str, Any]:
 
             # Determine effective status. Herdr's live agent_status is authoritative;
             # session-file inference only fills gaps and must NEVER downgrade a
-            # live "working" report (a finished previous turn in the transcript tail
-            # does not mean the current turn is done).
-            if status_override == "waiting":
-                status = "waiting"
-            elif raw_status in ("waiting", "prompt", "input"):
-                status = "waiting"
-            elif raw_status in ("working", "busy", "running", "thinking", "generating"):
-                status = "working"
-            elif status_override == "working":
-                status = "working"
-            elif raw_status in ("completed", "done", "finished") or "✓" in title_raw:
-                status = "completed"
-            elif raw_status in ("blocked",):
-                status = "waiting"
-            elif raw_status in ("unknown",):
-                status = "unknown"
-            elif raw_status in ("error", "failed"):
-                status = "error"
-            else:
-                # Herdr has no strong opinion (idle/empty): fall back to the
-                # session tail, which distinguishes a finished task from a fresh prompt.
-                status = status_override or "idle"
+            # live "working" report (see resolve_agent_status()).
+            status = resolve_agent_status(raw_status, status_override, title_raw)
 
             origin = "herdr_remote" if remote_machine else ("herdr_desktop" if is_hermes_desktop else "herdr")
             origin_label = (
@@ -4296,11 +4377,147 @@ def fetch_all_agents() -> Dict[str, Any]:
                 }
             )
 
+    def consume_herdr_core_terminals(terminals: List[Dict[str, Any]]) -> None:
+        """Merge herdr-core (0.1.x) terminals that host a recognized agent.
+
+        The 0.1 generation has no workspace/pane graph in its roster: a
+        terminal carries its own footprint in `labels` (`where`, `herdr.space`,
+        `herdr.tab`) and its live state in `status` (the OSC 7501 report).
+        Session inference only fills a missing or idle report.
+        """
+        nonlocal working_count, completed_count, idle_count, waiting_count, unknown_count, top_working_task, top_completed_task
+
+        for term in terminals:
+            address = str(term.get("address") or "")
+            if not address or term.get("state") != "live":
+                continue
+            agent_type = herdr_core_agent_type(term)
+            if not agent_type:
+                continue
+
+            foreground = term.get("foreground") or {}
+            foreground_pid = foreground.get("pid") if isinstance(foreground.get("pid"), int) else None
+            foreground_argv = foreground.get("argv") if isinstance(foreground.get("argv"), list) else []
+            cwd = foreground.get("cwd") or term.get("cwd") or ""
+            repo_name = os.path.basename(cwd.rstrip("/")) if cwd else ""
+            clean_cwd = shorten_path(cwd)
+
+            labels = term.get("labels") or {}
+            where = str(labels.get("where") or "")
+            space_name, _, tab_name = where.partition(" / ")
+
+            title_raw = str(term.get("title") or "")
+            cleaned_title = clean_title(title_raw)
+            is_generic_title = cleaned_title in (repo_name, "~", "tmp", "/tmp", "") or cleaned_title.startswith("/tmp") or cleaned_title.startswith("alberto@")
+
+            user_goal = None
+            detail_text = None
+            model_name = None
+            status_override = None
+            has_question = False
+            session_path = None
+            is_hermes_desktop = agent_type == "hermes" and "desktop" in foreground_argv
+
+            if agent_type in ("omp", "grok") and foreground_pid:
+                # A core terminal names the agent's PID, so the session is the
+                # one that process actually runs: no "latest in this cwd"
+                # fallback, which would hand one agent another's transcript.
+                session_path = find_session_for_process(agent_type, foreground_pid, cwd, claimed_sessions, foreground_argv)
+                if session_path:
+                    claimed_sessions.add(session_path)
+                    if agent_type == "omp":
+                        user_goal, detail_text, model_name, status_override, has_question = extract_omp_task_from_session(session_path)
+                    else:
+                        user_goal, detail_text, model_name, status_override, has_question = extract_grok_task_from_session(session_path)
+                if agent_type == "omp":
+                    model_name = model_name or get_omp_default_model()
+            elif agent_type == "hermes":
+                user_goal, model_name, _, _, detail_text, status_override, has_question = extract_hermes_session_info(
+                    source_preference="desktop" if is_hermes_desktop else "cli",
+                    min_start_time=get_process_start_time(foreground_pid) if foreground_pid else None,
+                    hermes_profile=hermes_profile_from_argv(foreground_argv),
+                )
+            elif agent_type == "claude" and foreground_pid:
+                # Same contract as the standalone scan: a hook-reported state
+                # comes from the session itself and outranks inference.
+                claude_hook_status = read_claude_hook_status(foreground_pid)
+                if claude_hook_status:
+                    status_override = claude_hook_status["status"]
+                    detail_text = claude_hook_status["detail"] or "Ready for prompt"
+                    has_question = status_override == "waiting"
+
+            raw_status = normalize_herdr_status((term.get("status") or {}).get("state"))
+            status = resolve_agent_status(raw_status, status_override, title_raw)
+
+            if user_goal:
+                effective_title = user_goal
+            elif cleaned_title and not is_generic_title:
+                effective_title = cleaned_title
+            elif repo_name and repo_name not in ("tmp", "~"):
+                effective_title = f"Working in {repo_name}"
+            else:
+                effective_title = f"{agent_type.upper()} session"
+
+            origin = "herdr_desktop" if is_hermes_desktop else "herdr"
+            origin_label = "Herdr (Desktop)" if is_hermes_desktop else "Herdr"
+            display_name = "Hermes Desktop" if is_hermes_desktop else (agent_type.upper() if agent_type in ("omp", "pi") else agent_type.capitalize())
+
+            if status == "working":
+                working_count += 1
+                active_agent_types.add(agent_type)
+                if not top_working_task:
+                    top_working_task = f"{display_name}: {effective_title}"
+            elif status == "waiting":
+                waiting_count += 1
+                active_agent_types.add(agent_type)
+            elif status == "completed":
+                completed_count += 1
+                if not top_completed_task:
+                    top_completed_task = f"{display_name}: ✓ {effective_title}"
+            elif status == "unknown":
+                unknown_count += 1
+            else:
+                idle_count += 1
+
+            detail_display = detail_text or (user_goal if user_goal and user_goal != effective_title else "") or clean_cwd
+            agents_list.append(
+                {
+                    "pane_id": f"herdr-core:{address}",
+                    "raw_pane_id": address,
+                    "herdr_session": "default",
+                    "origin": origin,
+                    "origin_label": origin_label,
+                    "agent": agent_type,
+                    "agent_display": display_name,
+                    "status": status,
+                    "title": effective_title,
+                    "detail": detail_display,
+                    "cwd": clean_cwd,
+                    "repo": repo_name,
+                    "workspace": space_name or "Herdr",
+                    "tab": tab_name,
+                    "pane_label": where or address,
+                    "focused": False,
+                    "model": model_name or "",
+                    "session_path": session_path or "",
+                    "has_question": has_question,
+                    "can_focus": True,
+                    "can_control": True,
+                }
+            )
+
     for sess_name, sess_sock in herdr_session_sockets():
         resp = query_herdr_socket("session.snapshot", sock_path=sess_sock)
         if resp and "result" in resp and "snapshot" in resp["result"]:
             herdr_connected = True
             consume_herdr_snapshot(resp["result"]["snapshot"], sess_name, sess_sock)
+
+    for core_sock in herdr_core_sockets():
+        core_terminals = query_herdr_core_terminals(core_sock)
+        if core_terminals is None:
+            continue
+        herdr_connected = True
+        consume_herdr_core_terminals(core_terminals)
 
     remote_machines = herdr_machine_list()
     # ponytail: eight concurrent SSH probes; add persistent async transports only
@@ -4473,6 +4690,58 @@ def find_herdr_window_for_session(clients: List[Dict[str, Any]], session_name: s
     return None
 
 
+def herdr_app_window(clients: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    """The Hyprland window of the Herdr desktop app (0.1 generation)."""
+    return next(
+        (c for c in clients if c.get("class") == "herdr-app" or c.get("initialClass") == "herdr-app"),
+        None,
+    )
+
+
+def focus_herdr_core_terminal(address: str) -> Dict[str, Any]:
+    """Show a herdr-core terminal (its space, tab and pane) and focus the window.
+
+    pane.focus is an app-side command: the core keeps terminals alive without
+    the window, but only the window can put one on screen. The app switches
+    space and tab itself, so no core socket call is involved.
+    """
+    target = f"herdr-core:{address}"
+    try:
+        proc = subprocess.run(
+            ["herdr-app", "do", "pane.focus", "--terminal", address],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=1.5,
+        )
+    except Exception:
+        return {"ok": False, "error": "Herdr window unavailable", "pane_id": target}
+    if proc.returncode != 0:
+        return {"ok": False, "error": "Herdr window refused the focus request", "pane_id": target}
+    win = herdr_app_window(get_hypr_clients())
+    if not win:
+        return {"ok": False, "error": "Herdr window not found", "pane_id": target}
+    focus_hypr_window(win)
+    return {
+        "ok": True,
+        "pane_id": target,
+        "focused_window": win.get("title", ""),
+        "workspace": win.get("workspace", {}).get("id"),
+    }
+
+
+def kill_herdr_core_terminal(address: str) -> Dict[str, Any]:
+    """End the program of a herdr-core terminal through `terminal.kill`."""
+    target = f"herdr-core:{address}"
+    last_error = None
+    for core_sock in herdr_core_sockets():
+        res = query_herdr_socket("terminal.kill", {"terminal": address}, sock_path=core_sock)
+        err = herdr_error_message(res)
+        if err is None and isinstance(res, dict) and res.get("result") is not None:
+            return {"ok": True, "pane_id": target}
+        last_error = err or "Herdr core refused the request"
+    return {"ok": False, "error": last_error or "herdr-core socket not found", "pane_id": target}
+
+
 def focus_pane(target_id: str) -> Dict[str, Any]:
     """Focus a specific pane in Herdr, Hermes Desktop window, or standalone terminal and switch desktops."""
     if not target_id:
@@ -4534,7 +4803,14 @@ def focus_pane(target_id: str) -> Dict[str, Any]:
         except Exception:
             pass
         return {"ok": False, "error": "Standalone terminal window not found"}
-    # 3. Herdr pane (session-qualified targets look like herdr:<session>|<pane_id>)
+    # 3. herdr-core (0.1.x) terminal, addressed as herdr-core:<address>
+    if target_id.startswith("herdr-core:"):
+        address = target_id[len("herdr-core:"):]
+        if not re.fullmatch(r"[A-Za-z0-9_.:-]+", address):
+            return {"ok": False, "error": "Invalid herdr-core terminal address"}
+        return focus_herdr_core_terminal(address)
+
+    # 4. Herdr pane (session-qualified targets look like herdr:<session>|<pane_id>)
     sess_name = "default"
     pane_target = target_id
     if target_id.startswith("herdr:"):
@@ -4709,7 +4985,14 @@ def kill_target(target_id: str) -> Dict[str, Any]:
         except Exception as e:
             return {"ok": False, "error": str(e)}
 
-    # 4. Herdr pane (session-qualified targets look like herdr:<session>|<pane_id>)
+    # 4. herdr-core (0.1.x) terminal, addressed as herdr-core:<address>
+    if target_id.startswith("herdr-core:"):
+        address = target_id[len("herdr-core:"):]
+        if not re.fullmatch(r"[A-Za-z0-9_.:-]+", address):
+            return {"ok": False, "error": "Invalid herdr-core terminal address"}
+        return kill_herdr_core_terminal(address)
+
+    # 5. Herdr pane (session-qualified targets look like herdr:<session>|<pane_id>)
     if target_id.startswith("herdr:"):
         parts = target_id.split("|", 1)
         sess_name = parts[0][len("herdr:"):]
