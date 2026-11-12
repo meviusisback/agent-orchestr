@@ -18,7 +18,7 @@ When several AI coding agents work at once — across terminals, Herdr panes and
 
 ## Features
 
-- **Live multi-source tracking** — Herdr daemon panes (local socket plus remote machines), **remote Hermes peers** (gateways registered with `hermes peer add`, read-only), standalone terminal windows (Ghostty, Foot, Kitty, Alacritty, WezTerm), **OMP** sessions (`~/.omp/agent/sessions/`), **Hermes** CLI and Desktop app databases (`~/.hermes/state.db`), and **Grok** Build TUI sessions (`$GROK_HOME/active_sessions.json` + `events.jsonl`).
+- **Live multi-source tracking** — Herdr panes from both generations (0.9 `herdr.sock` snapshots and 0.1 `herdr-core` JSON-RPC rosters, local plus remote machines), **remote Hermes peers** (gateways registered with `hermes peer add`, read-only), standalone terminal windows (Ghostty, Foot, Kitty, Alacritty, WezTerm), **OMP** sessions (`~/.omp/agent/sessions/`), **Hermes** CLI and Desktop app databases (`~/.hermes/state.db`), and **Grok** Build TUI sessions (`$GROK_HOME/active_sessions.json` + `events.jsonl`).
 - **One-click workspace & window switching** — click any agent card to switch Hyprland workspaces and focus the exact terminal window, Herdr pane or Hermes Desktop window.
 - **Visual status bar display** — `Icon` mode (orchestrator glyph with activity badge and spinner while agents work), `Status` mode (real-time ticker of active tasks), `Compact` mode (live counts like `4 ag · 1 busy`, `3 done`).
 - **Interactive popup panel** — smart filter tabs (`All`, `Working`, `Waiting`, `Done`, `Idle`); rich cards with model tags, latest human prompt, real-time tool execution, repo/working-directory breadcrumbs and session indicators; terminate agent processes or close Herdr panes from card buttons.
@@ -89,6 +89,8 @@ omarchy shell meviusisback.agent-orchestr refresh  # force live refresh
 | `showIdleInBar` | `false` | Badge count when all agents are idle |
 | `maxTaskLength` | `45` | Max characters of the bar status ticker |
 | `privacyHidePrompts` | `false` | Hide agent task/prompt text in bar and cards (counts, status, repo, workspace only) |
+
+**Herdr generations:** the 0.9 server is read from `~/.config/herdr/herdr.sock` (`session.snapshot`, plus per-session sockets under `~/.config/herdr/sessions/`); the 0.1 generation is read from its `herdr-core` socket under `$XDG_RUNTIME_DIR/herdr-core/` (or `HC_SOCKET`) through `terminal.list`. A 0.1 terminal is an agent only when its program is a recognized agent and it reports state through the OSC 7501 record the core stores in `status`; shells are skipped and finished terminals dropped. Clicking a 0.1 card runs `herdr-app do pane.focus --terminal <address>` and focuses the Herdr window; ✕ sends `terminal.kill` to the core. Agents that never write a status record still appear, but with status inferred from their session transcript.
 
 **Remote sources (read-only — no focus, no terminate; those windows aren't on this desktop):**
 

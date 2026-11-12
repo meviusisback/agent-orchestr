@@ -46,6 +46,7 @@ class TestDiscoveryRegression(unittest.TestCase):
         machine = {"id": "dev-id", "label": "Dev", "target": "dev", "session": "default"}
         with mock.patch.object(ac, "get_herdr_server_pids", return_value=[]), \
              mock.patch.object(ac, "herdr_session_sockets", return_value=[]), \
+             mock.patch.object(ac, "herdr_core_sockets", return_value=[]), \
              mock.patch.object(ac, "herdr_machine_list", return_value=[machine]), \
              mock.patch.object(ac, "query_remote_herdr_snapshot", return_value=response), \
              mock.patch.object(ac, "scan_orca_agents", return_value=[]), \
@@ -56,6 +57,56 @@ class TestDiscoveryRegression(unittest.TestCase):
         self.assertEqual(data["agents"][0]["agent"], "claude")
         self.assertEqual(data["agents"][0]["origin_label"], "Herdr · Dev")
         self.assertEqual(data["agents"][0]["status"], "working")
+
+    def test_collects_herdr_core_terminals_only_for_agents(self):
+        """0.1 generation: `terminal.list` roster, shells/dead terminals dropped."""
+        roster = [
+            {
+                "address": "t7", "state": "live", "cwd": "/home/alberto/repo/shop",
+                "foreground": {"name": "omp", "pid": 700, "argv": ["omp"], "cwd": "/home/alberto/repo/shop"},
+                "labels": {"where": "shop / Oh My Pi"},
+                "status": {"app": "omp", "state": "working"},
+                "title": "π > fix login",
+            },
+            {
+                "address": "t8", "state": "live",
+                "foreground": {"name": "bash", "argv": ["/usr/bin/bash"], "cwd": "/tmp"},
+                "status": None,
+                "title": "alberto@omarchy:/tmp",
+            },
+            {
+                "address": "t9", "state": "finished",
+                "foreground": {"name": "omp", "pid": 701, "argv": ["omp"], "cwd": "/tmp"},
+                "status": {"app": "omp", "state": "done"},
+                "title": "π > old task",
+            },
+            {
+                "address": "t10", "state": "live",
+                "foreground": {"name": "hermes", "pid": 702, "argv": ["hermes"], "cwd": "/home/alberto/repo/shop"},
+                "labels": {"where": "shop / Hermes"},
+                "status": {"app": "hermes", "state": "blocked"},
+                "title": "alberto@omarchy:~/repo/shop",
+            },
+        ]
+        with mock.patch.object(ac, "get_herdr_server_pids", return_value=[]), \
+             mock.patch.object(ac, "herdr_session_sockets", return_value=[]), \
+             mock.patch.object(ac, "herdr_core_sockets", return_value=["/run/user/1000/herdr-core/default.sock"]), \
+             mock.patch.object(ac, "query_herdr_core_terminals", return_value=roster), \
+             mock.patch.object(ac, "herdr_machine_list", return_value=[]), \
+             mock.patch.object(ac, "find_session_for_process", return_value=None), \
+             mock.patch.object(ac, "get_omp_default_model", return_value="model-x"), \
+             mock.patch.object(ac, "extract_hermes_session_info", return_value=("deploy", "m", "p", "d", "detail", None, False)), \
+             mock.patch.object(ac, "scan_orca_agents", return_value=[]), \
+             mock.patch.object(ac, "scan_standalone_agents", return_value=[]), \
+             mock.patch.object(ac, "_collect_peer_cards", return_value=([], [])), \
+             mock.patch.object(ac, "query_orca_terminals", return_value=[]):
+            data = ac.fetch_all_agents()
+        self.assertEqual([a["pane_id"] for a in data["agents"]], ["herdr-core:t7", "herdr-core:t10"])
+        omp, hermes = data["agents"]
+        self.assertEqual((omp["agent"], omp["status"], omp["workspace"], omp["tab"]), ("omp", "working", "shop", "Oh My Pi"))
+        self.assertEqual((omp["model"], omp["can_focus"], omp["can_control"]), ("model-x", True, True))
+        self.assertEqual((hermes["agent"], hermes["status"]), ("hermes", "waiting"))
+        self.assertEqual(hermes["title"], "deploy")
 
 
 if __name__ == "__main__":

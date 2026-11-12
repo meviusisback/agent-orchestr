@@ -133,6 +133,38 @@ class HerdrTargets(KillTargetCase):
         self.assertFalse(res["ok"])
 
 
+class HerdrCoreTargets(KillTargetCase):
+    """0.1 generation: `terminal.kill` over the core socket, not pane.close."""
+
+    def setUp(self):
+        super().setUp()
+        patcher = mock.patch.object(ac, "herdr_core_sockets", return_value=["/run/user/1000/herdr-core/default.sock"])
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_successful_terminal_kill(self):
+        res = ac.kill_target("herdr-core:t7")
+        self.assertTrue(res["ok"], res)
+        self.assertEqual(self.socket_calls, [("terminal.kill", {"terminal": "t7"})])
+
+    def test_rpc_error_is_reported(self):
+        self.socket_reply = {"id": "test", "error": {"code": -32000, "message": "no terminal \"t7\""}}
+        res = ac.kill_target("herdr-core:t7")
+        self.assertFalse(res["ok"])
+        self.assertIn("no terminal", res["error"])
+
+    def test_malformed_address_is_rejected(self):
+        res = ac.kill_target("herdr-core:t7; rm -rf /")
+        self.assertFalse(res["ok"])
+        self.assertEqual(self.socket_calls, [])
+
+    def test_missing_core_socket_is_reported(self):
+        with mock.patch.object(ac, "herdr_core_sockets", return_value=[]):
+            res = ac.kill_target("herdr-core:t7")
+        self.assertFalse(res["ok"])
+        self.assertEqual(self.socket_calls, [])
+
+
 class ProcessTargets(KillTargetCase):
     """The PID-addressed paths keep their agent validation gate."""
 
