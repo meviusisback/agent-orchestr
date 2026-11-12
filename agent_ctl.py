@@ -1487,6 +1487,41 @@ def herdr_core_sockets() -> List[str]:
     return [p for p in found if ".holder." not in os.path.basename(p)]
 
 
+def herdr_core_key(sock_path: str) -> str:
+    """Card identity of a core: its socket's session name.
+
+    Terminal addresses are allocated per core ('t7' lives in every core), so a
+    card must carry the core it came from or an action cannot address it.
+    """
+    base = os.path.basename(sock_path or "")
+    return base[:-len(".sock")] if base.endswith(".sock") else base
+
+
+def herdr_core_socket_for_key(core_key: str) -> Optional[str]:
+    """The single socket a card's core key names, or None when unresolvable."""
+    if not core_key:
+        return None
+    matches = [p for p in herdr_core_sockets() if herdr_core_key(p) == core_key]
+    return matches[0] if len(matches) == 1 else None
+
+
+def split_herdr_core_target(target_id: str) -> Tuple[Optional[str], str]:
+    """Split ``herdr-core:<core>:<address>`` into (core_key, address).
+
+    The older two-part form carries no core, so it is accepted only while a
+    single core is live; with several cores the caller must refuse rather than
+    guess which one owns the address.
+    """
+    rest = target_id.split("herdr-core:", 1)[1]
+    if ":" in rest:
+        core_key, address = rest.split(":", 1)
+        return core_key, address
+    live = herdr_core_sockets()
+    if len(live) == 1:
+        return herdr_core_key(live[0]), rest
+    return None, rest
+
+
 # herdr-core names the program owning a terminal in its roster, so this is a
 # closed vocabulary (an unknown name is a shell or a tool, not an agent).
 HERDR_CORE_AGENT_NAMES = {
@@ -1534,13 +1569,23 @@ def query_herdr_core_terminals(sock_path: str) -> Optional[List[Dict[str, Any]]]
 
 
 def query_herdr_socket(method: str, params: Optional[Dict[str, Any]] = None, timeout: float = 1.0, sock_path: Optional[str] = None) -> Optional[Dict[str, Any]]:
-    """Send JSON-RPC request to a Herdr socket and return parsed response."""
+    """Send JSON-RPC request to a Herdr socket and return parsed response.
+
+    ``timeout`` is a budget for the whole exchange, not per recv: a peer that
+    connects and then drips bytes without a newline used to hold the caller for
+    as long as it liked (the per-recv deadline was re-armed every time).
+    """
     sock = sock_path or HERDR_SOCK_PATH
     if not os.path.exists(sock):
         return None
+    deadline = time.monotonic() + max(0.05, float(timeout or 1.0))
+    s = None
     try:
         s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        s.settimeout(min(timeout, 0.5))
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return None
+        s.settimeout(remaining)
         s.connect(sock)
         req_id = f"orchestr:{int(time.time() * 1000)}"
         payload = {"id": req_id, "method": method, "params": params or {}}
@@ -1549,17 +1594,26 @@ def query_herdr_socket(method: str, params: Optional[Dict[str, Any]] = None, tim
         max_bytes = 262144  # 256KB max response limit
         data = b""
         while b"\n" not in data and len(data) < max_bytes:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return None
+            s.settimeout(remaining)
             chunk = s.recv(min(32768, max_bytes - len(data)))
             if not chunk:
                 break
             data += chunk
-        s.close()
 
         if not data:
             return None
         return json.loads(data.decode("utf-8", errors="replace"))
     except Exception:
         return None
+    finally:
+        if s is not None:
+            try:
+                s.close()
+            except OSError:
+                pass
 
 
 def herdr_error_message(res: Optional[Dict[str, Any]]) -> Optional[str]:
@@ -1680,8 +1734,15 @@ def normalize_hermes_agent(value: Any) -> Optional[str]:
 
 
 def normalize_herdr_status(value: Any) -> str:
-    """Map Herdr's status vocabulary to plugin status vocabulary."""
-    status = str(value or "unknown").strip().lower()
+    """Map Herdr's status vocabulary to plugin status vocabulary.
+
+    An absent record returns "" — "no report at all" — not "unknown": callers
+    then fall back to session inference, which is what an agent that never
+    writes an OSC 7501 record is supposed to get.
+    """
+    if value is None or not str(value).strip():
+        return ""
+    status = str(value or "").strip().lower()
     if status == "blocked":
         return "waiting"
     if status in {"busy", "running", "thinking", "generating"}:
@@ -2628,7 +2689,10 @@ def is_valid_agent_process(pid: int) -> bool:
         return True
     if first in ("python", "python3") and is_hermes_cli_process(cmd):
         return True
-    if "/Hermes" in cmd or "Hermes" in cmd:
+    # The desktop app, by executable name only: a substring test over the whole
+    # cmdline accepted any process with the word 'Hermes' anywhere in its argv
+    # (a path, a comment, an argument) and let the Kill button SIGTERM it.
+    if first in ("hermes", "hermes-desktop", "Hermes"):
         return True
     return False
 
@@ -2857,7 +2921,7 @@ def find_session_for_process(agent_type: str, pid: int, cwd: str, claimed_sessio
     if agent_type == "omp" and os.path.exists(OMP_SESSIONS_DIR):
         folder_part = os.path.basename(cwd.rstrip("/")) if cwd else ""
         if folder_part and folder_part not in ("tmp", "~"):
-            matches = glob.glob(os.path.join(OMP_SESSIONS_DIR, f"*{folder_part}*", "*.jsonl"))
+            matches = glob.glob(os.path.join(OMP_SESSIONS_DIR, f"*{glob.escape(folder_part)}*", "*.jsonl"))
         else:
             matches = glob.glob(os.path.join(OMP_SESSIONS_DIR, "*-tmp*", "*.jsonl"))
         if matches:
@@ -2911,7 +2975,7 @@ def find_latest_session_for_cwd(agent_type: str, cwd: str, claimed_sessions: Opt
         try:
             folder_part = os.path.basename(cwd.rstrip("/")) if cwd else ""
             if folder_part and folder_part not in ("tmp", "~"):
-                matches = glob.glob(os.path.join(OMP_SESSIONS_DIR, f"*{folder_part}*", "*.jsonl"))
+                matches = glob.glob(os.path.join(OMP_SESSIONS_DIR, f"*{glob.escape(folder_part)}*", "*.jsonl"))
             else:
                 matches = glob.glob(os.path.join(OMP_SESSIONS_DIR, "*-tmp*", "*.jsonl"))
             if not matches:
@@ -3263,8 +3327,12 @@ def extract_hermes_session_info(
     # If source_preference is given, strictly filter to matching sources if any exist
     if sources:
         matching = [c for c in candidates if c.get("source") in sources]
-        if matching:
-            candidates = matching
+        if not matching:
+            # No fallback to the unfiltered set: adopting a desktop, gateway or
+            # cron session because no TUI session matched is exactly the
+            # misattribution this filter exists to prevent.
+            return None, None, None, None, None, None, False
+        candidates = matching
 
     # Sort candidates: active leases first among matching, then most recent last_active
     def sort_key(c: Dict[str, Any]) -> Tuple[int, float]:
@@ -4388,134 +4456,153 @@ def fetch_all_agents() -> Dict[str, Any]:
                 }
             )
 
-    def consume_herdr_core_terminals(terminals: List[Dict[str, Any]]) -> None:
+    def consume_herdr_core_terminals(terminals: List[Dict[str, Any]], core_key: str = "") -> None:
         """Merge herdr-core (0.1.x) terminals that host a recognized agent.
 
         The 0.1 generation has no workspace/pane graph in its roster: a
         terminal carries its own footprint in `labels` (`where`, `herdr.space`,
         `herdr.tab`) and its live state in `status` (the OSC 7501 report).
-        Session inference only fills a missing or idle report.
+        Session inference only fills a missing or idle report. ``core_key`` is
+        the socket the roster came from: addresses are allocated per core, so
+        the card must carry it or a later focus/kill cannot address this
+        terminal.
         """
         nonlocal working_count, completed_count, idle_count, waiting_count, unknown_count, top_working_task, top_completed_task
 
         for term in terminals:
-            address = str(term.get("address") or "")
-            if not address or term.get("state") != "live":
-                continue
-            agent_type = herdr_core_agent_type(term)
-            if not agent_type:
-                continue
+            try:
+                address = str(term.get("address") or "")
+                if not address or term.get("state") != "live":
+                    continue
+                agent_type = herdr_core_agent_type(term)
+                if not agent_type:
+                    continue
 
-            foreground = term.get("foreground") or {}
-            foreground_pid = foreground.get("pid") if isinstance(foreground.get("pid"), int) else None
-            foreground_argv = foreground.get("argv") if isinstance(foreground.get("argv"), list) else []
-            cwd = foreground.get("cwd") or term.get("cwd") or ""
-            repo_name = os.path.basename(cwd.rstrip("/")) if cwd else ""
-            clean_cwd = shorten_path(cwd)
+                foreground = term.get("foreground") if isinstance(term.get("foreground"), dict) else {}
+                foreground_pid = foreground.get("pid") if isinstance(foreground.get("pid"), int) else None
+                foreground_argv = foreground.get("argv") if isinstance(foreground.get("argv"), list) else []
+                cwd = foreground.get("cwd") or term.get("cwd") or ""
+                repo_name = os.path.basename(cwd.rstrip("/")) if cwd else ""
+                clean_cwd = shorten_path(cwd)
 
-            labels = term.get("labels") or {}
-            where = str(labels.get("where") or "")
-            space_name, _, tab_name = where.partition(" / ")
+                labels = term.get("labels") if isinstance(term.get("labels"), dict) else {}
+                where = str(labels.get("where") or "")
+                space_name, _, tab_name = where.partition(" / ")
 
-            title_raw = str(term.get("title") or "")
-            cleaned_title = clean_title(title_raw)
-            is_generic_title = cleaned_title in (repo_name, "~", "tmp", "/tmp", "") or cleaned_title.startswith("/tmp") or cleaned_title.startswith("alberto@")
+                title_raw = str(term.get("title") or "")
+                cleaned_title = clean_title(title_raw)
+                # A shell prompt title ("user@host:~/dir") is generic for ANY
+                # user; a hardcoded username made the fallback disappear for
+                # everyone else.
+                is_generic_title = (cleaned_title in (repo_name, "~", "tmp", "/tmp", "")
+                                    or cleaned_title.startswith("/tmp")
+                                    or re.match(r"^[^@\s]+@[^:\s]+:", cleaned_title) is not None)
 
-            user_goal = None
-            detail_text = None
-            model_name = None
-            status_override = None
-            has_question = False
-            session_path = None
-            is_hermes_desktop = agent_type == "hermes" and "desktop" in foreground_argv
+                user_goal = None
+                detail_text = None
+                model_name = None
+                status_override = None
+                has_question = False
+                session_path = None
+                is_hermes_desktop = agent_type == "hermes" and "desktop" in foreground_argv
 
-            if agent_type in ("omp", "grok") and foreground_pid:
-                # A core terminal names the agent's PID, so the session is the
-                # one that process actually runs: no "latest in this cwd"
-                # fallback, which would hand one agent another's transcript.
-                session_path = find_session_for_process(agent_type, foreground_pid, cwd, claimed_sessions, foreground_argv)
-                if session_path:
-                    claimed_sessions.add(session_path)
+                if agent_type in ("omp", "grok") and foreground_pid:
+                    # A core terminal names the agent's PID, so the session is the
+                    # one that process actually runs: no "latest in this cwd"
+                    # fallback, which would hand one agent another's transcript.
+                    session_path = find_session_for_process(agent_type, foreground_pid, cwd, claimed_sessions, foreground_argv)
+                    if session_path:
+                        claimed_sessions.add(session_path)
+                        if agent_type == "omp":
+                            user_goal, detail_text, model_name, status_override, has_question = extract_omp_task_from_session(session_path)
+                        else:
+                            user_goal, detail_text, model_name, status_override, has_question = extract_grok_task_from_session(session_path)
                     if agent_type == "omp":
-                        user_goal, detail_text, model_name, status_override, has_question = extract_omp_task_from_session(session_path)
-                    else:
-                        user_goal, detail_text, model_name, status_override, has_question = extract_grok_task_from_session(session_path)
-                if agent_type == "omp":
-                    model_name = model_name or get_omp_default_model()
-            elif agent_type == "hermes":
-                user_goal, model_name, _, _, detail_text, status_override, has_question = extract_hermes_session_info(
-                    source_preference="desktop" if is_hermes_desktop else HERMES_TUI_SOURCES,
-                    min_start_time=get_process_start_time(foreground_pid) if foreground_pid else None,
-                    hermes_profile=hermes_profile_from_argv(foreground_argv),
+                        model_name = model_name or get_omp_default_model()
+                elif agent_type == "hermes":
+                    user_goal, model_name, _, _, detail_text, status_override, has_question = extract_hermes_session_info(
+                        source_preference="desktop" if is_hermes_desktop else HERMES_TUI_SOURCES,
+                        min_start_time=get_process_start_time(foreground_pid) if foreground_pid else None,
+                        hermes_profile=hermes_profile_from_argv(foreground_argv),
+                        # Same contract as the other Hermes call sites: the
+                        # profile home keeps another profile's newest session
+                        # from being captioned onto this terminal.
+                        hermes_home=get_process_hermes_home(foreground_pid) if foreground_pid else None,
+                    )
+                elif agent_type == "claude" and foreground_pid:
+                    # Same contract as the standalone scan: a hook-reported state
+                    # comes from the session itself and outranks inference.
+                    claude_hook_status = read_claude_hook_status(foreground_pid)
+                    if claude_hook_status:
+                        status_override = claude_hook_status["status"]
+                        detail_text = claude_hook_status["detail"] or "Ready for prompt"
+                        has_question = status_override == "waiting"
+
+                status_record = term.get("status") if isinstance(term.get("status"), dict) else {}
+                raw_status = normalize_herdr_status(status_record.get("state")) if status_record else ""
+                status = resolve_agent_status(raw_status, status_override, title_raw)
+
+                if user_goal:
+                    effective_title = user_goal
+                elif cleaned_title and not is_generic_title:
+                    effective_title = cleaned_title
+                elif repo_name and repo_name not in ("tmp", "~"):
+                    effective_title = f"Working in {repo_name}"
+                else:
+                    effective_title = f"{agent_type.upper()} session"
+
+                origin = "herdr_desktop" if is_hermes_desktop else "herdr"
+                origin_label = "Herdr (Desktop)" if is_hermes_desktop else "Herdr"
+                display_name = "Hermes Desktop" if is_hermes_desktop else (agent_type.upper() if agent_type in ("omp", "pi") else agent_type.capitalize())
+
+                if status == "working":
+                    working_count += 1
+                    active_agent_types.add(agent_type)
+                    if not top_working_task:
+                        top_working_task = f"{display_name}: {effective_title}"
+                elif status == "waiting":
+                    waiting_count += 1
+                    active_agent_types.add(agent_type)
+                elif status == "completed":
+                    completed_count += 1
+                    if not top_completed_task:
+                        top_completed_task = f"{display_name}: ✓ {effective_title}"
+                elif status == "unknown":
+                    unknown_count += 1
+                else:
+                    idle_count += 1
+
+                detail_display = detail_text or (user_goal if user_goal and user_goal != effective_title else "") or clean_cwd
+                agents_list.append(
+                    {
+                        "pane_id": f"herdr-core:{core_key}:{address}" if core_key else f"herdr-core:{address}",
+                        "raw_pane_id": address,
+                        "herdr_session": core_key or "default",
+                        "origin": origin,
+                        "origin_label": origin_label,
+                        "agent": agent_type,
+                        "agent_display": display_name,
+                        "status": status,
+                        "title": effective_title,
+                        "detail": detail_display,
+                        "cwd": clean_cwd,
+                        "repo": repo_name,
+                        "workspace": space_name or "Herdr",
+                        "tab": tab_name,
+                        "pane_label": where or address,
+                        "focused": False,
+                        "model": model_name or "",
+                        "session_path": session_path or "",
+                        "has_question": has_question,
+                        "can_focus": True,
+                        "can_control": True,
+                    }
                 )
-            elif agent_type == "claude" and foreground_pid:
-                # Same contract as the standalone scan: a hook-reported state
-                # comes from the session itself and outranks inference.
-                claude_hook_status = read_claude_hook_status(foreground_pid)
-                if claude_hook_status:
-                    status_override = claude_hook_status["status"]
-                    detail_text = claude_hook_status["detail"] or "Ready for prompt"
-                    has_question = status_override == "waiting"
+            except Exception:
+                # One malformed roster row must not abort the whole tick: the
+                # panel would keep showing the previous snapshot instead.
+                continue
 
-            raw_status = normalize_herdr_status((term.get("status") or {}).get("state"))
-            status = resolve_agent_status(raw_status, status_override, title_raw)
-
-            if user_goal:
-                effective_title = user_goal
-            elif cleaned_title and not is_generic_title:
-                effective_title = cleaned_title
-            elif repo_name and repo_name not in ("tmp", "~"):
-                effective_title = f"Working in {repo_name}"
-            else:
-                effective_title = f"{agent_type.upper()} session"
-
-            origin = "herdr_desktop" if is_hermes_desktop else "herdr"
-            origin_label = "Herdr (Desktop)" if is_hermes_desktop else "Herdr"
-            display_name = "Hermes Desktop" if is_hermes_desktop else (agent_type.upper() if agent_type in ("omp", "pi") else agent_type.capitalize())
-
-            if status == "working":
-                working_count += 1
-                active_agent_types.add(agent_type)
-                if not top_working_task:
-                    top_working_task = f"{display_name}: {effective_title}"
-            elif status == "waiting":
-                waiting_count += 1
-                active_agent_types.add(agent_type)
-            elif status == "completed":
-                completed_count += 1
-                if not top_completed_task:
-                    top_completed_task = f"{display_name}: ✓ {effective_title}"
-            elif status == "unknown":
-                unknown_count += 1
-            else:
-                idle_count += 1
-
-            detail_display = detail_text or (user_goal if user_goal and user_goal != effective_title else "") or clean_cwd
-            agents_list.append(
-                {
-                    "pane_id": f"herdr-core:{address}",
-                    "raw_pane_id": address,
-                    "herdr_session": "default",
-                    "origin": origin,
-                    "origin_label": origin_label,
-                    "agent": agent_type,
-                    "agent_display": display_name,
-                    "status": status,
-                    "title": effective_title,
-                    "detail": detail_display,
-                    "cwd": clean_cwd,
-                    "repo": repo_name,
-                    "workspace": space_name or "Herdr",
-                    "tab": tab_name,
-                    "pane_label": where or address,
-                    "focused": False,
-                    "model": model_name or "",
-                    "session_path": session_path or "",
-                    "has_question": has_question,
-                    "can_focus": True,
-                    "can_control": True,
-                }
-            )
 
     for sess_name, sess_sock in herdr_session_sockets():
         resp = query_herdr_socket("session.snapshot", sock_path=sess_sock)
@@ -4528,7 +4615,7 @@ def fetch_all_agents() -> Dict[str, Any]:
         if core_terminals is None:
             continue
         herdr_connected = True
-        consume_herdr_core_terminals(core_terminals)
+        consume_herdr_core_terminals(core_terminals, herdr_core_key(core_sock))
 
     remote_machines = herdr_machine_list()
     # ponytail: eight concurrent SSH probes; add persistent async transports only
@@ -4709,17 +4796,19 @@ def herdr_app_window(clients: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
     )
 
 
-def focus_herdr_core_terminal(address: str) -> Dict[str, Any]:
+def focus_herdr_core_terminal(address: str, core_key: str = "") -> Dict[str, Any]:
     """Show a herdr-core terminal (its space, tab and pane) and focus the window.
 
     pane.focus is an app-side command: the core keeps terminals alive without
     the window, but only the window can put one on screen. The app switches
-    space and tab itself, so no core socket call is involved.
+    space and tab itself, so no core socket call is involved. The value is
+    passed as one `--terminal=<address>` argument so it can never be read as an
+    option.
     """
-    target = f"herdr-core:{address}"
+    target = f"herdr-core:{core_key}:{address}" if core_key else f"herdr-core:{address}"
     try:
         proc = subprocess.run(
-            ["herdr-app", "do", "pane.focus", "--terminal", address],
+            ["herdr-app", "do", "pane.focus", f"--terminal={address}"],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
             timeout=1.5,
@@ -4740,17 +4829,26 @@ def focus_herdr_core_terminal(address: str) -> Dict[str, Any]:
     }
 
 
-def kill_herdr_core_terminal(address: str) -> Dict[str, Any]:
-    """End the program of a herdr-core terminal through `terminal.kill`."""
-    target = f"herdr-core:{address}"
-    last_error = None
-    for core_sock in herdr_core_sockets():
-        res = query_herdr_socket("terminal.kill", {"terminal": address}, sock_path=core_sock)
-        err = herdr_error_message(res)
-        if err is None and isinstance(res, dict) and res.get("result") is not None:
-            return {"ok": True, "pane_id": target}
-        last_error = err or "Herdr core refused the request"
-    return {"ok": False, "error": last_error or "herdr-core socket not found", "pane_id": target}
+def kill_herdr_core_terminal(address: str, core_key: str = "") -> Dict[str, Any]:
+    """End the program of a herdr-core terminal through `terminal.kill`.
+
+    The request goes to the ONE core the card came from. Terminal addresses are
+    allocated per core ('t7' exists in every core), so trying the other sockets
+    killed an unrelated agent whose address happened to match, and reported it
+    as success for the card the user clicked.
+    """
+    target = f"herdr-core:{core_key}:{address}" if core_key else f"herdr-core:{address}"
+    core_sock = herdr_core_socket_for_key(core_key)
+    if not core_sock:
+        return {"ok": False,
+                "error": "The herdr-core that owns this terminal is gone; "
+                         "refusing to kill another core's terminal",
+                "pane_id": target}
+    res = query_herdr_socket("terminal.kill", {"terminal": address}, sock_path=core_sock)
+    err = herdr_error_message(res)
+    if err is None and isinstance(res, dict) and "result" in res:
+        return {"ok": True, "pane_id": target}
+    return {"ok": False, "error": err or "Herdr core refused the request", "pane_id": target}
 
 
 def focus_pane(target_id: str) -> Dict[str, Any]:
@@ -4814,12 +4912,15 @@ def focus_pane(target_id: str) -> Dict[str, Any]:
         except Exception:
             pass
         return {"ok": False, "error": "Standalone terminal window not found"}
-    # 3. herdr-core (0.1.x) terminal, addressed as herdr-core:<address>
+    # 3. herdr-core (0.1.x) terminal, addressed as herdr-core:<core>:<address>
     if target_id.startswith("herdr-core:"):
-        address = target_id[len("herdr-core:"):]
+        core_key, address = split_herdr_core_target(target_id)
         if not re.fullmatch(r"[A-Za-z0-9_.:-]+", address):
             return {"ok": False, "error": "Invalid herdr-core terminal address"}
-        return focus_herdr_core_terminal(address)
+        if not core_key:
+            return {"ok": False,
+                    "error": "Several herdr-cores are live: the target must name its core"}
+        return focus_herdr_core_terminal(address, core_key)
 
     # 4. Herdr pane (session-qualified targets look like herdr:<session>|<pane_id>)
     sess_name = "default"
@@ -4996,12 +5097,15 @@ def kill_target(target_id: str) -> Dict[str, Any]:
         except Exception as e:
             return {"ok": False, "error": str(e)}
 
-    # 4. herdr-core (0.1.x) terminal, addressed as herdr-core:<address>
+    # 4. herdr-core (0.1.x) terminal, addressed as herdr-core:<core>:<address>
     if target_id.startswith("herdr-core:"):
-        address = target_id[len("herdr-core:"):]
-        if not re.fullmatch(r"[A-Za-z0-9_.:-]+", address):
+        core_key, address = split_herdr_core_target(target_id)
+        if not address or not re.fullmatch(r"[A-Za-z0-9_.-]+", address):
             return {"ok": False, "error": "Invalid herdr-core terminal address"}
-        return kill_herdr_core_terminal(address)
+        if not core_key:
+            return {"ok": False,
+                    "error": "Several herdr-cores are live: the target must name its core"}
+        return kill_herdr_core_terminal(address, core_key)
 
     # 5. Herdr pane (session-qualified targets look like herdr:<session>|<pane_id>)
     if target_id.startswith("herdr:"):
@@ -5023,7 +5127,10 @@ def kill_target(target_id: str) -> Dict[str, Any]:
 
 def launch_agent(agent_name: Optional[str] = None) -> Dict[str, Any]:
     """Launch agent in Omarchy or open agent selector."""
-    cmd = ["omarchy-agent", "--pick"] if not agent_name else ["omarchy-agent", agent_name]
+    if agent_name is not None and not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", agent_name):
+        # A name beginning with '-' would be read by omarchy-agent as an option.
+        return {"ok": False, "error": f"Invalid agent name: {agent_name!r}"}
+    cmd = ["omarchy-agent", "--pick"] if not agent_name else ["omarchy-agent", "--", agent_name]
     try:
         subprocess.Popen(cmd)
         return {"ok": True, "command": cmd}
@@ -5179,7 +5286,15 @@ def _flush_and_exit(code: int = 0) -> None:
 
 def main() -> None:
     if len(sys.argv) < 2 or sys.argv[1] in ("fetch", "status", "--json", "-j"):
-        data = fetch_all_agents()
+        try:
+            data = fetch_all_agents()
+        except Exception as e:  # noqa: BLE001 — the panel needs a valid object
+            # A traceback leaves the panel parsing nothing, so it keeps showing
+            # the previous snapshot (statuses and kill targets included) with no
+            # sign that the tick failed.
+            print(json.dumps({"ok": False, "error": f"status collection failed: {e}"}))
+            _flush_and_exit(1)
+            return
         print(dump_status_json(data))
         _flush_and_exit(0)
         return

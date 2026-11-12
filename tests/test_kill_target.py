@@ -143,26 +143,71 @@ class HerdrCoreTargets(KillTargetCase):
         self.addCleanup(patcher.stop)
 
     def test_successful_terminal_kill(self):
-        res = ac.kill_target("herdr-core:t7")
+        res = ac.kill_target("herdr-core:default:t7")
         self.assertTrue(res["ok"], res)
         self.assertEqual(self.socket_calls, [("terminal.kill", {"terminal": "t7"})])
 
     def test_rpc_error_is_reported(self):
         self.socket_reply = {"id": "test", "error": {"code": -32000, "message": "no terminal \"t7\""}}
-        res = ac.kill_target("herdr-core:t7")
+        res = ac.kill_target("herdr-core:default:t7")
         self.assertFalse(res["ok"])
         self.assertIn("no terminal", res["error"])
 
     def test_malformed_address_is_rejected(self):
-        res = ac.kill_target("herdr-core:t7; rm -rf /")
+        res = ac.kill_target("herdr-core:default:t7; rm -rf /")
         self.assertFalse(res["ok"])
         self.assertEqual(self.socket_calls, [])
 
     def test_missing_core_socket_is_reported(self):
         with mock.patch.object(ac, "herdr_core_sockets", return_value=[]):
-            res = ac.kill_target("herdr-core:t7")
+            res = ac.kill_target("herdr-core:default:t7")
         self.assertFalse(res["ok"])
         self.assertEqual(self.socket_calls, [])
+
+    def test_bare_address_is_refused_while_several_cores_are_live(self):
+        # Two cores both own a 't7': without a core in the target there is no
+        # safe choice, so the kill is refused instead of guessing.
+        calls = []
+        self.socket_send = lambda method, params: calls.append((method, params))
+        with mock.patch.object(ac, "herdr_core_sockets",
+                               return_value=["/run/user/1000/herdr-core/aaa.sock",
+                                             "/run/user/1000/herdr-core/zzz.sock"]):
+            res = ac.kill_target("herdr-core:t7")
+        self.assertFalse(res["ok"])
+        self.assertIn("must name its core", res["error"])
+        self.assertEqual(calls, [])
+
+    def test_kill_goes_only_to_the_card_core(self):
+        # The card came from zzz; aaa refuses the same address. The kill must
+        # never fall through to aaa (that terminated an unrelated agent and
+        # reported success for the card the user clicked).
+        seen = []
+
+        def fake_query(method, params=None, timeout=1.0, sock_path=None):
+            seen.append((sock_path, method, params))
+            if sock_path.endswith("aaa.sock"):
+                return {"id": "x", "error": {"code": -32000, "message": 'no terminal "t7"'}}
+            return {"id": "x", "result": {}}
+
+        with mock.patch.object(ac, "herdr_core_sockets",
+                               return_value=["/run/user/1000/herdr-core/aaa.sock",
+                                             "/run/user/1000/herdr-core/zzz.sock"]), \
+             mock.patch.object(ac, "query_herdr_socket", side_effect=fake_query):
+            res = ac.kill_target("herdr-core:zzz:t7")
+        self.assertTrue(res["ok"], res)
+        self.assertEqual([s for s, _m, _p in seen], ["/run/user/1000/herdr-core/zzz.sock"])
+
+    def test_refusal_on_the_card_core_is_not_retried_elsewhere(self):
+        def fake_query(method, params=None, timeout=1.0, sock_path=None):
+            return {"id": "x", "error": {"code": -32000, "message": 'no terminal "t7"'}}
+
+        with mock.patch.object(ac, "herdr_core_sockets",
+                               return_value=["/run/user/1000/herdr-core/aaa.sock",
+                                             "/run/user/1000/herdr-core/zzz.sock"]), \
+             mock.patch.object(ac, "query_herdr_socket", side_effect=fake_query):
+            res = ac.kill_target("herdr-core:zzz:t7")
+        self.assertFalse(res["ok"])
+        self.assertIn("no terminal", res["error"])
 
 
 class ProcessTargets(KillTargetCase):

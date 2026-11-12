@@ -53,6 +53,14 @@ Panel {
   property string lastFocusedPane: ""
   property string killError: ""
 
+  // herdr-core status churns ('done' flips to idle as soon as the user looks),
+  // so a conditional tab can vanish under the pointer: the list then showed
+  // nothing with no chip highlighted.
+  onSummaryChanged: {
+    if (root.selectedFilter === "completed" && !(root.summary.completed > 0)) root.selectedFilter = "all"
+    if (root.selectedFilter === "waiting" && !(root.summary.waiting > 0)) root.selectedFilter = "all"
+  }
+
   readonly property var filteredAgents: {
     var list = root.agents || []
     if (root.selectedFilter === "working") {
@@ -237,6 +245,19 @@ Panel {
 
   Process {
     id: focusProc
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: {
+        // A refused focus (no herdr-app on PATH, headless core) used to be
+        // invisible: the popup closed and the click looked like a dead UI.
+        try {
+          var res = JSON.parse(text || "{}")
+          root.killError = res.ok ? "" : String(res.error || "focus failed")
+        } catch (e) {
+          root.killError = "focus produced no usable reply"
+        }
+      }
+    }
   }
 
   Process {

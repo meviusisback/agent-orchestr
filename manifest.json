@@ -34,7 +34,7 @@
         "key": "refreshIntervalSec",
         "type": "integer",
         "label": "Refresh interval (seconds)",
-        "min": 1,
+        "min": 3,
         "max": 60,
         "step": 1,
         "defaultValue": 3,

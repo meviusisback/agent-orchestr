@@ -101,7 +101,12 @@ class TestDiscoveryRegression(unittest.TestCase):
              mock.patch.object(ac, "_collect_peer_cards", return_value=([], [])), \
              mock.patch.object(ac, "query_orca_terminals", return_value=[]):
             data = ac.fetch_all_agents()
-        self.assertEqual([a["pane_id"] for a in data["agents"]], ["herdr-core:t7", "herdr-core:t10"])
+        # The card carries the core it came from: terminal addresses are
+        # allocated per core, so a bare "herdr-core:t7" cannot be acted on
+        # when more than one core is live.
+        self.assertEqual([a["pane_id"] for a in data["agents"]],
+                         ["herdr-core:default:t7", "herdr-core:default:t10"])
+        self.assertEqual([a["herdr_session"] for a in data["agents"]], ["default", "default"])
         omp, hermes = data["agents"]
         self.assertEqual((omp["agent"], omp["status"], omp["workspace"], omp["tab"]), ("omp", "working", "shop", "Oh My Pi"))
         self.assertEqual((omp["model"], omp["can_focus"], omp["can_control"]), ("model-x", True, True))
