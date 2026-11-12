@@ -3166,8 +3166,13 @@ def get_all_hermes_dbs(hermes_home: Optional[str] = None, hermes_profile: Option
     return dbs
 
 
+# The interactive TUI writes its own session source, and Hermes renamed it
+# across releases: older builds wrote `cli`/`tui`, current ones `local`.
+HERMES_TUI_SOURCES = ("local", "cli", "tui")
+
+
 def extract_hermes_session_info(
-    source_preference: Optional[str] = None,
+    source_preference: Optional[Union[str, Sequence[str]]] = None,
     specific_session_id: Optional[str] = None,
     min_start_time: Optional[float] = None,
     hermes_home: Optional[str] = None,
@@ -3179,6 +3184,11 @@ def extract_hermes_session_info(
     message stream state to accurately determine working, waiting, or idle status.
     """
     now = time.time()
+    sources: Tuple[str, ...] = ()
+    if isinstance(source_preference, str):
+        sources = (source_preference,)
+    elif source_preference:
+        sources = tuple(str(src) for src in source_preference if src)
     all_dbs = get_all_hermes_dbs(hermes_home, hermes_profile)
     if not all_dbs:
         return None, None, None, None, None, None, False
@@ -3216,10 +3226,11 @@ def extract_hermes_session_info(
                     "SELECT id, source, title, model, billing_provider, profile_name, last_activity_at FROM sessions WHERE profile_name = ? ORDER BY last_activity_at DESC LIMIT 5;",
                     (hermes_profile,),
                 )
-            elif source_preference:
+            elif sources:
+                placeholders = ", ".join("?" for _ in sources)
                 cur.execute(
-                    "SELECT id, source, title, model, billing_provider, profile_name, last_activity_at FROM sessions WHERE source = ? ORDER BY last_activity_at DESC LIMIT 5;",
-                    (source_preference,)
+                    f"SELECT id, source, title, model, billing_provider, profile_name, last_activity_at FROM sessions WHERE source IN ({placeholders}) ORDER BY last_activity_at DESC LIMIT 5;",
+                    sources,
                 )
             else:
                 cur.execute(
@@ -3249,9 +3260,9 @@ def extract_hermes_session_info(
     if not candidates:
         return None, None, None, None, None, None, False
 
-    # If source_preference is given, strictly filter to matching source if any exist
-    if source_preference:
-        matching = [c for c in candidates if c.get("source") == source_preference]
+    # If source_preference is given, strictly filter to matching sources if any exist
+    if sources:
+        matching = [c for c in candidates if c.get("source") in sources]
         if matching:
             candidates = matching
 
@@ -3722,7 +3733,7 @@ def scan_orca_agents(claimed_sessions: Set[str]) -> List[Dict[str, Any]]:
                 elif agent_type == "grok":
                     user_goal, detail_text, model_name, status_override, has_question = extract_grok_task_from_session(session_path)
                 elif agent_type == "hermes":
-                    _, model_name, _, _, detail_text, status_override, has_question = extract_hermes_session_info(source_preference="cli")
+                    _, model_name, _, _, detail_text, status_override, has_question = extract_hermes_session_info(source_preference=HERMES_TUI_SOURCES)
             elif agent_type == "omp":
                 model_name = get_omp_default_model()
 
@@ -4037,7 +4048,7 @@ def scan_standalone_agents(herdr_server_pids: List[int], seen_cwds: Set[str], cl
                     elif agent_type == "hermes":
                         p_st = get_process_start_time(pid)
                         user_goal, model_name, _, _, detail_text, status_override, has_question = extract_hermes_session_info(
-                            source_preference="cli", min_start_time=p_st, hermes_home=get_process_hermes_home(pid)
+                            source_preference=HERMES_TUI_SOURCES, min_start_time=p_st, hermes_home=get_process_hermes_home(pid)
                         )
                 else:
                     if agent_type == "omp":
@@ -4299,7 +4310,7 @@ def fetch_all_agents() -> Dict[str, Any]:
                 if is_hermes_desktop:
                     user_goal, model_name, _, _, detail_text, status_override, has_question = extract_hermes_session_info(source_preference="desktop", min_start_time=hermes_p_start, hermes_profile=hermes_profile)
                 else:
-                    user_goal, model_name, _, _, detail_text, status_override, has_question = extract_hermes_session_info(source_preference="cli", min_start_time=hermes_p_start, hermes_profile=hermes_profile)
+                    user_goal, model_name, _, _, detail_text, status_override, has_question = extract_hermes_session_info(source_preference=HERMES_TUI_SOURCES, min_start_time=hermes_p_start, hermes_profile=hermes_profile)
             is_generic_title = cleaned_title in (repo_name, "~", "tmp", "/tmp", "") or cleaned_title.startswith("/tmp") or cleaned_title.startswith("alberto@")
 
             if user_goal:
@@ -4433,7 +4444,7 @@ def fetch_all_agents() -> Dict[str, Any]:
                     model_name = model_name or get_omp_default_model()
             elif agent_type == "hermes":
                 user_goal, model_name, _, _, detail_text, status_override, has_question = extract_hermes_session_info(
-                    source_preference="desktop" if is_hermes_desktop else "cli",
+                    source_preference="desktop" if is_hermes_desktop else HERMES_TUI_SOURCES,
                     min_start_time=get_process_start_time(foreground_pid) if foreground_pid else None,
                     hermes_profile=hermes_profile_from_argv(foreground_argv),
                 )
