@@ -62,6 +62,45 @@ class TestHermesActivity(unittest.TestCase):
         self.assertEqual(ac.normalize_herdr_status("unknown"), "unknown")
         self.assertEqual(ac.normalize_herdr_status("new_status"), "unknown")
 
+    def test_current_tui_source_wins_over_retired_cli_sessions(self):
+        """Hermes renamed the TUI session source: newest `local` must win."""
+        import sqlite3
+        import tempfile
+        import time
+
+        with tempfile.TemporaryDirectory() as tmp:
+            db = os.path.join(tmp, "state.db")
+            conn = sqlite3.connect(db)
+            conn.executescript(
+                """
+                CREATE TABLE sessions (id TEXT PRIMARY KEY, source TEXT, title TEXT, model TEXT,
+                    billing_provider TEXT, profile_name TEXT, last_activity_at REAL);
+                CREATE TABLE messages (id INTEGER PRIMARY KEY, session_id TEXT, role TEXT,
+                    content TEXT, tool_name TEXT, tool_calls TEXT, finish_reason TEXT, display_kind TEXT);
+                """
+            )
+            now = time.time()
+            conn.execute(
+                "INSERT INTO sessions VALUES ('old-cli', 'cli', 'old task', 'muse-spark-1.3-contributor', 'p', 'default', ?)",
+                (now - 86400 * 20,),
+            )
+            conn.execute(
+                "INSERT INTO sessions VALUES ('tui', 'local', 'Fix the thing', 'deepseek-v4.1-flash', 'opencode-go', 'default', ?)",
+                (now,),
+            )
+            conn.execute("INSERT INTO messages VALUES (1, 'tui', 'user', 'fix it', NULL, NULL, NULL, NULL)")
+            conn.execute("INSERT INTO messages VALUES (2, 'tui', 'assistant', 'Done.', NULL, NULL, 'stop', NULL)")
+            conn.commit()
+            conn.close()
+
+            prompt, model, _provider, _profile, _detail, _status, _has_q = ac.extract_hermes_session_info(
+                source_preference=ac.HERMES_TUI_SOURCES,
+                min_start_time=now - 60,
+                hermes_home=tmp,
+            )
+        self.assertEqual(model, "deepseek-v4.1-flash")
+        self.assertEqual(prompt, "fix it")
+
     def test_hermes_tui_label_and_screen_status_are_normalized(self):
         self.assertEqual(ac.normalize_hermes_agent("hermes tui"), "hermes")
         self.assertEqual(ac.hermes_screen_status("\u23f3 Running tool: terminal"), "working")
