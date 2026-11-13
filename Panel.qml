@@ -202,6 +202,18 @@ Panel {
     // collector itself is Quickshell's direct child. That matters for the stall
     // timer below: terminating the process only signals the direct child, and a
     // shell wrapper would leave the real collector running and leaked.
+    // The Orca CLI is the child that could outlive a killed collector; it is
+    // tied to this process, however: it runs in its own session, a failed call (timeout,
+    // cap, non-zero exit) kills that whole group while this collector is alive,
+    // and the CLI itself carries PR_SET_PDEATHSIG — so terminating this
+    // collector, however this timer does it, takes the CLI down with it. A
+    // clean poll kills nothing: whatever the runtime left in the CLI's session
+    // is its own daemon. Helpers the CLI forks are covered only by the in-band
+    // group kill (PDEATHSIG is cleared for the children of fork()), so a helper
+    // that holds the pipe can still outlive a panel kill.
+    // The other external calls this status tick makes carry per-call wall-clock
+    // budgets but no lifetime tie: their budgets are enforced by this collector,
+    // so a tick this timer kills can leave one (an in-flight ssh) running.
     command: root.cliArgv("status")
     stdout: StdioCollector {
       waitForEnd: true
@@ -230,6 +242,15 @@ Panel {
   // "Loading…" forever: fetchStatus() no-ops while fetchProc.running, so a
   // Process that never exits can't be re-run. Give up on one that overstays,
   // exactly as the shell's own widgets do, and keep trying on the next tick.
+  // This is a last-resort backstop, not a control loop of its own: there is no
+  // global tick deadline, and the per-call budgets in agent_ctl.py add up, so a
+  // multi-surface degraded tick (a wedged Orca probe ~4.6s, peer probes 4s, an
+  // SSH wave 2.5s per batch of eight, herdr sockets ~1s each, plus a 1s
+  // detection read per Hermes pane and 2.5s per remote machine with panes) can
+  // still reach this interval and lose its reply. What it must never do is stay
+  // stuck: a lost tick is retried, and the Orca CLI itself dies with the killed
+  // collector (see the lifetime note above; a helper it forked and left holding
+  // the pipe can still survive).
   Timer {
     id: fetchStallTimer
     interval: 18000

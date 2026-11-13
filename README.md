@@ -122,6 +122,7 @@ python3 tests/test_claude_hook_argv.py
 python3 tests/test_discovery_regression.py
 python3 tests/test_hermes_activity.py
 python3 tests/test_remote_sources.py
+python3 tests/test_orca_cli_bounds.py      # Orca CLI bounds, group kill, PDEATHSIG
 ```
 
 ## Removal

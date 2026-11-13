@@ -9,6 +9,7 @@ Discovers and manages AI agents across:
 5. Remote Hermes peers (gateways registered with `hermes peer add`, read-only)
 """
 
+import ctypes
 import glob
 import http.client
 import ipaddress
@@ -3498,7 +3499,13 @@ def shorten_path(path: str) -> str:
 # be collected here.
 
 ORCA_CLI = os.environ.get("ORCA_CLI_PATH", "orca")
-_ORCA_CACHE: Dict[str, Any] = {"ts": 0.0, "terminals": []}
+_ORCA_CACHE: Dict[str, Any] = {
+    "ts": 0.0,
+    "failed_ts": 0.0,
+    "failed_tick": -1,
+    "tick": 0,
+    "terminals": [],
+}
 _ORCA_CACHE_TTL = 5.0  # seconds; keeps repeated fetch cycles cheap
 
 # Map an Orca terminal to a known agent type from its cleaned title. Titles
@@ -3669,6 +3676,18 @@ def classify_orca_terminal(term: Dict[str, Any]) -> Optional[str]:
 _ORCA_MAX_BYTES = 256 * 1024  # 256 KiB hard cap on raw CLI output
 _ORCA_MAX_TERMINALS = 64      # maximum terminals to retain from one fetch
 _ORCA_MAX_FIELD = 4096        # per-field string cap (preview, title, etc.)
+_ORCA_KILL_GRACE = 0.2        # seconds between SIGTERM and SIGKILL for a wedged CLI
+
+# libc is already loaded in this interpreter; prctl is only reachable through it.
+_PR_SET_PDEATHSIG = 1
+_ORCA_CLI_START_FAILED = 127
+try:
+    _LIBC = ctypes.CDLL(None, use_errno=True)
+    # Resolve the callable HERE, at import time: a first-time ctypes attribute
+    # lookup inside the forked child allocates and can deadlock at fork.
+    _PRCTL = _LIBC.prctl
+except (OSError, AttributeError):  # pragma: no cover - non-glibc platform
+    _PRCTL = None
 
 
 def _cap_fields(term: Dict[str, Any]) -> Dict[str, Any]:
@@ -3680,6 +3699,128 @@ def _cap_fields(term: Dict[str, Any]) -> Dict[str, Any]:
     return term
 
 
+def _orca_child_preexec(parent_pid: int):
+    """Build the pre-exec hook that ties the CLI's life to this collector.
+
+    Quickshell's Process only signals its direct child (this collector), so a
+    stalled or wedged `orca` would otherwise outlive the tick that spawned it
+    and accumulate across stall-timer retries. PR_SET_PDEATHSIG survives
+    execve, so the CLI process itself is killed by the kernel whenever this
+    process dies — including the SIGKILL the panel sends when it gives up,
+    which no Python-side cleanup can catch. Scope matters: fork(2) clears the
+    flag for the CLI's own children, so those are covered only by the in-band
+    process-group kill below, which needs this process alive to run. The
+    getppid() check closes the race where the parent died between fork() and
+    prctl().
+
+    The hook does no work beyond the bound prctl callable: it runs in the
+    forked child before exec, where importing, attribute lookup or locking can
+    deadlock.
+    """
+    def _preexec() -> None:
+        if _PRCTL is not None:
+            try:
+                _PRCTL(_PR_SET_PDEATHSIG, signal.SIGKILL, 0, 0, 0)
+            except Exception:
+                pass
+        if os.getppid() != parent_pid:
+            os._exit(_ORCA_CLI_START_FAILED)
+    return _preexec
+
+
+def _orca_group_alive(pgid: int) -> bool:
+    """True while any process still lives in the CLI's process group."""
+    try:
+        os.killpg(pgid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:  # pragma: no cover - our own process group only
+        return True
+
+
+def _kill_orca_process_group(proc: "subprocess.Popen[bytes]") -> None:
+    """Kill the CLI's whole process group (it leads its own session) and reap.
+
+    The group — not just the direct child — is what gets signaled, and the
+    escalation keeps going until the GROUP is empty: a child that survives
+    SIGTERM (or ignores it) is still there after the direct child was reaped,
+    and leaving it would hand the next retry a stray process. Only this call
+    reaches the CLI's helpers, because PR_SET_PDEATHSIG is cleared for the
+    children of fork(2).
+
+    With start_new_session the CLI is a session leader, so it cannot leave
+    this group (setsid/setpgid both fail EPERM for it) and a group holding it
+    cannot make killpg raise ESRCH. The direct-child kill after the loop is
+    therefore only a last-resort net for the case where the group check and the
+    signal disagree; it is never the primary mechanism.
+    """
+    for sig in (signal.SIGTERM, signal.SIGKILL):
+        if not _orca_group_alive(proc.pid):
+            break
+        try:
+            os.killpg(proc.pid, sig)
+        except ProcessLookupError:
+            break
+        except PermissionError:
+            try:
+                proc.kill()
+            except (ProcessLookupError, PermissionError):
+                pass
+        # Reap the direct child inside the grace window; the group check at
+        # the top of the next pass decides whether a survivor needs SIGKILL.
+        try:
+            proc.wait(timeout=_ORCA_KILL_GRACE)
+        except subprocess.TimeoutExpired:
+            pass
+    if proc.poll() is None:  # still alive after the group kill: last resort
+        try:
+            proc.kill()
+        except (ProcessLookupError, PermissionError):
+            pass
+    try:
+        proc.wait(timeout=_ORCA_KILL_GRACE)
+    except subprocess.TimeoutExpired:  # pragma: no cover - SIGKILL unkillable only
+        pass
+
+
+def _drain_orca_stdout(proc: "subprocess.Popen[bytes]", deadline: float) -> Tuple[bytes, str]:
+    """Read stdout until EOF, the byte cap, or the wall-clock deadline.
+
+    Returns (bytes, reason) with reason in {"eof", "timeout", "overflow"}.
+    The read is non-blocking and deadline-aware on purpose: a blocking
+    read(n) parks forever when the producer holds the pipe open without
+    writing, so a `timeout` applied only to wait() would never fire. Nothing
+    here sleeps past `deadline`, so one tick can never wedge the collector.
+    """
+    if proc.stdout is None:  # pragma: no cover - Popen(stdout=PIPE) sets it
+        raise RuntimeError("orca CLI stdout pipe was not created")
+    os.set_blocking(proc.stdout.fileno(), False)
+    selector = selectors.DefaultSelector()
+    selector.register(proc.stdout, selectors.EVENT_READ)
+    chunks: List[bytes] = []
+    total = 0
+    try:
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return b"".join(chunks), "timeout"
+            if not selector.select(remaining):
+                return b"".join(chunks), "timeout"
+            try:
+                chunk = os.read(proc.stdout.fileno(), min(8192, _ORCA_MAX_BYTES + 1 - total))
+            except BlockingIOError:
+                continue
+            if not chunk:
+                return b"".join(chunks), "eof"
+            chunks.append(chunk)
+            total += len(chunk)
+            if total > _ORCA_MAX_BYTES:
+                return b"".join(chunks)[:_ORCA_MAX_BYTES], "overflow"
+    finally:
+        selector.close()
+
+
 def query_orca_terminals(timeout: float = 4.0) -> List[Dict[str, Any]]:
     """Return the live terminals known to the Orca runtime, cached briefly.
 
@@ -3688,42 +3829,96 @@ def query_orca_terminals(timeout: float = 4.0) -> List[Dict[str, Any]]:
     endpoint cannot exhaust memory before JSON parsing.  Terminal count
     and per-field sizes are also capped.
 
+    `timeout` is one wall-clock budget for the whole invocation — spawn,
+    read and exit — not a wait() applied after an unbounded read, so a
+    stalled runtime that holds stdout open without writing cannot park this
+    collector. The budget is measured from before Popen, except for Popen's
+    own fork/exec step, which cannot be interrupted from this thread.
+
+    A FAILED call (timeout, cap, non-zero exit) loses its whole process GROUP
+    while this collector is alive (the CLI leads its own session), which is
+    what reaches the helpers it may have forked — including a CLI that already
+    exited with a helper holding the pipe. A clean poll kills nothing: whatever
+    the CLI leaves in its own session then belongs to the runtime (an
+    auto-started daemon that did not detach), not to this probe.
+
+    The CLI process itself carries PR_SET_PDEATHSIG, so it dies even when the
+    panel SIGKILLs this collector; its fork()ed helpers are covered only by the
+    in-band group kill above. Repeated FAILED retries therefore cannot
+    accumulate Orca processes; what a clean poll leaves behind is the runtime's
+    daemon and is not collected here.
+
+    Known trade-off: if the CLI auto-starts a runtime daemon that stays in this
+    session (does not double-fork into its own), a FAILED call takes that daemon
+    down too. That is deliberate — the alternative is leaving, on every retry,
+    exactly the helper processes this scan was blocked for — and it can only
+    happen on a call that already failed.
+
+    A failure is remembered for the rest of the tick (a tick calls this twice —
+    the roster scan and the `orca_connected` probe) and for _ORCA_CACHE_TTL
+    seconds of wall clock, so a wedged runtime cannot spend two full budgets
+    plus kill overhead inside Panel.qml's stall timer. The tick identity is
+    bumped by fetch_all_agents(), so a tick whose other stages overrun the TTL
+    still does not re-probe what already failed.
+
     On success the result is cached for _ORCA_CACHE_TTL seconds.  On
-    failure (CLI missing, timeout, non-JSON) we do NOT poison the cache
-    with an empty list — instead we return the most recent good result
-    (or [] on the very first call) and leave the cache untouched, so a
-    transient Orca CLI hang can't blank out the roster for the whole TTL.
+    failure (CLI missing, timeout, non-JSON) we do NOT poison the roster —
+    the most recent good result (or [] on the very first call) is returned
+    and its timestamp is left alone, so a transient Orca CLI hang can't blank
+    out the roster for the whole TTL. Only the failure back-off is recorded.
     """
     now = time.monotonic()
     if now - _ORCA_CACHE["ts"] < _ORCA_CACHE_TTL:
         return _ORCA_CACHE["terminals"]
+    if (_ORCA_CACHE["failed_tick"] == _ORCA_CACHE["tick"]
+            or now - _ORCA_CACHE["failed_ts"] < _ORCA_CACHE_TTL):
+        # This tick (or the last few seconds) already failed: serve
+        # last-known-good instead of paying the budget twice. The roster is
+        # never blanked by this. The tick arm is released only by the bump in
+        # fetch_all_agents(), so a caller outside a status build must not rely
+        # on it — the wall-clock arm is the always-available release.
+        return _ORCA_CACHE["terminals"]
 
     terminals: List[Dict[str, Any]] = []
+    failure = True
     try:
+        deadline = time.monotonic() + timeout
+        parent_pid = os.getpid()
         proc = subprocess.Popen(
             [ORCA_CLI, "terminal", "list", "--json"],
+            stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,
-            text=True,
+            start_new_session=True,
+            preexec_fn=_orca_child_preexec(parent_pid),
         )
-        # Read at most _ORCA_MAX_BYTES from stdout so the producer cannot
-        # exhaust memory regardless of how much it writes.
-        chunks: List[str] = []
-        total = 0
-        while total < _ORCA_MAX_BYTES:
-            remaining = _ORCA_MAX_BYTES - total
-            chunk = proc.stdout.read(min(8192, remaining))
-            if not chunk:
-                break
-            chunks.append(chunk)
-            total += len(chunk)
         try:
-            proc.wait(timeout=timeout)
-        except subprocess.TimeoutExpired:
-            proc.kill()
-            proc.wait()
+            stdout_bytes, reason = _drain_orca_stdout(proc, deadline)
+            if reason == "eof":
+                # stdout closed: the CLI is done or about to exit, and the
+                # only thing left to spend the budget on is its exit status.
+                try:
+                    proc.wait(timeout=max(0.01, deadline - time.monotonic()))
+                except subprocess.TimeoutExpired:
+                    reason = "timeout"
+            failure = reason != "eof" or proc.returncode != 0
+        finally:
+            # A FAILED call loses its whole group, and this is NOT gated on the
+            # leader being alive: a CLI that already exited while a helper kept
+            # stdout open must still lose that helper. A clean poll signals
+            # nothing — leftovers in the CLI's session are the runtime's, not
+            # this probe's — and its leader is already reaped above, so no
+            # pgid is signalled after its pid could have been recycled.
+            if failure:
+                _kill_orca_process_group(proc)
+            if proc.stdout is not None:
+                proc.stdout.close()
+
+        if reason == "timeout":
             raise subprocess.TimeoutExpired(proc.args, timeout)
-        stdout = "".join(chunks)
+        if reason == "overflow":
+            raise ValueError(f"orca terminal list exceeded {_ORCA_MAX_BYTES} bytes")
+        stdout = stdout_bytes.decode("utf-8", errors="replace")
 
         if proc.returncode == 0 and stdout.strip():
             payload = json.loads(stdout)
@@ -3749,8 +3944,13 @@ def query_orca_terminals(timeout: float = 4.0) -> List[Dict[str, Any]]:
         # Non-JSON output, transient runtime errors, etc. -> treat as no data.
         print(f"agent_ctl: orca terminal list failed ({e}); serving last-known-good", file=sys.stderr)
 
-    # Failure path: return the last good cache (may be [] on first call) without
-    # refreshing the timestamp, so the next cycle retries the CLI promptly.
+    # Failure path: return the last good roster (may be [] on first call) and
+    # never refresh its timestamp, but do record the failure so the second call
+    # in this tick serves the roster instead of re-paying the deadline.
+    # Stamped at failure time, not at entry: the back-off must not shrink by
+    # however long the failed call took.
+    _ORCA_CACHE["failed_ts"] = time.monotonic()
+    _ORCA_CACHE["failed_tick"] = _ORCA_CACHE["tick"]
     return _ORCA_CACHE["terminals"]
 
 
@@ -4236,6 +4436,9 @@ def fetch_all_agents() -> Dict[str, Any]:
     # Grok session reads are budgeted per fetch cycle, so a large or hostile
     # $GROK_HOME cannot turn one tick into unbounded work.
     _GROK_BUDGET.reset()
+    # One status build is one tick: the Orca back-off is scoped to it, so a
+    # runtime that failed earlier in this tick is never probed again here.
+    _ORCA_CACHE["tick"] += 1
     herdr_pids = get_herdr_server_pids()
 
     agents_list = []
