@@ -22,6 +22,7 @@ import subprocess
 import sys
 import tempfile
 import textwrap
+import types
 import time
 import unittest
 from unittest import mock
@@ -30,12 +31,19 @@ REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
 def _load_agent_ctl():
-    spec = importlib.util.spec_from_file_location(
-        "agent_ctl_under_test", os.path.join(REPO_ROOT, "agent_ctl.py")
-    )
-    assert spec is not None and spec.loader is not None, "cannot load agent_ctl.py"
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
+    """Load agent_ctl.py from SOURCE, never from a bytecode cache.
+
+    The mutation sweep rewrites this file between runs, and two mutations can
+    produce the same file size: a pyc whose mtime (whole seconds) and size both
+    match would then hide the edit and report a guard as SURVIVED when it was
+    actually removed. Compiling the text we just read cannot go stale.
+    """
+    path = os.path.join(REPO_ROOT, "agent_ctl.py")
+    module = types.ModuleType("agent_ctl_under_test")
+    module.__file__ = path
+    with open(path, encoding="utf-8") as f:
+        code = compile(f.read(), path, "exec")
+    exec(code, module.__dict__)
     return module
 
 
@@ -95,8 +103,17 @@ class OrcaCliBoundsCase(unittest.TestCase):
             "ts": stale, "failed_ts": stale, "terminals": [],
             "failed_tick": -1, "tick": ac._ORCA_CACHE["tick"] + 1,
         })
+        # Every case is hermetic about the journal: nothing may land in the
+        # real $XDG_RUNTIME_DIR while the suite runs.
+        self._saved_journal_dir = ac._ORCA_JOURNAL_DIR
+        ac._ORCA_JOURNAL_DIR = self.dir
+
+    @property
+    def journal(self):
+        return ac._orca_journal_path()
 
     def tearDown(self):
+        ac._ORCA_JOURNAL_DIR = self._saved_journal_dir
         # Sweep the pidfile AND any forked kid: an assertion that fails before
         # a kid's cleanup is registered must not leave it sleeping for 120s.
         pids = self._all_pids()
@@ -495,6 +512,36 @@ class OrcaTickDeadlineCase(OrcaCliBoundsCase):
         ac._TICK_DEADLINE = None
         self.assertEqual(ac._tick_budget(4.0), 4.0)
 
+    def test_spawn_overrun_is_cleaned_up_in_band(self):
+        """A spawn that eats the budget must not leave a call for the watchdog.
+
+        The admission check runs before Popen; a paused scheduler or a slow exec
+        can cross the deadline during it, so the deadline is re-checked as soon
+        as the pid is known.
+        """
+        marker = os.path.join(self.dir, "drain-ran")
+        ac._TICK_DEADLINE = (time.monotonic() + ac._ORCA_MIN_BUDGET
+                             + ac._ORCA_CLEANUP_RESERVE + 0.02)
+        self._stub("time.sleep(120)\n")
+        real_popen = subprocess.Popen
+
+        def slow_popen(*args, **kwargs):
+            proc = real_popen(*args, **kwargs)
+            time.sleep(0.8)  # the spawn itself overran the tick deadline
+            return proc
+
+        def fake_drain(*args, **kwargs):
+            open(marker, "w").close()
+            return b"", "eof"
+
+        with mock.patch.object(ac.subprocess, "Popen", side_effect=slow_popen), \
+             mock.patch.object(ac, "_drain_orca_stdout", side_effect=fake_drain):
+            rows = ac.query_orca_terminals(timeout=30.0)
+        self.assertEqual(rows, [])
+        self.assertFalse(os.path.exists(marker), "the drain ran past the deadline")
+        self.assertTrue(_wait_gone(self._stub_pid()), "the overrun call was not cleaned up")
+        self.assertFalse(os.path.exists(self.journal), "the overrun call kept its record")
+
     def test_status_build_publishes_the_tick_deadline(self):
         """The deadline is set by fetch_all_agents, not derived per probe."""
         t0 = time.monotonic()
@@ -539,20 +586,12 @@ class OrcaOrphanJournalCase(OrcaCliBoundsCase):
 
     def setUp(self):
         super().setUp()
-        self._saved_journal_dir = ac._ORCA_JOURNAL_DIR
         self._saved_deadline = ac._TICK_DEADLINE
-        # The journal must never land in the real runtime dir during tests.
-        ac._ORCA_JOURNAL_DIR = self.dir
         ac._TICK_DEADLINE = None
 
     def tearDown(self):
-        ac._ORCA_JOURNAL_DIR = self._saved_journal_dir
         ac._TICK_DEADLINE = self._saved_deadline
         super().tearDown()
-
-    @property
-    def journal(self):
-        return ac._orca_journal_path()
 
     def _sleeping_group(self, ignore_sigterm=False):
         """A process in its own group that has ALREADY installed its handlers.
@@ -643,6 +682,27 @@ class OrcaOrphanJournalCase(OrcaCliBoundsCase):
         self.assertFalse(_wait_gone(proc.pid), "an expired record killed a live group")
         self.assertFalse(os.path.exists(self.journal))
 
+    def test_failed_record_write_leaves_the_previous_record_intact(self):
+        """The record is replaced atomically: a broken write cannot blank it.
+
+        An empty or partial record reads exactly like "no orphan", so a kill
+        between truncate and write would strand the helper this journal exists
+        to reap. The new record is written beside the old one and renamed.
+        """
+        proc = self._sleeping_group()
+        ac._orca_record_orphan(proc.pid)
+        before = ac._orca_read_orphan()
+        self.assertEqual(before[2], proc.pid)
+        other = self._sleeping_group()
+        with mock.patch.object(ac.os, "write", side_effect=OSError("ENOSPC")):
+            ac._orca_record_orphan(other.pid)
+        after = ac._orca_read_orphan()
+        self.assertIsNotNone(after, "a failed write destroyed the previous record")
+        self.assertEqual(after[2], proc.pid, "a failed write replaced the record")
+        self.assertEqual(after[1], before[1])
+        self.assertEqual([n for n in os.listdir(self.dir) if n.endswith(".tmp")], [],
+                         "a failed write left a temp file behind")
+
     def test_clean_poll_clears_its_record(self):
         payload = '{"ok": true, "result": {"terminals": []}}'
         self._stub(f"sys.stdout.write({payload!r})\nsys.stdout.flush()\n")
@@ -650,10 +710,13 @@ class OrcaOrphanJournalCase(OrcaCliBoundsCase):
         self.assertFalse(os.path.exists(self.journal),
                          "a clean poll left a record that would reap the runtime daemon")
 
-    def test_journaling_is_disabled_fail_closed_in_an_unsafe_directory(self):
-        os.chmod(self.dir, 0o777)
+    def test_journaling_is_disabled_for_a_group_readable_directory(self):
+        # 0755 has no group/other WRITE bit, so the ancestor rule allows it and
+        # only the held directory's owner-only rule can reject it.
+        os.chmod(self.dir, 0o755)
         self.addCleanup(os.chmod, self.dir, 0o700)
-        self.assertIsNone(ac._orca_journal_path())
+        self.assertIsNone(ac._orca_journal_hold_dir(),
+                          "a group-readable runtime dir was trusted")
         self._stub("time.sleep(120)\n")
         ac.query_orca_terminals(timeout=0.4)  # still works, just unjournaled
         self.assertEqual(self._spawn_count(), 1)
@@ -713,9 +776,30 @@ class OrcaOrphanJournalCase(OrcaCliBoundsCase):
         ac._ORCA_JOURNAL_DIR = link
         self.assertIsNone(ac._orca_journal_path(), "a symlinked runtime dir was trusted")
 
+    def test_journal_dir_under_a_writable_ancestor_is_refused(self):
+        outer = os.path.join(self.dir, "outer")
+        inner = os.path.join(outer, "inner")
+        os.makedirs(inner, mode=0o700)
+        os.chmod(outer, 0o777)
+        ac._ORCA_JOURNAL_DIR = inner
+        self.assertIsNone(ac._orca_journal_path(), "a writable ancestor was trusted")
+        self.assertIsNone(ac._orca_journal_hold_dir(), "a writable ancestor was trusted")
+
+    def test_journal_dir_under_a_symlinked_ancestor_is_refused(self):
+        real = os.path.join(self.dir, "real")
+        sub = os.path.join(real, "sub")
+        os.makedirs(sub, mode=0o700)
+        link = os.path.join(self.dir, "link")
+        os.symlink(real, link)
+        ac._ORCA_JOURNAL_DIR = os.path.join(link, "sub")
+        self.assertIsNone(ac._orca_journal_hold_dir(),
+                          "a symlinked ancestor was trusted")
+
     def test_journal_dir_owned_by_another_uid_is_refused(self):
         with mock.patch.object(ac.os, "geteuid", return_value=os.geteuid() + 1):
             self.assertIsNone(ac._orca_journal_path(),
+                              "a runtime dir owned by someone else was trusted")
+            self.assertIsNone(ac._orca_journal_hold_dir(),
                               "a runtime dir owned by someone else was trusted")
 
     def test_journal_dir_that_is_relative_is_refused(self):
@@ -725,6 +809,7 @@ class OrcaOrphanJournalCase(OrcaCliBoundsCase):
         self.addCleanup(os.chdir, previous)
         ac._ORCA_JOURNAL_DIR = "runtime"
         self.assertIsNone(ac._orca_journal_path(), "a relative runtime dir was trusted")
+        self.assertIsNone(ac._orca_journal_hold_dir(), "a relative runtime dir was trusted")
 
     def test_journal_dir_that_is_a_regular_file_is_refused(self):
         not_a_dir = os.path.join(self.dir, "not-a-dir")
@@ -733,6 +818,16 @@ class OrcaOrphanJournalCase(OrcaCliBoundsCase):
         os.chmod(not_a_dir, 0o600)
         ac._ORCA_JOURNAL_DIR = not_a_dir
         self.assertIsNone(ac._orca_journal_path(), "a non-directory runtime path was trusted")
+
+    def test_symlinked_record_is_never_followed(self):
+        proc = self._sleeping_group(ignore_sigterm=True)
+        ac._orca_record_orphan(proc.pid)          # a genuine, fresh record
+        real = os.path.join(self.dir, "real-record")
+        os.replace(self.journal, real)            # move it aside...
+        os.symlink(real, self.journal)            # ...and point the journal at it
+        self.assertFalse(ac._reap_orphan_orca_group())
+        time.sleep(0.2)
+        self.assertFalse(_wait_gone(proc.pid), "a symlinked record was followed")
 
     def test_journal_record_that_is_not_a_regular_file_is_ignored(self):
         os.mkdir(self.journal)
@@ -754,6 +849,97 @@ class OrcaOrphanJournalCase(OrcaCliBoundsCase):
         )
         time.sleep(0.2)
         self.assertFalse(_wait_gone(proc.pid), "a non-member was killed")
+
+    def test_pidfd_open_unavailable_never_signals(self):
+        """No pidfd, no signal: the numeric kill fallback is not allowed."""
+        proc = self._sleeping_group()
+        with mock.patch.object(ac, "_PIDFD_OPEN", None):
+            self.assertFalse(ac._signal_orca_group_member(proc.pid, proc.pid, signal.SIGKILL))
+        time.sleep(0.2)
+        self.assertFalse(_wait_gone(proc.pid), "signalled without a pidfd to pin the pid")
+
+    def test_pidfd_send_unavailable_never_signals(self):
+        proc = self._sleeping_group()
+        with mock.patch.object(ac, "_PIDFD_SEND", None):
+            self.assertFalse(ac._signal_orca_group_member(proc.pid, proc.pid, signal.SIGKILL))
+        time.sleep(0.2)
+        self.assertFalse(_wait_gone(proc.pid), "signalled without pidfd_send")
+
+    def test_a_leader_recycled_during_the_reap_aborts_it(self):
+        """The leader is re-read for every pass, not just once up front."""
+        proc = self._sleeping_group(ignore_sigterm=True)
+        ac._orca_record_orphan(proc.pid)
+        real = ac._proc_starttime
+
+        def fake(pid):
+            value = real(pid)
+            if pid == proc.pid and value is not None:
+                return value + 1  # a recycled leader: different start time
+            return value
+
+        with mock.patch.object(ac, "_proc_starttime", side_effect=fake):
+            self.assertFalse(ac._reap_orphan_orca_group())
+        time.sleep(0.2)
+        self.assertFalse(_wait_gone(proc.pid), "a recycled leader did not abort the reap")
+
+    def test_record_survives_until_the_call_is_verified_clean(self):
+        """EOF alone must not clear the record: the group can still be alive.
+
+        The CLI closes stdout, forks a SIGTERM-ignoring helper and keeps
+        running. The collector sees EOF and blocks in wait(); killing it there
+        used to leave the helper with no record at all.
+        """
+        kidfile = os.path.join(self.dir, "kid.pid")
+        eof_marker = os.path.join(self.dir, "eof.marker")
+        self._stub(f"""
+            kid = os.fork()
+            if kid == 0:
+                signal.signal(signal.SIGTERM, signal.SIG_IGN)
+                open({kidfile!r}, "w").write(str(os.getpid()))
+                time.sleep(120)
+                os._exit(0)
+            while not os.path.exists({kidfile!r}):
+                time.sleep(0.01)
+            os.close(1)                     # EOF, with no payload written
+            open({eof_marker!r}, "w").close()
+            time.sleep(120)                 # leader stays alive after EOF
+        """)
+        log = os.path.join(self.dir, "collector.log")
+        collector = textwrap.dedent(f"""
+            import importlib.util
+            spec = importlib.util.spec_from_file_location(
+                "ac", {os.path.join(REPO_ROOT, 'agent_ctl.py')!r})
+            m = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(m)
+            m.ORCA_CLI = {os.path.join(self.dir, 'stub.py')!r}
+            m._ORCA_JOURNAL_DIR = {self.dir!r}
+            open({log!r}, "w").write("ready")
+            m.query_orca_terminals(timeout=30)
+        """)
+        collector_proc = subprocess.Popen([sys.executable, "-c", collector])
+        self.addCleanup(lambda: collector_proc.poll() is None and collector_proc.kill())
+        deadline = time.monotonic() + 10.0
+        while time.monotonic() < deadline:
+            if (os.path.exists(eof_marker) and os.path.exists(self.journal)
+                    and os.path.exists(kidfile) and os.path.getsize(kidfile) > 0):
+                break
+            time.sleep(0.02)
+        else:
+            self.fail("the collector never reached EOF with a recorded group")
+        with open(kidfile) as f:
+            kid = int(f.read().strip())
+        self.addCleanup(lambda: os.path.exists(f"/proc/{kid}") and os.kill(kid, 9))
+        time.sleep(0.1)  # land the kill inside wait(), after EOF
+        collector_proc.kill()
+        collector_proc.wait(timeout=10)
+        self.assertTrue(os.path.exists(self.journal),
+                        "EOF cleared the only record of a still-live group")
+        self.assertTrue(_alive(kid), "the helper was expected to survive a SIGKILL")
+        payload = '{"ok": true, "result": {"terminals": []}}'
+        self._stub(f"sys.stdout.write({payload!r})\nsys.stdout.flush()\n")
+        ac.query_orca_terminals(timeout=4.0)
+        self.assertTrue(_wait_gone(kid), "the post-EOF helper was never reaped")
+        self.assertFalse(os.path.exists(self.journal))
 
     def test_helper_left_by_a_killed_collector_is_reaped_by_the_next_probe(self):
         """The block's exact end-to-end case, with the kill it needs to survive."""

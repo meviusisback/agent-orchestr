@@ -3791,26 +3791,83 @@ def _orca_journal_dir() -> str:
     return (os.environ.get("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}").strip()
 
 
-def _orca_journal_path() -> Optional[str]:
-    """Path of a usable orphan record, or None when the directory is unsafe.
+def _orca_dir_chain_trusted(directory: str) -> bool:
+    """Every component of `directory` must be a directory we can trust.
 
-    XDG_RUNTIME_DIR is config-supplied, so it gets the same treatment as any
-    other path from a setting: absolute, a real directory (lstat never reports
-    a directory for a symlink, so S_ISDIR alone rejects links), owned by this
-    uid, and not group/other accessible.
+    Validating only the leaf is not confinement: a writable or symlinked
+    ancestor lets another process redirect the path after the check. Each
+    component is lstat'ed (so a symlink anywhere fails), must be a directory
+    owned by root or by this uid, and must not be group/other writable — a
+    sticky bit is accepted because it already forbids renaming other users'
+    entries (that is why /tmp is a safe parent for a 0700 dir).
+    """
+    components = []
+    current = os.path.abspath(directory)
+    while True:
+        components.append(current)
+        parent = os.path.dirname(current)
+        if parent == current:
+            break
+        current = parent
+    for path in reversed(components):
+        try:
+            info = os.lstat(path)
+        except OSError:
+            return False
+        if not stat.S_ISDIR(info.st_mode):
+            return False
+        if info.st_uid not in (0, os.geteuid()):
+            return False
+        if info.st_mode & 0o022 and not info.st_mode & stat.S_ISVTX:
+            return False
+    return True
+
+
+def _orca_journal_path() -> Optional[str]:
+    """Path of the orphan record, or None when the directory is unsafe.
+
+    Path validation only. The record helpers below reopen the directory and
+    verify the object they actually hold, so this is for reporting and tests —
+    not the guard the file operations rely on.
     """
     directory = _orca_journal_dir()
     if not directory or not os.path.isabs(directory):
         return None
-    try:
-        info = os.lstat(directory)
-    except OSError:
-        return None
-    if not stat.S_ISDIR(info.st_mode):
-        return None
-    if info.st_uid != os.geteuid() or info.st_mode & 0o077:
+    if not _orca_dir_chain_trusted(directory):
         return None
     return os.path.join(directory, _ORCA_JOURNAL_NAME)
+
+
+def _orca_journal_hold_dir() -> Optional[int]:
+    """Open the validated runtime directory, or None when it is not usable.
+
+    Opened O_DIRECTORY|O_NOFOLLOW — a symlink cannot be entered — and fstat'ed
+    afterwards: the path checks can race with a rename, so the object actually
+    held must itself be a directory, owned by this uid and owner-only. Every
+    record operation goes through this fd, so a later swap of the path cannot
+    redirect it.
+    """
+    directory = _orca_journal_dir()
+    if not directory or not os.path.isabs(directory):
+        return None
+    if not _orca_dir_chain_trusted(directory):
+        return None
+    try:
+        fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    except OSError:
+        return None
+    try:
+        info = os.fstat(fd)
+    except OSError:
+        os.close(fd)
+        return None
+    # The uid/ancestor rules already ran on the path; this is the stricter
+    # owner-only rule for the object actually held. S_ISDIR is kept as a second
+    # net even though O_DIRECTORY above already refuses anything else.
+    if not stat.S_ISDIR(info.st_mode) or info.st_mode & 0o077:
+        os.close(fd)
+        return None
+    return fd
 
 
 def _proc_stat_fields(pid: int) -> Optional[List[bytes]]:
@@ -3870,45 +3927,85 @@ def _uptime_ms() -> Optional[int]:
 
 
 def _orca_record_orphan(pgid: int) -> None:
-    """Record the probe's process group so a later process can reap it."""
-    path = _orca_journal_path()
-    if path is None or pgid <= 1:
+    """Record the probe's process group so a later process can reap it.
+
+    Written in full to a sibling temp file and renamed into place through the
+    held directory fd: writing in place (O_TRUNC then write) would let a kill
+    between the two steps leave an empty or half-written record, which reads
+    exactly like "no orphan" and would strand the helper this file exists to
+    reap. Until the rename succeeds the previous record stays intact.
+    """
+    if pgid <= 1:
         return
     starttime = _proc_starttime(pgid)
     boot_id, uptime_ms = _boot_id(), _uptime_ms()
     if starttime is None or boot_id is None or uptime_ms is None:
         return  # nothing to verify a future reap against: write no guess
-    try:
-        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
-    except OSError:
+    payload = f"{boot_id} {uptime_ms} {pgid} {starttime}\n".encode("ascii")
+    dir_fd = _orca_journal_hold_dir()
+    if dir_fd is None:
         return
+    tmp_name = f"{_ORCA_JOURNAL_NAME}.{os.getpid()}.tmp"
     try:
-        os.write(fd, f"{boot_id} {uptime_ms} {pgid} {starttime}\n".encode("ascii"))
+        try:
+            fd = os.open(
+                tmp_name,
+                os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW,
+                0o600,
+                dir_fd=dir_fd,
+            )
+        except OSError:
+            return
+        try:
+            written = 0
+            while written < len(payload):
+                step = os.write(fd, payload[written:])
+                if step <= 0:
+                    raise OSError("short record write")
+                written += step
+        except OSError:
+            os.close(fd)
+            _orca_unlink_quietly(tmp_name, dir_fd)
+            return
+        os.close(fd)
+        try:
+            os.replace(tmp_name, _ORCA_JOURNAL_NAME,
+                       src_dir_fd=dir_fd, dst_dir_fd=dir_fd)
+        except OSError:
+            _orca_unlink_quietly(tmp_name, dir_fd)
+    finally:
+        os.close(dir_fd)
+
+
+def _orca_unlink_quietly(name: str, dir_fd: int) -> None:
+    try:
+        os.unlink(name, dir_fd=dir_fd)
     except OSError:
         pass
-    finally:
-        os.close(fd)
 
 
 def _orca_read_orphan() -> Optional[Tuple[str, int, int, int]]:
     """(boot id, uptime ms, pgid, starttime) from the record, or None."""
-    path = _orca_journal_path()
-    if path is None:
+    dir_fd = _orca_journal_hold_dir()
+    if dir_fd is None:
         return None
     try:
-        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
-    except OSError:
-        return None
-    try:
-        info = os.fstat(fd)
-        if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid()
-                or info.st_size > _ORCA_JOURNAL_MAX_BYTES):
+        try:
+            fd = os.open(_ORCA_JOURNAL_NAME, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=dir_fd)
+        except OSError:
             return None
-        data = os.read(fd, _ORCA_JOURNAL_MAX_BYTES)
-    except OSError:
-        return None
+        try:
+            info = os.fstat(fd)
+            if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid()
+                    or info.st_size > _ORCA_JOURNAL_MAX_BYTES):
+                return None
+            data = os.read(fd, _ORCA_JOURNAL_MAX_BYTES)
+        except OSError:
+            return None
+        finally:
+            os.close(fd)
     finally:
-        os.close(fd)
+        os.close(dir_fd)
     try:
         boot_id, uptime_s, pgid_s, start_s = data.decode("ascii", "strict").split()
         uptime_ms, pgid, starttime = int(uptime_s), int(pgid_s), int(start_s)
@@ -3920,13 +4017,13 @@ def _orca_read_orphan() -> Optional[Tuple[str, int, int, int]]:
 
 
 def _orca_clear_orphan() -> None:
-    path = _orca_journal_path()
-    if path is None:
+    dir_fd = _orca_journal_hold_dir()
+    if dir_fd is None:
         return
     try:
-        os.unlink(path)
-    except OSError:
-        pass
+        _orca_unlink_quietly(_ORCA_JOURNAL_NAME, dir_fd)
+    finally:
+        os.close(dir_fd)
 
 
 def _orca_group_member_pids(pgid: int) -> List[int]:
@@ -3958,32 +4055,28 @@ def _signal_orca_group_member(pid: int, pgid: int, sig: int) -> bool:
 
     The pidfd pins the process, and group membership is re-read AFTER the fd
     exists: a pid that left the group — or was recycled between enumeration and
-    here — fails the check and is skipped. Without pidfd support the best
-    fallback is a plain kill(), which keeps only the enumeration race.
+    here — fails the check and is skipped. pidfd support is REQUIRED (Linux
+    5.3+, Python 3.9+): without it the only thing left is a numeric kill()
+    after a non-atomic check, which can land on a recycled pid. The caller then
+    keeps the record untouched instead of signalling — fail closed.
     """
-    fd = -1
-    if _PIDFD_OPEN is not None:
-        try:
-            fd = _PIDFD_OPEN(pid)
-        except ProcessLookupError:
-            return False
-        except OSError:
-            fd = -1
-    if _proc_pgrp(pid) != pgid:
-        if fd >= 0:
-            os.close(fd)
+    if _PIDFD_OPEN is None or _PIDFD_SEND is None:
         return False
     try:
-        if fd >= 0 and _PIDFD_SEND is not None:
-            _PIDFD_SEND(fd, sig, None, 0)
-        else:
-            os.kill(pid, sig)
+        fd = _PIDFD_OPEN(pid)
+    except ProcessLookupError:
+        return False
+    except OSError:
+        return False
+    try:
+        if _proc_pgrp(pid) != pgid:
+            return False
+        _PIDFD_SEND(fd, sig, None, 0)
         return True
     except (ProcessLookupError, PermissionError, OSError):
         return False
     finally:
-        if fd >= 0:
-            os.close(fd)
+        os.close(fd)
 
 
 def _reap_orphan_orca_group() -> bool:
@@ -3995,7 +4088,9 @@ def _reap_orphan_orca_group() -> bool:
     numeric pgid cannot be recycled inside a couple of minutes without the
     kernel wrapping its pid space. Members are signalled individually through
     pidfds — never a blind killpg — so the check-then-kill race cannot land on
-    a process this probe never owned.
+    a process this probe never owned, and the leader is re-read before every
+    pass so a pgid recycled *during* the reap aborts it instead of inheriting
+    the signal.
     """
     record = _orca_read_orphan()
     if record is None:
@@ -4009,13 +4104,15 @@ def _reap_orphan_orca_group() -> bool:
             or now_ms - recorded_ms > _ORCA_JOURNAL_MAX_AGE * 1000):
         _orca_clear_orphan()
         return False
-    leader = _proc_starttime(pgid)
-    if leader is not None and leader != starttime:
-        _orca_clear_orphan()  # recycled pid: the group is somebody else's now
-        return False
-
     signalled = False
     for sig in (signal.SIGTERM, signal.SIGKILL):
+        # Re-read the leader for THIS pass: a pid recycled between passes looks
+        # exactly like ours to a pgrp scan, and only its start time tells them
+        # apart.
+        leader = _proc_starttime(pgid)
+        if leader is not None and leader != starttime:
+            _orca_clear_orphan()
+            return signalled
         members = _orca_group_member_pids(pgid)
         if not members:
             break
@@ -4152,12 +4249,14 @@ def query_orca_terminals(timeout: float = 4.0) -> List[Dict[str, Any]]:
 
     Inside a status build the call is also clamped to what is left of the tick
     budget, minus the time its own teardown needs: a probe that cannot finish
-    its group kill before Panel.qml's watchdog fires is never started, so the
-    watchdog can never be the thing that skips the cleanup. Only the bounded
-    phases (drain, wait, cleanup) are covered by that; Popen's fork/exec cannot
-    be interrupted from this thread, and at that point the CLI has not run yet,
-    so it has no helper to orphan. A direct call (no tick in progress) keeps the
-    caller's own budget.
+    its group kill before Panel.qml's watchdog fires is never started, and one
+    whose spawn overran the deadline is cleaned up in-band, so the watchdog is
+    never what ends a probe. One step is not bounded from inside this process:
+    Popen's fork/exec is uninterruptible, and between the child's exec and the
+    record write below there are a few bytecodes in which the CLI could fork a
+    helper. Closing that would need a supervisor process of its own — more
+    attack surface than the microseconds are worth — so it is stated here
+    instead of being claimed away.
 
     Known trade-off: if the CLI auto-starts a runtime daemon that stays in this
     session (does not double-fork into its own), a FAILED call takes that daemon
@@ -4229,14 +4328,21 @@ def query_orca_terminals(timeout: float = 4.0) -> List[Dict[str, Any]]:
         # evidence a later process would have of the group if this one dies.
         _orca_record_orphan(proc.pid)
         try:
+            # Popen returns once the child has execed, but a paused scheduler
+            # or a slow exec can spend the whole budget before we get here. The
+            # admission check above cannot see that, so re-check now that the
+            # pid is known: an overrun is cleaned up in-band instead of left
+            # running under a watchdog that is about to fire.
+            if time.monotonic() >= deadline:
+                raise subprocess.TimeoutExpired(proc.args, budget)
             stdout_bytes, reason = _drain_orca_stdout(proc, deadline)
             if reason == "eof":
                 # stdout closed: the CLI is done or about to exit, and the
                 # only thing left to spend the budget on is its exit status.
-                # Clear the record HERE: from EOF on, whatever still lives in
-                # the group is the runtime's daemon (a clean poll kills
-                # nothing), so a later reap must not touch it.
-                _orca_clear_orphan()
+                # The record stays through this wait on purpose: EOF says
+                # nothing about the group (a leader can close stdout, fork a
+                # helper and keep running), so only a verified clean exit may
+                # clear it.
                 try:
                     proc.wait(timeout=max(0.01, deadline - time.monotonic()))
                 except subprocess.TimeoutExpired:
@@ -4251,6 +4357,8 @@ def query_orca_terminals(timeout: float = 4.0) -> List[Dict[str, Any]]:
             # pgid is signalled after its pid could have been recycled.
             if failure:
                 _kill_orca_process_group(proc)
+                if not _orca_group_alive(proc.pid):
+                    _orca_clear_orphan()
             if proc.stdout is not None:
                 proc.stdout.close()
 
@@ -4275,6 +4383,10 @@ def query_orca_terminals(timeout: float = 4.0) -> List[Dict[str, Any]]:
                 # last-known-good branch below. Stamped at completion, not at
                 # entry: a 4 s success must not be re-probed by the second call
                 # in the same tick just because the TTL ran out meanwhile.
+                # This is the only place a clean call clears its record: the
+                # CLI exited 0 and its output parsed, so anything left in its
+                # session is the runtime's own daemon, not this probe's.
+                _orca_clear_orphan()
                 _ORCA_CACHE["ts"] = time.monotonic()
                 _ORCA_CACHE["terminals"] = terminals
                 return terminals
