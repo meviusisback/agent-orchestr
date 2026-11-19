@@ -3504,6 +3504,7 @@ _ORCA_CACHE: Dict[str, Any] = {
     "failed_ts": 0.0,
     "failed_tick": -1,
     "tick": 0,
+    "reap_tick": -1,
     "terminals": [],
 }
 _ORCA_CACHE_TTL = 5.0  # seconds; keeps repeated fetch cycles cheap
@@ -3678,6 +3679,26 @@ _ORCA_MAX_TERMINALS = 64      # maximum terminals to retain from one fetch
 _ORCA_MAX_FIELD = 4096        # per-field string cap (preview, title, etc.)
 _ORCA_KILL_GRACE = 0.2        # seconds between SIGTERM and SIGKILL for a wedged CLI
 
+# Panel.qml's fetchStallTimer gives one collection tick this long before it
+# kills the collector. The value is duplicated there as a literal interval and
+# a test parses it, so the two files cannot drift apart silently.
+PANEL_STALL_SECONDS = 18.0
+# One tick has to finish, cleanup included, inside that watchdog. This margin
+# covers the Orca probe's own teardown (2 x _ORCA_KILL_GRACE), an orphan reap
+# and the status payload dump.
+_TICK_SAFETY_MARGIN = 3.0
+_TICK_WALL_BUDGET = PANEL_STALL_SECONDS - _TICK_SAFETY_MARGIN
+# Held back from the tick deadline for the probe's teardown: a call admitted
+# without it could still be inside its finally block when the watchdog fires.
+_ORCA_CLEANUP_RESERVE = 2 * _ORCA_KILL_GRACE + 0.35
+_ORCA_MIN_BUDGET = 0.5        # a shorter drain cannot yield a usable roster
+# Monotonic deadline for the status build in progress; None outside one, which
+# keeps a verb's or a test's own budget authoritative. Every Quickshell poll is
+# a fresh process (main -> fetch_all_agents -> _flush_and_exit), so this is per
+# tick by construction: nothing in this cache is meant to survive a poll, and
+# the orphan journal is the only cross-process state.
+_TICK_DEADLINE: Optional[float] = None
+
 # libc is already loaded in this interpreter; prctl is only reachable through it.
 _PR_SET_PDEATHSIG = 1
 _ORCA_CLI_START_FAILED = 127
@@ -3737,6 +3758,285 @@ def _orca_group_alive(pgid: int) -> bool:
         return False
     except PermissionError:  # pragma: no cover - our own process group only
         return True
+
+
+# --- Orca probe orphan journal ------------------------------------------------
+#
+# The in-band group kill runs only while this collector is alive. If the panel
+# (or anything else) SIGKILLs it mid-probe, Python never reaches its finally
+# block, and PR_SET_PDEATHSIG reaches only the direct CLI: fork(2) clears the
+# flag for the CLI's own children. A surviving helper holds the stdout pipe, so
+# the next retry stalls the whole monitor again.
+#
+# The record below is the ONLY state that crosses a process boundary. It is
+# written once the CLI is spawned, cleared as soon as the call is known clean,
+# and reaped by the next probe otherwise — every panel poll is a separate,
+# short-lived process, so nothing in _ORCA_CACHE can do this job. The file lives
+# in $XDG_RUNTIME_DIR, which is a setting, so that directory is validated rather
+# than trusted; anything failing validation disables journaling entirely
+# (fail-closed) instead of falling back to a shared location.
+
+_ORCA_JOURNAL_NAME = "agent-orchestr-orca.pgid"
+_ORCA_JOURNAL_MAX_BYTES = 96
+_ORCA_JOURNAL_MAX_AGE = 120.0  # seconds; older records are treated as stale
+_ORCA_JOURNAL_DIR: Optional[str] = None  # tests point this at a scratch dir
+_PIDFD_OPEN = getattr(os, "pidfd_open", None)
+_PIDFD_SEND = getattr(signal, "pidfd_send_signal", None)
+
+
+def _orca_journal_dir() -> str:
+    """The per-user directory a record may live in, unvalidated."""
+    if _ORCA_JOURNAL_DIR is not None:
+        return _ORCA_JOURNAL_DIR
+    return (os.environ.get("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}").strip()
+
+
+def _orca_journal_path() -> Optional[str]:
+    """Path of a usable orphan record, or None when the directory is unsafe.
+
+    XDG_RUNTIME_DIR is config-supplied, so it gets the same treatment as any
+    other path from a setting: absolute, a real directory (lstat never reports
+    a directory for a symlink, so S_ISDIR alone rejects links), owned by this
+    uid, and not group/other accessible.
+    """
+    directory = _orca_journal_dir()
+    if not directory or not os.path.isabs(directory):
+        return None
+    try:
+        info = os.lstat(directory)
+    except OSError:
+        return None
+    if not stat.S_ISDIR(info.st_mode):
+        return None
+    if info.st_uid != os.geteuid() or info.st_mode & 0o077:
+        return None
+    return os.path.join(directory, _ORCA_JOURNAL_NAME)
+
+
+def _proc_stat_fields(pid: int) -> Optional[List[bytes]]:
+    """Fields of /proc/<pid>/stat after `comm`, or None when the pid is gone.
+
+    comm sits in parentheses and may itself contain spaces and parentheses, so
+    the split starts after the LAST ')': index 0 is field 3 (state).
+    """
+    try:
+        with open(f"/proc/{pid}/stat", "rb") as f:
+            data = f.read(4096)
+    except OSError:
+        return None
+    end = data.rfind(b")")
+    if end < 0:
+        return None
+    return data[end + 2:].split()
+
+
+def _proc_starttime(pid: int) -> Optional[int]:
+    """Start time in clock ticks since boot (field 22): the PID-reuse guard."""
+    fields = _proc_stat_fields(pid)
+    if fields is None or len(fields) < 20:
+        return None
+    try:
+        return int(fields[19])
+    except ValueError:
+        return None
+
+
+def _proc_pgrp(pid: int) -> Optional[int]:
+    """Process group id (field 5) of a live pid."""
+    fields = _proc_stat_fields(pid)
+    if fields is None or len(fields) < 3:
+        return None
+    try:
+        return int(fields[2])
+    except ValueError:
+        return None
+
+
+def _boot_id() -> Optional[str]:
+    try:
+        with open("/proc/sys/kernel/random/boot_id", encoding="ascii") as f:
+            return f.read(64).strip() or None
+    except OSError:
+        return None
+
+
+def _uptime_ms() -> Optional[int]:
+    """Boot-relative time in ms: comparable across processes on one boot."""
+    try:
+        with open("/proc/uptime", encoding="ascii") as f:
+            return int(float(f.read(64).split()[0]) * 1000)
+    except (OSError, ValueError, IndexError):
+        return None
+
+
+def _orca_record_orphan(pgid: int) -> None:
+    """Record the probe's process group so a later process can reap it."""
+    path = _orca_journal_path()
+    if path is None or pgid <= 1:
+        return
+    starttime = _proc_starttime(pgid)
+    boot_id, uptime_ms = _boot_id(), _uptime_ms()
+    if starttime is None or boot_id is None or uptime_ms is None:
+        return  # nothing to verify a future reap against: write no guess
+    try:
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
+    except OSError:
+        return
+    try:
+        os.write(fd, f"{boot_id} {uptime_ms} {pgid} {starttime}\n".encode("ascii"))
+    except OSError:
+        pass
+    finally:
+        os.close(fd)
+
+
+def _orca_read_orphan() -> Optional[Tuple[str, int, int, int]]:
+    """(boot id, uptime ms, pgid, starttime) from the record, or None."""
+    path = _orca_journal_path()
+    if path is None:
+        return None
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+    except OSError:
+        return None
+    try:
+        info = os.fstat(fd)
+        if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid()
+                or info.st_size > _ORCA_JOURNAL_MAX_BYTES):
+            return None
+        data = os.read(fd, _ORCA_JOURNAL_MAX_BYTES)
+    except OSError:
+        return None
+    finally:
+        os.close(fd)
+    try:
+        boot_id, uptime_s, pgid_s, start_s = data.decode("ascii", "strict").split()
+        uptime_ms, pgid, starttime = int(uptime_s), int(pgid_s), int(start_s)
+    except (UnicodeDecodeError, ValueError):
+        return None
+    if pgid <= 1 or starttime <= 0 or uptime_ms < 0:
+        return None
+    return boot_id, uptime_ms, pgid, starttime
+
+
+def _orca_clear_orphan() -> None:
+    path = _orca_journal_path()
+    if path is None:
+        return
+    try:
+        os.unlink(path)
+    except OSError:
+        pass
+
+
+def _orca_group_member_pids(pgid: int) -> List[int]:
+    """Live (non-zombie) pids whose process group is `pgid`.
+
+    Zombies keep their pgrp in /proc, and a member we killed may sit as one
+    until its own parent reaps it. Counting those would make a fully killed
+    group look alive forever — and leave the record behind to be reaped again.
+    """
+    members = []
+    for entry in glob.iglob("/proc/[0-9]*"):
+        try:
+            pid = int(entry.rsplit("/", 1)[1])
+        except ValueError:
+            continue
+        fields = _proc_stat_fields(pid)
+        if not fields or fields[0] in (b"Z", b"X", b"x"):
+            continue
+        try:
+            if int(fields[2]) == pgid:
+                members.append(pid)
+        except ValueError:
+            continue
+    return members
+
+
+def _signal_orca_group_member(pid: int, pgid: int, sig: int) -> bool:
+    """Signal one member through a pidfd so a recycled pid is never hit.
+
+    The pidfd pins the process, and group membership is re-read AFTER the fd
+    exists: a pid that left the group — or was recycled between enumeration and
+    here — fails the check and is skipped. Without pidfd support the best
+    fallback is a plain kill(), which keeps only the enumeration race.
+    """
+    fd = -1
+    if _PIDFD_OPEN is not None:
+        try:
+            fd = _PIDFD_OPEN(pid)
+        except ProcessLookupError:
+            return False
+        except OSError:
+            fd = -1
+    if _proc_pgrp(pid) != pgid:
+        if fd >= 0:
+            os.close(fd)
+        return False
+    try:
+        if fd >= 0 and _PIDFD_SEND is not None:
+            _PIDFD_SEND(fd, sig, None, 0)
+        else:
+            os.kill(pid, sig)
+        return True
+    except (ProcessLookupError, PermissionError, OSError):
+        return False
+    finally:
+        if fd >= 0:
+            os.close(fd)
+
+
+def _reap_orphan_orca_group() -> bool:
+    """Reap a probe group a previous process recorded but never cleaned up.
+
+    True when anything was signalled. Identity is proven by the record's boot
+    id and age, plus the leader's start time while the leader still lives. A
+    helper outlives the leader, so for that case freshness is the bound: the
+    numeric pgid cannot be recycled inside a couple of minutes without the
+    kernel wrapping its pid space. Members are signalled individually through
+    pidfds — never a blind killpg — so the check-then-kill race cannot land on
+    a process this probe never owned.
+    """
+    record = _orca_read_orphan()
+    if record is None:
+        return False
+    boot_id, recorded_ms, pgid, starttime = record
+    if boot_id != _boot_id():
+        _orca_clear_orphan()  # different boot: the pid space is unrelated
+        return False
+    now_ms = _uptime_ms()
+    if (now_ms is None or now_ms < recorded_ms
+            or now_ms - recorded_ms > _ORCA_JOURNAL_MAX_AGE * 1000):
+        _orca_clear_orphan()
+        return False
+    leader = _proc_starttime(pgid)
+    if leader is not None and leader != starttime:
+        _orca_clear_orphan()  # recycled pid: the group is somebody else's now
+        return False
+
+    signalled = False
+    for sig in (signal.SIGTERM, signal.SIGKILL):
+        members = _orca_group_member_pids(pgid)
+        if not members:
+            break
+        for pid in members:
+            signalled = _signal_orca_group_member(pid, pgid, sig) or signalled
+        deadline = time.monotonic() + _ORCA_KILL_GRACE
+        while time.monotonic() < deadline:
+            if not _orca_group_member_pids(pgid):
+                break
+            time.sleep(0.01)
+    if _orca_group_member_pids(pgid):
+        return signalled  # still there: keep the record for the next probe
+    _orca_clear_orphan()
+    return signalled
+
+
+def _tick_budget(ceiling: float) -> float:
+    """Clamp `ceiling` seconds to what is left of the status build's budget."""
+    if _TICK_DEADLINE is None:
+        return ceiling
+    return min(ceiling, _TICK_DEADLINE - time.monotonic())
 
 
 def _kill_orca_process_group(proc: "subprocess.Popen[bytes]") -> None:
@@ -3844,22 +4144,37 @@ def query_orca_terminals(timeout: float = 4.0) -> List[Dict[str, Any]]:
 
     The CLI process itself carries PR_SET_PDEATHSIG, so it dies even when the
     panel SIGKILLs this collector; its fork()ed helpers are covered only by the
-    in-band group kill above. Repeated FAILED retries therefore cannot
-    accumulate Orca processes; what a clean poll leaves behind is the runtime's
-    daemon and is not collected here.
+    in-band group kill above. The orphan journal closes that gap: the probe's
+    process group is recorded once the CLI is spawned and cleared as soon as the
+    call is known clean, and the next probe reaps whatever a dead collector left
+    behind. Repeated failed retries therefore cannot accumulate Orca processes,
+    and a SIGKILLed collector costs a lost reply and nothing more.
+
+    Inside a status build the call is also clamped to what is left of the tick
+    budget, minus the time its own teardown needs: a probe that cannot finish
+    its group kill before Panel.qml's watchdog fires is never started, so the
+    watchdog can never be the thing that skips the cleanup. Only the bounded
+    phases (drain, wait, cleanup) are covered by that; Popen's fork/exec cannot
+    be interrupted from this thread, and at that point the CLI has not run yet,
+    so it has no helper to orphan. A direct call (no tick in progress) keeps the
+    caller's own budget.
 
     Known trade-off: if the CLI auto-starts a runtime daemon that stays in this
     session (does not double-fork into its own), a FAILED call takes that daemon
-    down too. That is deliberate — the alternative is leaving, on every retry,
-    exactly the helper processes this scan was blocked for — and it can only
-    happen on a call that already failed.
+    down too, and so does a reap of a record left by a collector killed between
+    spawn and EOF (the record is cleared at EOF precisely to keep that window to
+    the drain itself). That is deliberate — the alternative is leaving, on every
+    retry, exactly the helper processes this scan was blocked for — and it can
+    only happen on a call that already failed or was killed mid-drain.
 
     A failure is remembered for the rest of the tick (a tick calls this twice —
     the roster scan and the `orca_connected` probe) and for _ORCA_CACHE_TTL
     seconds of wall clock, so a wedged runtime cannot spend two full budgets
     plus kill overhead inside Panel.qml's stall timer. The tick identity is
     bumped by fetch_all_agents(), so a tick whose other stages overrun the TTL
-    still does not re-probe what already failed.
+    still does not re-probe what already failed. The success stamp is taken when
+    the call completes, so a slow success is not re-probed by the second call
+    either.
 
     On success the result is cached for _ORCA_CACHE_TTL seconds.  On
     failure (CLI missing, timeout, non-JSON) we do NOT poison the roster —
@@ -3867,6 +4182,13 @@ def query_orca_terminals(timeout: float = 4.0) -> List[Dict[str, Any]]:
     and its timestamp is left alone, so a transient Orca CLI hang can't blank
     out the roster for the whole TTL. Only the failure back-off is recorded.
     """
+    # Once per tick: a record left by a collector that died mid-probe is this
+    # probe's to clean up. Gated on the tick (not on wall clock) so a degraded
+    # tick cannot pay for the /proc sweep twice.
+    if _ORCA_CACHE["reap_tick"] != _ORCA_CACHE["tick"]:
+        _ORCA_CACHE["reap_tick"] = _ORCA_CACHE["tick"]
+        _reap_orphan_orca_group()
+
     now = time.monotonic()
     if now - _ORCA_CACHE["ts"] < _ORCA_CACHE_TTL:
         return _ORCA_CACHE["terminals"]
@@ -3879,10 +4201,21 @@ def query_orca_terminals(timeout: float = 4.0) -> List[Dict[str, Any]]:
         # on it — the wall-clock arm is the always-available release.
         return _ORCA_CACHE["terminals"]
 
+    # Clamp to the tick, then hold back what the teardown needs. A probe
+    # admitted below the floor could reach the panel's watchdog while still
+    # inside its finally block, which is the exact kill this guards against.
+    budget = _tick_budget(timeout)
+    if _TICK_DEADLINE is not None:
+        if budget < _ORCA_MIN_BUDGET + _ORCA_CLEANUP_RESERVE:
+            _ORCA_CACHE["failed_ts"] = time.monotonic()
+            _ORCA_CACHE["failed_tick"] = _ORCA_CACHE["tick"]
+            return _ORCA_CACHE["terminals"]
+        budget -= _ORCA_CLEANUP_RESERVE
+
     terminals: List[Dict[str, Any]] = []
     failure = True
     try:
-        deadline = time.monotonic() + timeout
+        deadline = time.monotonic() + budget
         parent_pid = os.getpid()
         proc = subprocess.Popen(
             [ORCA_CLI, "terminal", "list", "--json"],
@@ -3892,11 +4225,18 @@ def query_orca_terminals(timeout: float = 4.0) -> List[Dict[str, Any]]:
             start_new_session=True,
             preexec_fn=_orca_child_preexec(parent_pid),
         )
+        # From here until the call is proven clean this record is the only
+        # evidence a later process would have of the group if this one dies.
+        _orca_record_orphan(proc.pid)
         try:
             stdout_bytes, reason = _drain_orca_stdout(proc, deadline)
             if reason == "eof":
                 # stdout closed: the CLI is done or about to exit, and the
                 # only thing left to spend the budget on is its exit status.
+                # Clear the record HERE: from EOF on, whatever still lives in
+                # the group is the runtime's daemon (a clean poll kills
+                # nothing), so a later reap must not touch it.
+                _orca_clear_orphan()
                 try:
                     proc.wait(timeout=max(0.01, deadline - time.monotonic()))
                 except subprocess.TimeoutExpired:
@@ -3915,7 +4255,7 @@ def query_orca_terminals(timeout: float = 4.0) -> List[Dict[str, Any]]:
                 proc.stdout.close()
 
         if reason == "timeout":
-            raise subprocess.TimeoutExpired(proc.args, timeout)
+            raise subprocess.TimeoutExpired(proc.args, budget)
         if reason == "overflow":
             raise ValueError(f"orca terminal list exceeded {_ORCA_MAX_BYTES} bytes")
         stdout = stdout_bytes.decode("utf-8", errors="replace")
@@ -3932,8 +4272,10 @@ def query_orca_terminals(timeout: float = 4.0) -> List[Dict[str, Any]]:
                         if isinstance(t, dict)
                     ][:_ORCA_MAX_TERMINALS]
                 # Only cache a successful parse; otherwise fall through to the
-                # last-known-good branch below.
-                _ORCA_CACHE["ts"] = now
+                # last-known-good branch below. Stamped at completion, not at
+                # entry: a 4 s success must not be re-probed by the second call
+                # in the same tick just because the TTL ran out meanwhile.
+                _ORCA_CACHE["ts"] = time.monotonic()
                 _ORCA_CACHE["terminals"] = terminals
                 return terminals
     except FileNotFoundError:
@@ -4433,6 +4775,13 @@ def _collect_peer_cards() -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
 
 def fetch_all_agents() -> Dict[str, Any]:
     """Fetch all agent data, combining Herdr snapshot, session enrichment, and standalone processes."""
+    global _TICK_DEADLINE
+    # One status build is one tick: publish the deadline here, once, so every
+    # stage that can need in-band cleanup clamps itself against the same
+    # wall clock (query_orca_terminals minus its teardown reserve). The panel
+    # kills the collector at Panel.qml's interval, and a kill would skip that
+    # cleanup entirely — hence a budget strictly inside it.
+    _TICK_DEADLINE = time.monotonic() + _TICK_WALL_BUDGET
     # Grok session reads are budgeted per fetch cycle, so a large or hostile
     # $GROK_HOME cannot turn one tick into unbounded work.
     _GROK_BUDGET.reset()
