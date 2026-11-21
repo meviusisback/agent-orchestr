@@ -37,8 +37,8 @@
   {
     "name": "success stamp taken at completion",
     "file": "agent_ctl.py",
-    "find": "                _ORCA_CACHE[\"ts\"] = time.monotonic()\n",
-    "replace": "                _ORCA_CACHE[\"ts\"] = now\n",
+    "find": "            _ORCA_CACHE[\"ts\"] = time.monotonic()\n            _ORCA_CACHE[\"terminals\"] = terminals\n",
+    "replace": "            _ORCA_CACHE[\"ts\"] = now\n            _ORCA_CACHE[\"terminals\"] = terminals\n",
     "test": "tests.test_orca_cli_bounds.OrcaTickDeadlineCase.test_a_slow_success_is_not_re_probed_in_the_same_tick"
   },
   {
@@ -51,7 +51,7 @@
   {
     "name": "orphan reap runs once per tick",
     "file": "agent_ctl.py",
-    "find": "    if _ORCA_CACHE[\"reap_tick\"] != _ORCA_CACHE[\"tick\"]:\n        _ORCA_CACHE[\"reap_tick\"] = _ORCA_CACHE[\"tick\"]\n        _reap_orphan_orca_group()\n",
+    "find": "        _orca_reap_orphan_orca_groups()\n",
     "replace": "",
     "test": "tests.test_orca_cli_bounds.OrcaOrphanJournalCase.test_helper_left_by_a_killed_collector_is_reaped_by_the_next_probe"
   },
@@ -93,29 +93,36 @@
   {
     "name": "record replaced atomically",
     "file": "agent_ctl.py",
-    "find": "    tmp_name = f\"{_ORCA_JOURNAL_NAME}.{os.getpid()}.tmp\"\n",
-    "replace": "    tmp_name = _ORCA_JOURNAL_NAME\n",
+    "find": "    name = _orca_journal_name(owner_pid, owner_start)\n    tmp_name = name + \".tmp\"\n    try:\n        try:\n            fd = os.open(\n                tmp_name,",
+    "replace": "    name = _orca_journal_name(owner_pid, owner_start)\n    tmp_name = name\n    try:\n        try:\n            fd = os.open(\n                tmp_name,",
     "test": "tests.test_orca_cli_bounds.OrcaOrphanJournalCase.test_failed_record_write_leaves_the_previous_record_intact"
   },
   {
     "name": "journal record never follows a symlink",
     "file": "agent_ctl.py",
-    "find": "            fd = os.open(_ORCA_JOURNAL_NAME, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=dir_fd)\n",
-    "replace": "            fd = os.open(_ORCA_JOURNAL_NAME, os.O_RDONLY, dir_fd=dir_fd)\n",
+    "find": "            fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=dir_fd)\n",
+    "replace": "            fd = os.open(name, os.O_RDONLY, dir_fd=dir_fd)\n",
     "test": "tests.test_orca_cli_bounds.OrcaOrphanJournalCase.test_symlinked_record_is_never_followed"
   },
   {
     "name": "no record without a verifiable leader",
     "file": "agent_ctl.py",
-    "find": "    if starttime is None or boot_id is None or uptime_ms is None:\n        return  # nothing to verify a future reap against: write no guess\n",
+    "find": "    if (owner_start is None or starttime is None\n            or boot_id is None or uptime_ms is None):\n        return  # nothing to verify a future reap against: write no guess\n",
     "replace": "    if False:\n        return  # nothing to verify a future reap against: write no guess\n",
     "test": "tests.test_orca_cli_bounds.OrcaOrphanJournalCase.test_record_is_skipped_when_the_leader_is_already_gone"
   },
   {
-    "name": "record cleared only on a verified clean exit",
+    "name": "owner pid recorded with the group",
     "file": "agent_ctl.py",
-    "find": "                _orca_clear_orphan()\n                _ORCA_CACHE[\"ts\"] = time.monotonic()\n",
-    "replace": "                _ORCA_CACHE[\"ts\"] = time.monotonic()\n",
+    "find": "    payload = (f\"{boot_id} {uptime_ms} {pgid} {starttime} {owner_start}\\n\"\n               .encode(\"ascii\"))\n",
+    "replace": "    payload = (f\"{boot_id} {uptime_ms} {pgid} {starttime}\\n\"\n               .encode(\"ascii\"))\n",
+    "test": "tests.test_orca_cli_bounds.OrcaOrphanJournalCase.test_record_is_owner_only_and_reads_back"
+  },
+  {
+    "name": "record cleared only on a parsed reply",
+    "file": "agent_ctl.py",
+    "find": "        _orca_clear_orphan()\n        if usable:\n",
+    "replace": "        if usable:\n",
     "test": "tests.test_orca_cli_bounds.OrcaOrphanJournalCase.test_clean_poll_clears_its_record"
   },
   {
@@ -128,7 +135,7 @@
   {
     "name": "record written once the CLI is spawned",
     "file": "agent_ctl.py",
-    "find": "        _orca_record_orphan(proc.pid)\n",
+    "find": "            _orca_record_orphan(proc.pid)\n",
     "replace": "",
     "test": "tests.test_orca_cli_bounds.OrcaOrphanJournalCase.test_helper_left_by_a_killed_collector_is_reaped_by_the_next_probe"
   },
@@ -149,9 +156,68 @@
   {
     "name": "leader re-read before every pass",
     "file": "agent_ctl.py",
-    "find": "        # Re-read the leader for THIS pass: a pid recycled between passes looks\n        # exactly like ours to a pgrp scan, and only its start time tells them\n        # apart.\n        leader = _proc_starttime(pgid)\n        if leader is not None and leader != starttime:\n            _orca_clear_orphan()\n            return signalled\n",
-    "replace": "        # Re-read the leader for THIS pass: a pid recycled between passes looks\n        # exactly like ours to a pgrp scan, and only its start time tells them\n        # apart.\n",
-    "test": "tests.test_orca_cli_bounds.OrcaOrphanJournalCase.test_reap_ignores_a_record_whose_pid_was_reused"
+    "find": "        leader = _proc_starttime(pgid)\n        if leader is not None and leader != starttime:\n            clear()\n            return signalled\n",
+    "replace": "        leader = _proc_starttime(pgid)\n",
+    "test": [
+      "tests.test_orca_cli_bounds.OrcaOrphanJournalCase.test_reap_ignores_a_record_whose_pid_was_reused",
+      "tests.test_orca_cli_bounds.OrcaOrphanJournalCase.test_a_leader_recycled_during_the_reap_aborts_it"
+    ]
+  },
+  {
+    "name": "a live owner is never reaped",
+    "file": "agent_ctl.py",
+    "find": "            if not _orca_owner_is_dead(owner, record[4]):\n                continue  # a live collector's group is never ours to signal\n",
+    "replace": "",
+    "test": "tests.test_orca_cli_bounds.OrcaOrphanJournalCase.test_a_live_collectors_group_is_never_reaped"
+  },
+  {
+    "name": "owner pid reuse is a dead collector",
+    "file": "agent_ctl.py",
+    "find": "    return current is None or current != owner_start\n",
+    "replace": "    return current is None\n",
+    "test": "tests.test_orca_cli_bounds.OrcaOrphanJournalCase.test_reap_treats_a_recycled_owner_pid_as_dead"
+  },
+  {
+    "name": "dead collector's temp file swept",
+    "file": "agent_ctl.py",
+    "find": "                    if current is None or (start is not None and current != start):\n                        _orca_unlink_quietly(name, dir_fd)\n",
+    "replace": "",
+    "test": "tests.test_orca_cli_bounds.OrcaOrphanJournalCase.test_stale_temp_file_from_a_dead_collector_is_swept"
+  },
+  {
+    "name": "start time guards a recycled temp owner",
+    "file": "agent_ctl.py",
+    "find": "                    if current is None or (start is not None and current != start):\n",
+    "replace": "                    if current is None:\n",
+    "test": "tests.test_orca_cli_bounds.OrcaOrphanJournalCase.test_stale_temp_of_a_recycled_owner_is_swept"
+  },
+  {
+    "name": "start time in the record name",
+    "file": "agent_ctl.py",
+    "find": "    stem = str(owner_pid) if owner_start is None else f\"{owner_pid}.{owner_start}\"\n",
+    "replace": "    stem = str(owner_pid)\n",
+    "test": "tests.test_orca_cli_bounds.OrcaOrphanJournalCase.test_a_new_incarnation_does_not_clobber_an_unreaped_record"
+  },
+  {
+    "name": "a parseable reply is a clean teardown",
+    "file": "agent_ctl.py",
+    "find": "                        failure = False\n                        if payload.get(\"ok\"):\n",
+    "replace": "                        failure = True\n                        if payload.get(\"ok\"):\n",
+    "test": "tests.test_orca_cli_bounds.OrcaOrphanJournalCase.test_parseable_non_success_is_a_clean_teardown"
+  },
+  {
+    "name": "non-success never caches an empty roster",
+    "file": "agent_ctl.py",
+    "find": "                        failure = False\n                        if payload.get(\"ok\"):\n",
+    "replace": "                        failure = False\n                        usable = True\n                        if payload.get(\"ok\"):\n",
+    "test": "tests.test_orca_cli_bounds.OrcaOrphanJournalCase.test_parseable_non_success_is_a_clean_teardown"
+  },
+  {
+    "name": "zombies do not hold a record open",
+    "file": "agent_ctl.py",
+    "find": "                if not _orca_group_member_pids(proc.pid):\n                    _orca_clear_orphan()\n",
+    "replace": "                if not _orca_group_alive(proc.pid):\n                    _orca_clear_orphan()\n",
+    "test": "tests.test_orca_cli_bounds.OrcaOrphanJournalCase.test_zero_exit_with_invalid_output_kills_its_helper"
   },
   {
     "name": "per-member group membership re-check",
