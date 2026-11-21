@@ -123,6 +123,7 @@ python3 tests/test_discovery_regression.py
 python3 tests/test_hermes_activity.py
 python3 tests/test_remote_sources.py
 python3 tests/test_orca_cli_bounds.py      # Orca CLI bounds, tick budget, group kill, orphan reap, PDEATHSIG
+python3 tests/test_audit_hardening.py      # peer header deadline, Claude hook status confined reads
 ```
 
 ## Removal

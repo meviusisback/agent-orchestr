@@ -50,6 +50,7 @@ HERMES_READ_MAX_BYTES = {
     "env": 65536,             # strict: ~/.hermes/.env
     "config": 262144,         # bounded: ~/.hermes/config.yaml
     "registry": 262144,       # bounded: ~/.config/Hermes/connections.json
+    "claude-status": 8192,    # strict: the Claude hook's per-PID status file
 }
 HERMES_CONFINE_MODE = 0o022
 HERMES_CREDENTIAL_MODE = 0o077
@@ -227,7 +228,7 @@ def read_confined_text(
     """
     own = os.getuid() if uid is None else uid
     trusted_uids: Sequence[int] = (own, 0) if ancestor_uids is None else tuple(ancestor_uids)
-    strict = kind == "env"
+    strict = kind in ("env", "claude-status")
     max_bytes = HERMES_READ_MAX_BYTES.get(kind, HERMES_READ_MAX_BYTES["config"])
     effective_roots = list(roots) if roots is not None else hermes_confine_roots(own, home, trusted_uids)
 
@@ -981,9 +982,10 @@ def peer_http_get(
       * it exposes the socket, so the deadline can be ENFORCED.
 
     The deadline is a `timeout=` (per socket operation, renewed on every recv —
-    useless alone against a peer that dribbles) PLUS a watchdog that closes the
-    socket when the TOTAL per-peer budget is spent. A blown budget is a refusal,
-    not a warning.
+    useless alone against a peer that dribbles) PLUS a watchdog that shuts down
+    the socket when the TOTAL per-peer budget is spent: `close()` alone does not
+    interrupt a blocking recv, so header-phase and body-phase reads are both
+    aborted with SHUT_RDWR. A blown budget is a refusal, not a warning.
 
     `connect` is the injection seam for the tests: a stand-in class whose
     constructor takes (host, port, timeout=..., context=...) and whose connect()
@@ -1182,7 +1184,17 @@ def _close_quietly(conn: Any) -> None:
     try:
         sock = getattr(conn, "sock", None)
         if sock is not None:
-            sock.close()  # unblocks a wedged recv from the watchdog thread
+            # close() in another thread does NOT interrupt a blocking recv on
+            # this fd: during getresponse() the deadline watchdog used to fire
+            # and leave a peer that dribbles header bytes wedged forever.
+            # shutdown() is what makes the pending read raise. Once the headers
+            # have arrived, _abort_response does the same for the socket behind
+            # response.fp (conn.sock is None by then).
+            try:
+                sock.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+            sock.close()
     except Exception:
         pass
     try:
@@ -2820,37 +2832,30 @@ def get_process_open_session(pid: int) -> Optional[str]:
 # hook-supplied free text (a tool name, a permission prompt), so it runs through
 # the same first-line and secret-redaction pass as every other agent detail.
 def read_claude_hook_status(pid: int) -> Optional[Dict[str, str]]:
-    """Read the live status Claude Code's own hooks wrote for this PID."""
-    path = os.path.join(CLAUDE_HOOK_STATUS_DIR, f"{pid}.json")
+    """Read one Claude hook status file through the strict confined reader.
 
-    # Owner and symlink checks: verify the directory is not a symlink, is owned
-    # by the current user, and that none of its ancestor directories are symlinks.
+    The hook writes these files with mktemp+mv (0600), but this side must not
+    trust that: a same-user process could plant a symlink or a FIFO at the
+    watched path. The strict profile enforces the checks on the HANDLE we
+    actually read — O_NOFOLLOW|O_NONBLOCK, fstat, samestat, /proc/self/fd
+    containment, owner-only mode and a byte ceiling — closes the TOCTOU window
+    the old islink/stat-then-plain-open sequence left open, and rejects a
+    future-dated or non-finite timestamp.
+    """
+    if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 1:
+        return None
+    path = os.path.join(CLAUDE_HOOK_STATUS_DIR, f"{pid}.json")
     try:
-        if os.path.islink(CLAUDE_HOOK_STATUS_DIR):
-            return None
-        if os.stat(CLAUDE_HOOK_STATUS_DIR).st_uid != os.getuid():
-            return None
-        # Check ancestors for symlinks
-        check_dir = CLAUDE_HOOK_STATUS_DIR
-        while check_dir != os.path.expanduser("~") and check_dir != "/":
-            parent = os.path.dirname(check_dir)
-            if os.path.islink(parent):
-                return None
-            try:
-                if os.stat(parent).st_uid != os.getuid():
-                    return None
-            except Exception:
-                return None
-            check_dir = parent
-        # Verify the file itself is not a symlink
-        if os.path.islink(path):
-            return None
+        text = read_confined_text(
+            "claude-status", path,
+            roots=[os.path.realpath(CLAUDE_HOOK_STATUS_DIR)],
+        )
     except Exception:
         return None
-
+    if not text:
+        return None
     try:
-        with open(path, "r", encoding="utf-8") as f:
-            data = json.load(f)
+        data = json.loads(text)
     except Exception:
         return None
     if not isinstance(data, dict):
@@ -2859,7 +2864,11 @@ def read_claude_hook_status(pid: int) -> Optional[Dict[str, str]]:
     if status not in CLAUDE_HOOK_STATUSES:
         return None
     updated = data.get("updated")
-    if not isinstance(updated, (int, float)) or (time.time() - updated) > CLAUDE_HOOK_STATUS_MAX_AGE:
+    now = time.time()
+    if (isinstance(updated, bool) or not isinstance(updated, (int, float))
+            or not math.isfinite(updated)
+            or updated > now + CLAUDE_HOOK_STATUS_MAX_AGE
+            or now - updated > CLAUDE_HOOK_STATUS_MAX_AGE):
         return None
     detail = data.get("detail")
     return {
