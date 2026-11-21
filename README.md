@@ -110,7 +110,7 @@ then merge its `PreToolUse`, `UserPromptSubmit`, `Notification`, `Stop`, `Subage
 
 ## How it works
 
-`agent_ctl.py` collects every source into one JSON snapshot per tick — local processes/terminals, Herdr sockets, OMP sessions, Hermes databases (read-only `?mode=ro`), Claude hook files (trusted only with a known status + fresh timestamp), Grok roster/events through one guarded reader (ownership, symlink, size and budget checks; anything planted degrades to "no detail", never a wrong card) — and `Panel.qml` renders bar and cards from it. Prompts, detail lines and error text pass secret redaction (API keys, tokens, the peer key itself) before they reach the panel; terminal and tab titles are displayed exactly as the terminal sets them. Everything renders as `Text.PlainText`, never rich text; peer transport uses `http.client` with the system CA bundle, bounded responses and a watchdog deadline per peer.
+`agent_ctl.py` collects every source into one JSON snapshot per tick — local processes/terminals, Herdr sockets, OMP sessions, Hermes databases (read-only `?mode=ro`), Claude hook files (trusted only with a known status + fresh timestamp), Grok roster/events through one guarded reader (ownership, symlink, size and budget checks; anything planted degrades to "no detail", never a wrong card) — and `Panel.qml` renders bar and cards from it. Prompts, detail lines and error text pass secret redaction (API keys, tokens, the peer key itself) before they reach the panel; terminal and tab titles are displayed exactly as the terminal sets them. Everything renders as `Text.PlainText`, never rich text; peer transport uses `http.client` with the system CA bundle, bounded responses and a watchdog deadline per peer. The Orca probe carries one wall-clock budget per tick, clamped under the panel's 18 s watchdog with time held back for its own cleanup. Each probe records its own process group in a validated, owner-only `$XDG_RUNTIME_DIR` file (one record per collector, keyed by pid **and** start time, so a recycled pid cannot clobber an unreaped record); the next probe reaps only groups whose collector is gone, never a live sibling probe's in-flight group. A zero exit with empty or unparseable output still counts as a failed call whose helpers are killed, while a well-formed non-success reply is a clean teardown that serves last-known-good without touching a runtime helper.
 
 Verify with the hermetic suites (no network, no `hyprctl`, no real `~/.grok` or `~/.hermes`; the peer suite serving only a loopback `http.server`):
 
@@ -122,7 +122,8 @@ python3 tests/test_claude_hook_argv.py
 python3 tests/test_discovery_regression.py
 python3 tests/test_hermes_activity.py
 python3 tests/test_remote_sources.py
-python3 tests/test_orca_cli_bounds.py      # Orca CLI bounds, group kill, PDEATHSIG
+python3 tests/test_orca_cli_bounds.py      # Orca CLI bounds, tick budget, group kill, orphan reap, PDEATHSIG
+python3 tests/test_audit_hardening.py      # peer header deadline, Claude hook status confined reads
 ```
 
 ## Removal
